@@ -1,0 +1,177 @@
+# orchestrator/ 代码说明
+
+给第一次看这份代码的人快速建立地图用的开发文档。四个文件各管一块，`main.py` 已经把 `persona`/`store`/`trip_plan` 三个模块接起来了（具体接了什么见文末），只有 `agent_ota_hotel` 还是纯占位假数据。
+
+设计背景/接口契约见 [agent-architecture.md](./agent-architecture.md)（为什么这么分 Agent、为什么中心化编排）和 [agent-interfaces.md](./agent-interfaces.md)（字段契约、原本的 Dify 方案，后来改成直接写 Python）。
+
+## 环境准备
+
+```
+pip install openai python-dotenv chromadb
+```
+
+在 `orchestrator/.env` 里写一行（这个文件已经在 `.gitignore` 里，不会被提交）：
+```
+PARATERA_API_KEY=你的key
+```
+
+四个文件都能直接 `python orchestrator/<文件名>.py` 单独跑，文件末尾的 `if __name__ == "__main__":` 都是自测代码，可以照着抄用法。
+
+---
+
+## main.py -- 编排 Agent 主流程
+
+**职责**：星型架构的中枢。接收用户消息 → 意图识别 → 决定调用哪几个子 Agent → 汇总结果 → 生成回复。对应 [agent-interfaces.md 第三节](./agent-interfaces.md) 的节点拓扑，只是从 Dify 可视化节点换成了 Python 函数。
+
+| 函数 | 作用 |
+|---|---|
+| `new_shared_state(user_id, scenario="vacation", onboarding_answers=None)` | 造一份共享状态：`persona`（真用 `persona.py` 的结构，传了 `onboarding_answers` 就走冷启动）+ `trip_plan`（真用 `trip_plan.py` 的结构） |
+| `call_llm(messages, model=MODEL_FULL)` | 统一的模型调用入口，`model` 传 `MODEL_FULL`（`DeepSeek-V4-Pro`）或 `MODEL_LIGHT`（`DeepSeek-V4-Flash`） |
+| `classify_intent(user_message)` | 调模型判断这轮要触发 `content`/`route`/`booking`/`exception` 里的哪几个 |
+| `agent_content` | 真实检索：算 persona 向量 → `store.query_similar_posts()` 查候选 |
+| `agent_route` | 真实写入：把地点依次加成 `trip_plan` 某一天的行程节点（时间/交通方式还是占位文字） |
+| `agent_ota_hotel` | **还是占位假数据**，没有真实比价/查库存来源可接 |
+| `agent_exception` | 真实处理：按地点名字子串匹配 `trip_plan` 里的行程节点，命中就删掉并记一条 `weather_alert` |
+| `orchestrate(user_message, shared_state)` | 主流程：意图识别 → 分发调用（子 Agent 直接改 `shared_state` 里的 `trip_plan`，不用再手动写回）→ 生成回复，返回 `(output, shared_state)` |
+
+**模型分档**（见 `agent-architecture.md` 模型档位设计）：编排 Agent 自己的两处调用（意图识别、生成回复）用 `MODEL_FULL`；子 Agent 换成真实实现、要接 LLM 时该用哪档在代码注释里标了（达人→Full，行程/OTA→Light，异常应变待定）。
+
+**现状**：`persona`/`store`/`trip_plan` 三个模块都已经接进 `main.py`（`agent_content`/`agent_route`/`agent_exception` 都在操作真实的共享状态，不再是纯假数据），具体"路线怎么排""异常怎么判定"这些算法还很简单（占位时间字段、纯子串匹配），等真实 Agent 实现替换即可，字段结构不用变。只有 `agent_ota_hotel` 还是完全没接。
+
+---
+
+## store.py -- 达人社区内容 + 历史记录
+
+**职责**：达人社区的图文帖子存储 + 检索（两阶段检索第一阶段：按人格向量相似度筛选），以及行程反馈历史记录。
+
+**存储技术**：Chroma 向量库（`orchestrator/data/chroma/`，本地文件持久化）存帖子；JSON Lines 文件（`orchestrator/data/history.jsonl`）存历史记录；图片本地落盘（`orchestrator/data/images/<post_id>/`），帖子里只存相对路径。
+
+| 函数 | 作用 |
+|---|---|
+| `save_image(post_id, filename, image_bytes)` | 写一张图，返回存进 `content["images"]` 的相对路径 |
+| `resolve_image_path(相对路径)` | 相对路径转本地绝对路径，读图用 |
+| `add_post(post_id, persona_vector, content)` | 存一条帖子。`content` 字段见下表 |
+| `query_similar_posts(persona_vector, top_k=5)` | 两阶段检索第一阶段：按人格向量相似度找候选帖子，返回时带 `similarity_score` |
+| `delete_post(post_id)` | 删帖 |
+| `log_history(user_id, trip_id, record)` | 追加一条行程反馈记录 |
+| `get_history(user_id=None)` | 读历史记录，不传 `user_id` 读全部 |
+
+`content` 字段（`add_post` 的第三个参数）：
+
+| 字段 | 说明 |
+|---|---|
+| `place` / `time_slot` / `avg_cost` / `rating` / `avoid_tips` / `verified_trip` | 结构化字段，对齐 `agent-interfaces.md` 达人 Agent 输出契约 |
+| `caption` | 帖子正文文字，可选 |
+| `images` | 图片相对路径列表，可选，由 `save_image()` 生成 |
+
+**待定/限制**：
+- 内容相关性排序（两阶段检索第二阶段）没实现，留给调用方在 `query_similar_posts()` 的候选集里自己排
+- 图片存本地文件系统，部署到 ModelScope Studio 时要换成对象存储（OSS/CDN），`images` 字段到时候存 URL 而不是本地路径，上层调用方式不变
+
+---
+
+## trip_plan.py -- 旅游计划（行程/机票/酒店/天气异常）
+
+**职责**：一次完整旅行的所有结构化信息，由多个 Agent 共同维护，最终汇总用于呈现。
+
+**顶层结构**：
+```python
+trip_plan = {
+    "trip_id": "...",
+    "flights": [...],        # OTA/酒店 Agent 维护
+    "hotels": [...],         # OTA/酒店 Agent 维护
+    "weather_alerts": [...], # 异常应变 Agent 维护
+    "days": {日期: day_plan},# 行程 Agent 生成，异常应变 Agent 增删改
+}
+```
+
+**景点通勤+餐饮的核心设计**：每天一个"链表"，但不是指针式链表，而是**节点字典 + id 引用**（`day_plan["nodes"]` 是 `{node_id: node}`，每个节点有 `next_id` 指向下一个节点的 id，`day_plan["head_id"]` 是链表头）。这样设计是因为：
+- 异常应变 Agent 改行程时只需要动被影响的那一个节点、接一下前后 `next_id`，不用重发整天的数组
+- 本质是个普通 dict，直接能存 JSON/传 HTTP，不需要额外的链表↔数组转换逻辑
+
+节点字段：`type`（`"attraction"` | `"meal"`）、`place`、`arrival_transport`、`arrival_time`、`end_time`、`next_id`；`meal` 类型节点多一个 `meal_type`（早餐/午餐/晚餐/夜宵）。
+
+| 函数 | 作用 |
+|---|---|
+| `new_trip_plan(trip_id)` | 造一个空旅游计划 |
+| `add_flight` / `add_hotel` / `add_weather_alert` | 往对应列表追加一条记录 |
+| `get_or_create_day(trip_plan, date)` | 拿到某天的 `day_plan`，不存在就新建 |
+| `add_stop(day_plan, node_id, type_, place, arrival_transport, arrival_time, end_time, after_id=None, **extra)` | 插入一个节点，`after_id=None` 插到最前面，否则插到该节点后面 |
+| `remove_stop(day_plan, node_id)` | 删除节点，自动重连前后节点（异常应变 Agent 常用，比如景点临时关闭） |
+| `patch_stop(day_plan, node_id, **fields)` | 只改某个节点的部分字段，不动链表结构 |
+| `day_stops(day_plan)` | 把链表还原成有序数组，渲染/地图面板用 |
+| `render(trip_plan)` | 汇总成最终展示结构（`flights`/`hotels`/`weather_alerts`/`days`，每天的 `stops` 已经是有序数组） |
+
+**现状**：已经接进 `main.py` 的 `shared_state["trip_plan"]`，`agent_route` 会往里面加节点、`agent_exception` 会删节点/记天气异常。目前所有节点都写进同一个占位日期 `"day-1"`（`main.py` 里的 `_PLACEHOLDER_DAY`），还没做真正的多日期规划。
+
+---
+
+## persona.py -- 人格变量
+
+**职责**：定义"旅游人格"的具体维度结构，供达人/行程/OTA Agent 读取，反馈闭环用来校准。
+
+**维度设计**（能量化的维度都用了 0~1 连续分数，不是纯标签）：
+
+| 维度 | 归属 | 类型 | 说明 |
+|---|---|---|---|
+| `taste` | `stable_traits`（跨场景稳定） | 固定词表 multi-hot | 菜系标签，词表见 `_TASTE_VOCAB` |
+| `novelty_score` | `stable_traits` | float 0~1 | 0=稳妥大众，1=小众冒险 |
+| `pace_score` | `scenario_traits`（按场景分开存） | float 0~1 | 0=完全休闲，1=完全特种兵 |
+| `budget_score` | `scenario_traits` | float 0~1 | 0=穷游，1=公务舱/总统套房/租车这种享受型消费；**硬过滤字段，不进相似度向量**，用 `budget_filter_ok()` 按数值区间过滤 |
+| `social_mode` | `scenario_traits` | 分类（`solo`/`couple`/`family`/`friends`） | 并列模式非程度光谱，向量里按 one-hot 编码 |
+| `interest_theme` | `scenario_traits` | 固定词表 multi-hot | 词表见 `_INTEREST_VOCAB` |
+
+`scenario_traits` 按"本次旅行模式"（`business_trip`/`vacation`/`family`/`solo_adventure`...）分开存，同一个人不同场景下这些值可以完全不同。
+
+| 函数 | 作用 |
+|---|---|
+| `new_persona(user_id)` | 造一份空人格 |
+| `bootstrap_from_onboarding(user_id, scenario, answers)` | 冷启动：从一份问卷答案组出初始 persona |
+| `set_scenario_traits(persona, scenario, **fields)` / `get_scenario_traits(persona, scenario)` | 读写某场景的特质，写入时会校验词表 + clamp 数值到 0~1 |
+| `update_stable_traits(persona, **fields)` | 读写跨场景稳定特质，同样有校验 |
+| `apply_feedback(persona, scenario, dimension, new_value, reason="")` | 按维度校准，写入 + 留痕（`feedback_log`）。"该改成什么值"由调用方决定，这里只负责写入 |
+| `budget_filter_ok(a_score, b_score, max_diff=0.25)` | 判断两个 `budget_score` 是否够接近，硬过滤专用，独立于相似度向量 |
+| `compute_persona_vector(persona, scenario)` | 拼出向量：`[novelty_score, taste multi-hot, pace_score, social_mode one-hot, interest_theme multi-hot]`，固定 20 维（词表大小变了维度也会变） |
+
+**待定/限制**：
+- `compute_persona_vector()` 是数值特征拼接，不是真实语义 embedding，以后接真实 embedding 模型可以整体替换掉函数体，调用方（`store.py`）接口不用变
+- 改 `_TASTE_VOCAB`/`_INTEREST_VOCAB` 词表会改变向量维度，如果本地 Chroma 已经有存量数据，改词表前要清掉 `orchestrator/data/chroma` 重新灌数据，不然新旧向量维度对不上（这个坑已经踩过一次）
+- 从一条用户反馈文本判断"该把哪个维度调成什么值"的算法没实现，留给编排/达人 Agent 决定
+
+---
+
+## server.py + web/index.html -- 呈现层（网页）
+
+**职责**：把 `main.py` 的编排 Agent 包成 HTTP 接口，配一个两栏网页——左边实时日程，右边聊天框。原本 `agent-architecture.md` 里设计的是三面板（社区/地图/聊天），这版先简化成两栏，验证"聊天真的能驱动日程展示"这条链路，社区面板/地图面板以后再加。
+
+**运行方式**：
+```
+pip install flask
+python orchestrator/server.py
+```
+然后浏览器打开 `http://127.0.0.1:5000`。
+
+**接口**（都是同一个 Flask app 提供，同源不用处理 CORS）：
+
+| 接口 | 作用 |
+|---|---|
+| `GET /` | 返回 `web/index.html` |
+| `GET /trip` | 返回 `trip_plan.render()` 的当前完整行程，左侧日程面板用这个渲染 |
+| `POST /chat` | body 传 `{"message": "..."}`，内部调 `main.orchestrate()`，返回编排 Agent 的输出（`chat_reply`/`community_panel`/`map_panel`） |
+
+**前端逻辑**（`web/index.html`，原生 HTML/CSS/JS，没引入任何框架）：发消息 → 调 `/chat` 显示回复 → 再调一次 `/trip` 刷新左侧日程，这样每次对话后日程面板都是最新状态。
+
+**现状/限制**：
+- 全局只有一个进程内共享状态（`server.py` 里的 `_state`），是单会话 demo，没有登录/多用户/并发处理，仅供本地演示，不要直接这样部署到公网
+- 已经端到端测试过："推荐+排路线"这类消息发过去，`/trip` 能看到新加的行程节点；异常应变消息发过去，`/trip` 能看到节点被删掉——聊天确实驱动了日程展示
+- 社区图文面板、地图面板（三面板设计里剩下的两块）还没做进网页
+
+## 待接事项
+
+四个文件已经在 `main.py` 里串起来了（`persona`/`store`/`trip_plan` 都接了），跑 `python orchestrator/main.py` 能看到一次完整的"推荐→规划路线→异常应变→重新渲染行程"的端到端流程。还剩这几处没做：
+
+1. `agent_ota_hotel` 完全没接，还是纯占位假数据，没有真实比价/查库存来源可接
+2. `agent_route` 目前所有节点都写进同一个占位日期 `_PLACEHOLDER_DAY = "day-1"`，没有真正的多日期规划；交通方式/到达时间也都是占位文字 `"待定"`
+3. `agent_exception` 用整句用户消息去子串匹配地点名字，很粗糙（比如"西湖"两个字出现在消息里就命中），真实版本应该先做实体识别抽出具体地点
+4. 两阶段检索第二阶段（候选集内部按内容相关性排序）还没实现，`agent_content` 里 `location_hint` 参数目前没用上
+5. 反馈闭环（用户点评行程 → 校准 persona）还没接：`store.log_history()` 记录和 `persona.apply_feedback()` 校准都写好了，但没人在 `orchestrate()` 里调用它们
