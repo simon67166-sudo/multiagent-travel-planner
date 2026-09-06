@@ -10,10 +10,12 @@
 pip install openai python-dotenv chromadb
 ```
 
-在 `orchestrator/.env` 里写一行（这个文件已经在 `.gitignore` 里，不会被提交）：
+在 `orchestrator/.env` 里写两行（这个文件已经在 `.gitignore` 里，不会被提交）：
 ```
 PARATERA_API_KEY=你的key
+AMAP_KEY=你的高德Web服务API Key
 ```
+`AMAP_KEY` 去 https://lbs.amap.com 控制台"创建应用"申请，类型要选 **Web服务**（不是 Web端/JS API，两种 key 不通用）。个人开发者未认证 6000次/天，实名认证后 30万次/月，demo 阶段够用。
 
 每个文件都能直接 `python orchestrator/<路径>.py` 单独跑（包括 `agents/` 里的 5 个文件），文件末尾的 `if __name__ == "__main__":` 都是自测代码，可以照着抄用法。
 
@@ -24,6 +26,7 @@ PARATERA_API_KEY=你的key
 ```
 orchestrator/
   llm_tool.py                     # 通用 LLM 调用工具，跟"编排"本身无关，谁都能 import
+  map_tool.py                     # 通用地图工具（高德地图 API）：地理编码 + 路径规划
   agents/
     orchestrator_agent.py         # 编排 Agent：new_shared_state + classify_intent + orchestrate
     content_agent.py              # 达人/内容 Agent
@@ -46,6 +49,21 @@ orchestrator/
 | `call_llm(messages, model=MODEL_FULL)` | 统一的模型调用入口 |
 | `MODEL_FULL` / `MODEL_LIGHT` | `DeepSeek-V4-Pro` / `DeepSeek-V4-Flash`，两档模型对齐 `agent-architecture.md` 的模型档位设计 |
 
+## map_tool.py -- 通用地图工具（高德地图）
+
+**职责**：地理编码 + 路径规划，给行程/路线 Agent 算真实的距离/耗时/路线用，跟 `llm_tool.py` 一样是通用基础设施。
+
+| 函数 | 作用 |
+|---|---|
+| `geocode(address, city=None)` | 地名/地址转经纬度，返回 `(lng, lat)` |
+| `route_between(place_a, place_b, mode="walking", city=None)` | 算两地之间的距离/耗时/路线，`mode` 传 `"walking"` 或 `"driving"`，返回 `distance_m`/`duration_min`/`polyline` |
+
+**现状/限制**：
+- 只做了"两点之间"的查询，还没做"多点一次性规划最优顺序"（这个高德也有专门接口，以后要优化路线顺序时再接）
+- `route_agent.py` 里用这个算相邻两站的真实交通方式/耗时（超过 2km 自动从步行切驾车），查询失败会优雅降级成"待定（地图查询失败：...）"文字，不会导致整个流程崩掉
+- 到达/结束的具体钟点时间（`arrival_time`/`end_time`）还是占位——那需要"一天几点开始"+"每站玩多久"这类还没定义的调度逻辑，跟地图 API 是两回事
+- 地图可视化（真的在网页上画一张地图+路线）还没做，`web/index.html` 目前只是文字列表展示行程，`polyline` 字段目前没被前端用上
+
 ## agents/orchestrator_agent.py -- 编排 Agent
 
 **职责**：星型架构的中枢。接收用户消息 → 意图识别 → 决定调用哪几个子 Agent → 汇总结果 → 生成回复。对应 [agent-interfaces.md 第三节](./agent-interfaces.md) 的节点拓扑，只是从 Dify 可视化节点换成了 Python 函数。模型档位用 `MODEL_FULL`（全系统推理最重）。
@@ -66,7 +84,7 @@ orchestrator/
 
 **职责**：把地点写进 `trip_plan` 某一天的行程节点。模型档位 `MODEL_LIGHT`，目前还没接 LLM，纯结构化写入。
 
-`run(shared_state, places, time_budget=None)`：所有节点目前都写进同一个占位日期（`_PLACEHOLDER_DAY = "day-1"`），时间/交通方式字段是占位文字 `"待定"`。
+`run(shared_state, places, time_budget=None, city=None)`：所有节点目前都写进同一个占位日期（`_PLACEHOLDER_DAY = "day-1"`）。`arrival_transport` 已经接了 `map_tool.py`，是相邻两站之间真实算出来的交通方式/耗时/距离（超过 2km 自动从步行切驾车）；`arrival_time`/`end_time` 还是占位文字 `"待定"`（原因见 `map_tool.py` 那节）。
 
 ## agents/ota_hotel_agent.py -- OTA/酒店 Agent
 
@@ -214,8 +232,9 @@ python orchestrator/server.py
 
 四个文件已经在 `main.py` 里串起来了（`persona`/`store`/`trip_plan` 都接了），跑 `python orchestrator/main.py` 能看到一次完整的"推荐→规划路线→异常应变→重新渲染行程"的端到端流程。还剩这几处没做：
 
-1. `agent_ota_hotel` 完全没接，还是纯占位假数据，没有真实比价/查库存来源可接
-2. `agent_route` 目前所有节点都写进同一个占位日期 `_PLACEHOLDER_DAY = "day-1"`，没有真正的多日期规划；交通方式/到达时间也都是占位文字 `"待定"`
-3. `agent_exception` 用整句用户消息去子串匹配地点名字，很粗糙（比如"西湖"两个字出现在消息里就命中），真实版本应该先做实体识别抽出具体地点
-4. 两阶段检索第二阶段（候选集内部按内容相关性排序）还没实现，`agent_content` 里 `location_hint` 参数目前没用上
+1. `ota_hotel_agent` 完全没接，还是纯占位假数据，没有真实比价/查库存来源可接
+2. `route_agent` 目前所有节点都写进同一个占位日期 `_PLACEHOLDER_DAY = "day-1"`，没有真正的多日期规划；交通方式/耗时已经接了高德地图 API 真实计算，但到达/结束的具体钟点时间还是占位文字 `"待定"`
+3. `exception_agent` 用整句用户消息去子串匹配地点名字，很粗糙（比如"西湖"两个字出现在消息里就命中），真实版本应该先做实体识别抽出具体地点
+4. 两阶段检索第二阶段（候选集内部按内容相关性排序）还没实现，`content_agent` 里 `location_hint` 参数目前没用上
 5. 反馈闭环（用户点评行程 → 校准 persona）还没接：`store.log_history()` 记录和 `persona.apply_feedback()` 校准都写好了，但没人在 `orchestrate()` 里调用它们
+6. `map_tool.py` 目前只查"两点之间"，没做"多点最优顺序"规划；`polyline` 路线坐标数据也还没接进 `web/index.html` 做真正的地图可视化，现在只是文字列表
