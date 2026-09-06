@@ -61,4 +61,6 @@ def chat():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    # debug=False：这个服务准备通过 Cloudflare Tunnel 暴露到公网给队友访问，
+    # Werkzeug 的调试器（debug=True）在公网环境下有远程执行代码的风险，不能开。
+    app.run(debug=False, port=5000)

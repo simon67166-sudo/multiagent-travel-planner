@@ -1,6 +1,6 @@
 # orchestrator/ 代码说明
 
-给第一次看这份代码的人快速建立地图用的开发文档。四个文件各管一块，`main.py` 已经把 `persona`/`store`/`trip_plan` 三个模块接起来了（具体接了什么见文末），只有 `agent_ota_hotel` 还是纯占位假数据。
+给第一次看这份代码的人快速建立地图用的开发文档。`main.py` 只是薄薄的入口胶水代码，真正的 5 个 Agent 各自一个文件放在 `agents/` 目录下，`persona`/`store`/`trip_plan` 三个模块已经被对应的 Agent 接起来了（具体接了什么见文末），只有 OTA/酒店 Agent 还是纯占位假数据。
 
 设计背景/接口契约见 [agent-architecture.md](./agent-architecture.md)（为什么这么分 Agent、为什么中心化编排）和 [agent-interfaces.md](./agent-interfaces.md)（字段契约、原本的 Dify 方案，后来改成直接写 Python）。
 
@@ -15,28 +15,72 @@ pip install openai python-dotenv chromadb
 PARATERA_API_KEY=你的key
 ```
 
-四个文件都能直接 `python orchestrator/<文件名>.py` 单独跑，文件末尾的 `if __name__ == "__main__":` 都是自测代码，可以照着抄用法。
+每个文件都能直接 `python orchestrator/<路径>.py` 单独跑（包括 `agents/` 里的 5 个文件），文件末尾的 `if __name__ == "__main__":` 都是自测代码，可以照着抄用法。
 
 ---
 
-## main.py -- 编排 Agent 主流程
+## 目录结构
 
-**职责**：星型架构的中枢。接收用户消息 → 意图识别 → 决定调用哪几个子 Agent → 汇总结果 → 生成回复。对应 [agent-interfaces.md 第三节](./agent-interfaces.md) 的节点拓扑，只是从 Dify 可视化节点换成了 Python 函数。
+```
+orchestrator/
+  llm_tool.py                     # 通用 LLM 调用工具，跟"编排"本身无关，谁都能 import
+  agents/
+    orchestrator_agent.py         # 编排 Agent：new_shared_state + classify_intent + orchestrate
+    content_agent.py              # 达人/内容 Agent
+    route_agent.py                # 行程/路线 Agent
+    ota_hotel_agent.py            # OTA/酒店 Agent（还是纯占位）
+    exception_agent.py            # 异常应变 Agent
+  main.py                         # 薄入口：re-export 编排 Agent 的两个函数 + __main__ 完整 demo
+  store.py / trip_plan.py / persona.py   # 不变
+  server.py / web/                # 不变，还是 import main，接口不受这次拆分影响
+```
+
+拆分原则：谁负责哪个 Agent 就改 `agents/` 下自己那一个文件，不用碰 `main.py` 或别人的 Agent 文件，减少多人协作冲突。
+
+## llm_tool.py -- 通用 LLM 工具
+
+**职责**：跟"编排"这件事本身无关的基础设施，5 个 Agent 里任何一个要调用模型都用这个，不要各自再写一遍 client 初始化。
+
+| 函数/常量 | 作用 |
+|---|---|
+| `call_llm(messages, model=MODEL_FULL)` | 统一的模型调用入口 |
+| `MODEL_FULL` / `MODEL_LIGHT` | `DeepSeek-V4-Pro` / `DeepSeek-V4-Flash`，两档模型对齐 `agent-architecture.md` 的模型档位设计 |
+
+## agents/orchestrator_agent.py -- 编排 Agent
+
+**职责**：星型架构的中枢。接收用户消息 → 意图识别 → 决定调用哪几个子 Agent → 汇总结果 → 生成回复。对应 [agent-interfaces.md 第三节](./agent-interfaces.md) 的节点拓扑，只是从 Dify 可视化节点换成了 Python 函数。模型档位用 `MODEL_FULL`（全系统推理最重）。
 
 | 函数 | 作用 |
 |---|---|
 | `new_shared_state(user_id, scenario="vacation", onboarding_answers=None)` | 造一份共享状态：`persona`（真用 `persona.py` 的结构，传了 `onboarding_answers` 就走冷启动）+ `trip_plan`（真用 `trip_plan.py` 的结构） |
-| `call_llm(messages, model=MODEL_FULL)` | 统一的模型调用入口，`model` 传 `MODEL_FULL`（`DeepSeek-V4-Pro`）或 `MODEL_LIGHT`（`DeepSeek-V4-Flash`） |
 | `classify_intent(user_message)` | 调模型判断这轮要触发 `content`/`route`/`booking`/`exception` 里的哪几个 |
-| `agent_content` | 真实检索：算 persona 向量 → `store.query_similar_posts()` 查候选 |
-| `agent_route` | 真实写入：把地点依次加成 `trip_plan` 某一天的行程节点（时间/交通方式还是占位文字） |
-| `agent_ota_hotel` | **还是占位假数据**，没有真实比价/查库存来源可接 |
-| `agent_exception` | 真实处理：按地点名字子串匹配 `trip_plan` 里的行程节点，命中就删掉并记一条 `weather_alert` |
-| `orchestrate(user_message, shared_state)` | 主流程：意图识别 → 分发调用（子 Agent 直接改 `shared_state` 里的 `trip_plan`，不用再手动写回）→ 生成回复，返回 `(output, shared_state)` |
+| `orchestrate(user_message, shared_state)` | 主流程：意图识别 → 分发调用 4 个子 Agent（子 Agent 直接改 `shared_state` 里的 `trip_plan`，不用再手动写回）→ 生成回复，返回 `(output, shared_state)` |
 
-**模型分档**（见 `agent-architecture.md` 模型档位设计）：编排 Agent 自己的两处调用（意图识别、生成回复）用 `MODEL_FULL`；子 Agent 换成真实实现、要接 LLM 时该用哪档在代码注释里标了（达人→Full，行程/OTA→Light，异常应变待定）。
+## agents/content_agent.py -- 达人/内容 Agent
 
-**现状**：`persona`/`store`/`trip_plan` 三个模块都已经接进 `main.py`（`agent_content`/`agent_route`/`agent_exception` 都在操作真实的共享状态，不再是纯假数据），具体"路线怎么排""异常怎么判定"这些算法还很简单（占位时间字段、纯子串匹配），等真实 Agent 实现替换即可，字段结构不用变。只有 `agent_ota_hotel` 还是完全没接。
+**职责**：两阶段检索第一阶段。模型档位 `MODEL_FULL`（UGC 语义提炼），目前还没实际调用 LLM（纯向量检索）。
+
+`run(shared_state, location_hint, top_k=3)`：算 persona 向量 → `store.query_similar_posts()` 查候选。`location_hint` 留给"内容相关性排序"（两阶段检索第二阶段）用，那部分还没实现。
+
+## agents/route_agent.py -- 行程/路线 Agent
+
+**职责**：把地点写进 `trip_plan` 某一天的行程节点。模型档位 `MODEL_LIGHT`，目前还没接 LLM，纯结构化写入。
+
+`run(shared_state, places, time_budget=None)`：所有节点目前都写进同一个占位日期（`_PLACEHOLDER_DAY = "day-1"`），时间/交通方式字段是占位文字 `"待定"`。
+
+## agents/ota_hotel_agent.py -- OTA/酒店 Agent
+
+**职责**：查库存/比价。模型档位 `MODEL_LIGHT`。**还是纯占位假数据**，没有真实的比价/查库存来源可接。真正确认预订后应该调 `trip_plan.add_hotel()` 落地，目前流程里没有"确认预订"这个触发点。
+
+## agents/exception_agent.py -- 异常应变 Agent
+
+**职责**：按地点名字匹配 `trip_plan` 里的行程节点，命中就删掉并记一条天气异常。模型档位架构文档里写的是"中等模型"，目前只有 `MODEL_FULL`/`MODEL_LIGHT` 两档，先待定。
+
+`run(shared_state, event_type, event_detail=None)`：`event_detail` 目前是纯子串匹配（整句用户消息去匹配地点名字），很粗糙，真实版本应该先做实体识别。
+
+## main.py -- 入口脚本
+
+**职责**：纯胶水代码，不包含任何 Agent 逻辑。`from agents.orchestrator_agent import new_shared_state, orchestrate` 之后直接 re-export，`server.py` 还是 `import main` 调这两个函数，完全不用改。`__main__` 里是完整的端到端 demo（推荐 → 排路线 → 异常应变 → 打印最终行程）。
 
 ---
 
