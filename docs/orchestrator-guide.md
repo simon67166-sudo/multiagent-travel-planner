@@ -10,12 +10,19 @@
 pip install openai python-dotenv chromadb
 ```
 
-在 `orchestrator/.env` 里写两行（这个文件已经在 `.gitignore` 里，不会被提交）：
+在 `orchestrator/.env` 里写这几行（这个文件已经在 `.gitignore` 里，不会被提交）：
 ```
 PARATERA_API_KEY=你的key
 AMAP_KEY=你的高德Web服务API Key
+AMAP_JS_KEY=你的高德Web端(JS API)Key
+AMAP_JS_SECURITY_CODE=你的安全密钥
 ```
-`AMAP_KEY` 去 https://lbs.amap.com 控制台"创建应用"申请，类型要选 **Web服务**（不是 Web端/JS API，两种 key 不通用）。个人开发者未认证 6000次/天，实名认证后 30万次/月，demo 阶段够用。
+高德的 key **分三样东西，缺一个都不行**：
+- `AMAP_KEY`：**Web服务** 类型，后端用（`map_tool.py` 查地理编码/路线）
+- `AMAP_JS_KEY`：**Web端(JS API)** 类型，前端画地图用——注意这是另一个应用/另一个 key，不能跟上面那个通用
+- `AMAP_JS_SECURITY_CODE`：安全密钥，高德 JS API 2.0 版本强制要求，在申请 `AMAP_JS_KEY` 的同一个应用页面能找到
+
+都在 https://lbs.amap.com 控制台"创建应用"里申请（一个应用可以同时创建 Web服务 + Web端(JS API) 两个 key，安全密钥在创建 Web端(JS API) key 的时候会一起给）。个人开发者未认证 6000次/天，实名认证后 30万次/月，demo 阶段够用。
 
 每个文件都能直接 `python orchestrator/<路径>.py` 单独跑（包括 `agents/` 里的 5 个文件），文件末尾的 `if __name__ == "__main__":` 都是自测代码，可以照着抄用法。
 
@@ -92,9 +99,9 @@ orchestrator/
 
 ## agents/ota_hotel_agent.py -- OTA/酒店 Agent
 
-**职责**：查库存/比价。模型档位 `MODEL_LIGHT`。**还是纯占位假数据**，没有真实的比价/查库存来源可接。真正确认预订后应该调 `trip_plan.add_hotel()` 落地，目前流程里没有"确认预订"这个触发点。
+**职责**：查库存/比价。模型档位 `MODEL_LIGHT`。**还是纯占位假数据**，没有真实的比价/查库存来源可接——但字段已经补全到"用户选中后能直接落地"的程度：机票候选带 `flight_no`/`from_`/`to`/`depart_time`/`arrive_time`/`status`，酒店候选带 `address`/`check_in`/`check_out`（`check_in`/`check_out` 会用 `date_range` 参数填，格式 `"开始日期~结束日期"`，没传就给占位日期）。这样 `POST /widget-response`（见 `server.py` 一节）收到用户选中的候选后，能直接拿这些字段调 `trip_plan.add_flight()`/`add_hotel()`，不用现造字段。
 
-`orchestrate()` 里 `booking` 意图命中时会把这里返回的 `candidates` 分别喂给 `widgets.build_flight_picker_widget()`/`widgets.build_hotel_picker_widget()`（按 `candidates` 里的 `provider_type` 字段分流，见下面 `widgets.py` 一节），目前假数据只有 `provider_type: "hotel"` 一条，所以 `flight_picker` 插件暂时永远是空的。
+`orchestrate()` 里 `booking` 意图命中时会把这里返回的 `candidates` 分别喂给 `widgets.build_flight_picker_widget()`/`widgets.build_hotel_picker_widget()`（按 `candidates` 里的 `provider_type` 字段分流，见下面 `widgets.py` 一节），现在假数据一条机票一条酒店都有，两个 widget 都能出内容。
 
 ## agents/exception_agent.py -- 异常应变 Agent
 
@@ -125,10 +132,9 @@ orchestrator/
 
 **四个 widget 分两种交互模式**：`post_list` 是纯展示（截取直接列出来）；`attraction_picker`/`flight_picker`/`hotel_picker` 是"可选池 + 前端勾选 + 结果回传"——`options` + `max_select` 是统一契约，机票/酒店默认 `max_select=1`（通常只订一个），景点默认 `max_select=3`（可以多选几个）。
 
+**现状**：四个 widget 都已经真正接进 `web/index.html` 渲染，`POST /widget-response` 接口也做完了（见 `server.py` 一节）——右侧聊天框里能看到真实的卡片/勾选交互，勾完点"确认选择"会真的把机票/酒店写进 `trip_plan`、把景点排进路线，不再是"传了但没人用"的状态。
+
 **待接事项**：
-- 三个"选择型"widget（`attraction_picker`/`flight_picker`/`hotel_picker`）勾选完之后怎么传回后端——`POST /widget-response` 这个接口还没定义，`server.py`/`web/index.html` 目前都不认这个交互；机票/酒店选完之后触发"确认预订"（调 `trip_plan.add_hotel()` 落地）也要等这个接口
-- 前端 `web/index.html` 还不会渲染 `widget` 字段（现在编排 Agent 已经把 `widgets` 数组塞进 `/chat` 返回值了，但页面 JS 还没处理，等于目前是"传了但没人用"）
-- `build_flight_picker_widget`/`build_hotel_picker_widget` 只是包了一层展示/选择逻辑，`ota_hotel_agent.py` 本身还是纯占位假数据（一条写死的 `"占位酒店/票务 X"`，`provider_type` 固定是 `"hotel"`），所以现在真跑起来永远只有 `hotel_picker` 有内容，`flight_picker` 会一直是 `None`（被跳过）——除非先给 `ota_hotel_agent.py` 补真实/更丰富的候选数据
 - 讨论过的其他 widget 想法还没做：反馈评分插件、异常变更确认插件、人格问卷引导插件
 
 ## schedule_widgets.py -- 左侧日程面板展示组件
@@ -155,11 +161,12 @@ orchestrator/
 - `routes` 里的坐标是把 `map_tool.route_between()` 返回的多段 `polyline` 展平成一条连续的 `[lng, lat]` 序列，直接给前端画线；查询失败的那一段跳过并记进 `route_failures`，不影响其他天/其他段
 - **字段约定**：`flights` 的 `from_`/`to`、`hotels` 的 `address` 建议存能被地理编码识别的地名/地址（比如"杭州萧山国际机场"），不建议只存三字码（比如 `"HGH"`）——高德地理编码认不出机场三字码，会直接进 `geocode_failures`
 
+**现状**：三个 widget 已经接进 `server.py` 的 `GET /trip`，`web/index.html` 用高德 JS API 真的把地图画出来了（见 `server.py + web/index.html` 一节）。
+
 **现状/限制**：
-- 跟 `route_agent.py` 一样依赖 `AMAP_KEY`，没配置时 `markers`/`routes` 会是空的、`*_failures` 里全是查询失败记录（不会导致整体报错，自测已验证这个降级路径）
+- 跟 `route_agent.py` 一样依赖 `AMAP_KEY`（后端查经纬度/路线用的那个，注意不是前端画图用的 `AMAP_JS_KEY`），没配置时 `markers`/`routes` 会是空的、`*_failures` 里全是查询失败记录（不会导致整体报错，自测+真实端到端联调都验证过这个降级路径）
 - `route_agent.py` 里已经算过一次相邻站点的交通方式/耗时，这里为了拿到完整 `polyline` 又独立查了一次路线（避免"展示层"反过来依赖某个 Agent 的内部计算结果），会有一点重复的高德 API 调用，demo/比赛规模的免费额度足够用，不是问题
-- 三个 widget 都还没接进 `server.py`/`web/index.html`，`GET /trip` 目前不会返回这些数据，左侧面板还是纯文字列表
-- 目前没有任何 Agent 真的调用过 `trip_plan.add_flight()`/`add_hotel()`（`ota_hotel_agent.py` 只返回候选，没有"确认预订"触发点，见前面 `ota_hotel_agent.py` 一节），所以 `build_booking_panel_widget`/机票酒店 marker 现在跑起来都是空的，要等那个触发点接上才有真实数据
+- `POST /widget-response` 确认机票/酒店后会真的调 `trip_plan.add_flight()`/`add_hotel()`，`build_booking_panel_widget`/机票酒店 marker 现在跑起来是有真实数据的（端到端联调过：选中机票+酒店 → `/trip` 能看到确认记录）
 
 ## main.py -- 入口脚本
 
@@ -269,39 +276,47 @@ trip_plan = {
 
 ## server.py + web/index.html -- 呈现层（网页）
 
-**职责**：把 `main.py` 的编排 Agent 包成 HTTP 接口，配一个两栏网页——左边实时日程，右边聊天框。原本 `agent-architecture.md` 里设计的是三面板（社区/地图/聊天），这版先简化成两栏，验证"聊天真的能驱动日程展示"这条链路，社区面板/地图面板以后再加。
+**职责**：把 `main.py` 的编排 Agent、`widgets.py`、`schedule_widgets.py` 包成 HTTP 接口 + 真实渲染，配一个两栏网页——左边实时日程（地图+每日时间线+机票酒店面板），右边聊天框（文字回复+四个插件卡片）。这是目前唯一"从对话到落地预订"整条链路能真的跑通的地方。
 
 **运行方式**：
 ```
-pip install flask
+pip install flask python-dotenv
 python orchestrator/server.py
 ```
-然后浏览器打开 `http://127.0.0.1:5000`。
+然后浏览器打开 `http://127.0.0.1:5000`。地图能不能真的画出来，取决于 `.env` 里三个高德 key 有没有配全（见"环境准备"一节）；没配的话页面照样能跑，只是地图是空的、控制台会有一条警告。
 
 **接口**（都是同一个 Flask app 提供，同源不用处理 CORS）：
 
 | 接口 | 作用 |
 |---|---|
-| `GET /` | 返回 `web/index.html` |
-| `GET /trip` | 返回 `trip_plan.render()` 的当前完整行程，左侧日程面板用这个渲染 |
-| `POST /chat` | body 传 `{"message": "..."}`，内部调 `main.orchestrate()`，返回编排 Agent 的输出（`chat_reply`/`community_panel`/`map_panel`） |
+| `GET /` | 返回 `web/index.html`，服务端会把文件里的 `__AMAP_JS_KEY__`/`__AMAP_JS_SECURITY_CODE__` 占位符换成 `.env` 里的真实值再返回（这两个 key 不写进 git 里的 html 文件，跟其他密钥一样只活在 `.env`） |
+| `GET /trip` | 返回 `trip_plan.render()` 的行程 + 额外三个字段 `trip_map`/`day_timeline`/`booking_panel`（分别是 `schedule_widgets.py` 那三个函数的输出），左侧日程面板用这个渲染 |
+| `POST /chat` | body 传 `{"message": "..."}`，内部调 `main.orchestrate()`，返回编排 Agent 的输出（`chat_reply`/`community_panel`/`map_panel`/`widgets`） |
+| `POST /widget-response` | body 传 `{"widget": "attraction_picker"\|"flight_picker"\|"hotel_picker", "selected": [...]}`，`selected` 是前端从对应 widget 的 `options` 里原样拿到的候选对象（不是前端自己编的字段，跟 `widgets.py` 里"LLM 只能选真实 ID"是同一个防幻觉思路）。景点选中后调 `route_agent.run()` 排进行程；机票/酒店选中后调 `trip_plan.add_flight()`/`add_hotel()` 确认预订 |
 
-**前端逻辑**（`web/index.html`，原生 HTML/CSS/JS，没引入任何框架）：发消息 → 调 `/chat` 显示回复 → 再调一次 `/trip` 刷新左侧日程，这样每次对话后日程面板都是最新状态。
+**前端逻辑**（`web/index.html`，原生 HTML/CSS/JS + 高德地图 JS SDK，没引入前端框架）：
+
+- 发消息 → 调 `/chat` → 显示文字回复 → 把返回的 `widgets` 数组按类型分发渲染（`post_list` 是横滑卡片；`attraction_picker`/`flight_picker`/`hotel_picker` 共用同一套"复选框 + 确认按钮"组件，`max_select` 决定最多能勾几个）→ 再调一次 `/trip` 刷新左侧日程
+- 三个"选择型" widget 点"确认选择"之后：把勾中的候选对象原样 `POST /widget-response`，成功后往聊天记录里加一条系统提示（"已确认：xxx"），再刷新一次左侧日程
+- 左侧地图用 `AMap.Map` 初始化一次（页面加载时），之后每次 `/trip` 刷新只 `map.clearMap()` 重画：景点/餐饮用 `AMap.CircleMarker` 按天上色，机票/酒店 marker 固定深灰蓝/棕色（颜色跟 `schedule_widgets.py` 里的常量对应，改了那边记得这边也要改），路线用 `AMap.Polyline` 按天上色，标记点击会弹 `AMap.InfoWindow` 显示地点名
+- 每日行程时间线现在读 `trip.day_timeline`（带颜色）而不是原始的 `trip.days`，模块颜色跟地图上同一天的颜色对得上
 
 **现状/限制**：
 - 全局只有一个进程内共享状态（`server.py` 里的 `_state`），是单会话 demo，没有登录/多用户/并发处理，仅供本地演示，不要直接这样部署到公网
-- 已经端到端测试过："推荐+排路线"这类消息发过去，`/trip` 能看到新加的行程节点；异常应变消息发过去，`/trip` 能看到节点被删掉——聊天确实驱动了日程展示
-- 社区图文面板、地图面板（三面板设计里剩下的两块）还没做进网页
+- 已经端到端联调过完整链路："推荐+排路线+查机票酒店"发过去 → 右侧出现 `flight_picker`/`hotel_picker` → 模拟前端 `POST /widget-response` 选中一个航班一个酒店 → 再查 `/trip` 能看到 `flights`/`hotels` 里多了确认记录（这一步是直接打 API 验证的，没配 `AMAP_JS_KEY` 时浏览器里的地图看不到，但数据链路是通的）
+- 社区图文面板（三面板设计里"逛社区帖子墙"那块，跟聊天框里的 `post_list` 不是一回事）还没做进网页
+- 地图是"重新全量清空再画"，不是增量更新，行程节点很多的时候会有一点点闪烁，demo 规模不明显
 
 ## 待接事项
 
-四个文件已经在 `main.py` 里串起来了（`persona`/`store`/`trip_plan` 都接了），跑 `python orchestrator/main.py` 能看到一次完整的"推荐→规划路线→异常应变→重新渲染行程"的端到端流程。还剩这几处没做：
+`main.py`/`server.py` 已经把所有 Agent + 两套 widgets 串成一条完整链路：跑 `python orchestrator/main.py` 能看到一次"推荐→规划路线→异常应变→重新渲染行程"的端到端流程；跑 `python orchestrator/server.py` 打开网页，能看到"聊天推荐→勾选景点/机票/酒店→确认→左侧地图/时间线/机票酒店面板更新"这条更完整的闭环真的在跑（已端到端联调验证过）。还剩这几处没做，都不阻塞基本演示：
 
-1. `ota_hotel_agent` 完全没接，还是纯占位假数据，没有真实比价/查库存来源可接
-2. `route_agent` 目前所有节点都写进同一个占位日期 `_PLACEHOLDER_DAY = "day-1"`，没有真正的多日期规划；交通方式/耗时已经接了高德地图 API 真实计算，但到达/结束的具体钟点时间还是占位文字 `"待定"`
+1. `ota_hotel_agent` 还是纯占位假数据（固定一条机票一条酒店），没有真实比价/查库存来源可接
+2. `route_agent` 目前所有节点都写进同一个占位日期 `_PLACEHOLDER_DAY = "day-1"`，没有真正的多日期规划——这意味着"按天上色"这个视觉设计在真实多日行程里还体现不出来（永远只有一种颜色）；交通方式/耗时已经接了高德地图 API 真实计算，但到达/结束的具体钟点时间还是占位文字 `"待定"`
 3. `exception_agent` 用整句用户消息去子串匹配地点名字，很粗糙（比如"西湖"两个字出现在消息里就命中），真实版本应该先做实体识别抽出具体地点
 4. 两阶段检索第二阶段（候选集内部按内容相关性排序）还没实现，`content_agent` 里 `location_hint` 参数目前没用上
 5. 反馈闭环（用户点评行程 → 校准 persona）还没接：`store.log_history()` 记录和 `persona.apply_feedback()` 校准都写好了，但没人在 `orchestrate()` 里调用它们
-6. `map_tool.py` 目前只查"两点之间"，没做"多点最优顺序"规划；`polyline` 路线坐标数据也还没接进 `web/index.html` 做真正的地图可视化，现在只是文字列表
-7. `widgets.py` 的四个插件（`post_list`/`attraction_picker`/`flight_picker`/`hotel_picker`）已经接进 `orchestrate()` 输出的 `widgets` 数组，但 `POST /widget-response` 回传接口和前端渲染都还没做（详见 `widgets.py` 一节的"待接事项"），另外几个 widget 想法（反馈评分/异常确认/人格问卷）也还没开始
-8. `schedule_widgets.py` 的三个 widget（`trip_map`/`day_timeline`/`booking_panel`）还没接进 `server.py`/`web/index.html`，左侧日程面板目前还是纯文字列表；另外没有 Agent 真的调用过 `trip_plan.add_flight()`/`add_hotel()`，机票酒店相关的 marker/面板现在跑起来都是空的
+6. `map_tool.py` 目前只查"两点之间"，没做"多点最优顺序"规划（比如给定 5 个景点，没有算出最优游览顺序，只是按用户/LLM 给的顺序排）
+7. 三个高德 key（`AMAP_KEY`/`AMAP_JS_KEY`/`AMAP_JS_SECURITY_CODE`）需要去高德开放平台申请配置，没配的话地图相关功能会优雅降级但看不到真实效果
+8. 讨论过的其他 widget 想法还没做：反馈评分插件、异常变更确认插件、人格问卷引导插件
+9. 单会话全局 state（`server.py` 里的 `_state`），没有登录/多用户/并发处理，真要多人同时用需要重新设计状态管理

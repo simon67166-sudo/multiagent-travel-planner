@@ -3,6 +3,12 @@
 <head>
 <meta charset="utf-8">
 <title>旅程编排 Demo</title>
+<script>
+  // 高德 JS API 2.0 要求先配安全密钥再加载 SDK；key/密钥本身不写死在这个文件里
+  // （这个文件要提交进 git），由 server.py 在返回页面时把占位符换成 .env 里的真实值。
+  window._AMapSecurityConfig = { securityJsCode: "__AMAP_JS_SECURITY_CODE__" };
+</script>
+<script src="https://webapi.amap.com/maps?v=2.0&key=__AMAP_JS_KEY__"></script>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -16,63 +22,107 @@
 
   /* ---------- 左：实时日程 ---------- */
   #schedule {
-    width: 42%;
-    max-width: 520px;
+    width: 44%;
+    max-width: 560px;
     border-right: 1px solid #ddd;
-    padding: 20px;
+    padding: 18px;
     overflow-y: auto;
     background: #fff;
   }
-  #schedule h2 { margin-top: 0; font-size: 18px; }
-  #schedule h3 { font-size: 14px; color: #666; margin: 20px 0 8px; text-transform: uppercase; letter-spacing: 1px; }
+  #schedule h2 { margin: 0 0 14px; font-size: 18px; display: flex; align-items: center; gap: 7px; }
+  #schedule h2 .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #0b5d3b; box-shadow: 0 0 0 3px rgba(11,93,59,.2); }
+  #schedule h3 { font-size: 12.5px; color: #888; margin: 20px 0 8px; text-transform: uppercase; letter-spacing: 1px; }
   .empty-hint { color: #999; font-size: 13px; }
 
   .card { border: 1px solid #e5e5e0; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; font-size: 13px; }
   .card .title { font-weight: 600; }
   .card .meta { color: #777; margin-top: 2px; }
-
   .alert-card { background: #fff4e5; border-color: #f0c36d; }
 
-  .day-block { margin-bottom: 16px; }
-  .day-date { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
-  .stop {
-    display: flex;
-    gap: 8px;
-    padding: 8px 10px;
-    border-left: 3px solid #0b5d3b;
-    background: #f7f7f4;
-    border-radius: 4px;
-    margin-bottom: 6px;
-    font-size: 13px;
+  /* 机票/酒店确认面板卡片 */
+  .booking-card { border: 1px solid #e5e5e0; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .booking-card .row1 { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .booking-card .kind {
+    font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    padding: 2px 6px; border-radius: 5px;
   }
-  .stop.meal { border-left-color: #a6402b; }
-  .stop .icon { flex: none; }
-  .stop .place { font-weight: 600; }
-  .stop .detail { color: #777; font-size: 12px; margin-top: 2px; }
+  .booking-card.flight .kind { background: #e7ebee; color: #33414f; }
+  .booking-card.hotel .kind { background: #f2ead9; color: #8a6d3b; }
+  .booking-card .title { font-weight: 700; font-size: 13.5px; }
+  .booking-card .sub { color: #777; font-size: 12px; margin-top: 2px; }
+  .booking-card .confirmed { font-size: 11px; color: #0b5d3b; font-weight: 700; }
+
+  /* 地图 */
+  #map-container { width: 100%; height: 260px; border-radius: 8px; border: 1px solid #e5e5e0; background: #eef1ee; }
+  .map-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11px; color: #777; margin-top: 8px; }
+  .map-legend .item { display: flex; align-items: center; gap: 5px; }
+  .map-legend .dot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+
+  /* 每日行程时间线（按天分模块+配色，跟地图对齐） */
+  .day-module { border: 1px solid #e5e5e0; border-radius: 8px; overflow: hidden; margin-bottom: 10px; }
+  .day-module__head { padding: 7px 12px; font-size: 12.5px; font-weight: 700; color: #fff; }
+  .day-module__body { padding: 9px 12px 11px; background: #fff; }
+  .tl-stop { display: flex; gap: 8px; padding: 5px 0; }
+  .tl-stop .time { flex: none; width: 78px; font-size: 11px; color: #888; padding-top: 1px; }
+  .tl-stop .body { flex: 1; border-left: 2px solid #ddd; padding-left: 9px; }
+  .tl-stop .place { font-weight: 600; font-size: 13px; }
+  .tl-stop .detail { color: #777; font-size: 11.5px; margin-top: 1px; }
 
   /* ---------- 右：聊天 ---------- */
-  #chat { flex: 1; display: flex; flex-direction: column; }
-  #messages { flex: 1; overflow-y: auto; padding: 20px; }
-  .msg { max-width: 70%; margin-bottom: 12px; padding: 10px 14px; border-radius: 10px; font-size: 14px; line-height: 1.5; }
+  #chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #messages { flex: 1; overflow-y: auto; padding: 18px 20px; }
+  .msg { max-width: 72%; margin-bottom: 6px; padding: 10px 14px; border-radius: 10px; font-size: 14px; line-height: 1.5; }
   .msg.user { margin-left: auto; background: #0b5d3b; color: #fff; }
   .msg.assistant { margin-right: auto; background: #fff; border: 1px solid #e5e5e0; }
   .msg.pending { opacity: 0.6; }
+  .msg.system { margin: 0 auto 6px; background: #f0f4f1; color: #555; font-size: 12.5px; text-align: center; max-width: 90%; }
+
+  .widget-block { margin-bottom: 14px; }
+  .widget-tag { font-size: 10px; color: #999; margin: 0 0 6px 4px; font-family: monospace; }
+
+  /* post_list */
+  .post-list { display: flex; gap: 10px; overflow-x: auto; padding: 2px 2px 8px; }
+  .post-card { flex: none; width: 190px; border: 1px solid #e5e5e0; border-radius: 10px; padding: 11px 12px; background: #fff; display: flex; flex-direction: column; gap: 6px; }
+  .post-card .top { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
+  .post-card .place { font-weight: 700; font-size: 13.5px; }
+  .post-card .rating { font-size: 11px; color: #a6402b; font-weight: 700; white-space: nowrap; }
+  .post-card .meta { display: flex; flex-wrap: wrap; gap: 4px; font-size: 10.5px; color: #777; }
+  .chip { background: #eef4f0; color: #0b5d3b; padding: 2px 6px; border-radius: 999px; font-weight: 600; }
+  .post-card .caption { font-size: 11.5px; color: #666; line-height: 1.5; }
+  .post-card .tip { font-size: 10.5px; color: #888; border-top: 1px dashed #e5e5e0; padding-top: 6px; }
+
+  /* picker（attraction/flight/hotel 共用） */
+  .picker { border: 1px solid #e5e5e0; border-radius: 10px; overflow: hidden; background: #fff; }
+  .picker__head { display: flex; justify-content: space-between; align-items: center; padding: 9px 13px; background: #eef4f0; font-size: 12px; }
+  .picker__head b { color: #0b5d3b; }
+  .picker__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 1px; background: #e5e5e0; }
+  .opt { background: #fff; padding: 11px 13px; display: flex; flex-direction: column; gap: 5px; cursor: pointer; }
+  .opt.picked { background: #eef4f0; }
+  .opt .row1 { display: flex; justify-content: space-between; align-items: flex-start; gap: 6px; }
+  .opt .place { font-weight: 700; font-size: 13px; }
+  .opt input[type="checkbox"] { margin: 2px 0 0; flex: none; width: 15px; height: 15px; }
+  .opt .sub { font-size: 10.5px; color: #888; }
+  .opt .cost { font-size: 11px; color: #a6402b; font-weight: 700; }
+  .picker__foot { display: flex; justify-content: space-between; align-items: center; padding: 8px 13px; border-top: 1px solid #eee; }
+  .picker__foot .hint { font-size: 10.5px; color: #999; }
+  .picker__foot button {
+    padding: 6px 14px; border: none; border-radius: 6px; background: #0b5d3b; color: #fff;
+    font-size: 12px; cursor: pointer;
+  }
+  .picker__foot button:disabled { background: #bbb; cursor: default; }
 
   #input-bar { display: flex; gap: 8px; padding: 16px 20px; border-top: 1px solid #ddd; background: #fff; }
-  #input-bar input {
-    flex: 1; padding: 10px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px;
-  }
-  #input-bar button {
-    padding: 10px 20px; border: none; border-radius: 6px; background: #0b5d3b; color: #fff;
-    font-size: 14px; cursor: pointer;
-  }
+  #input-bar input { flex: 1; padding: 10px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+  #input-bar button { padding: 10px 20px; border: none; border-radius: 6px; background: #0b5d3b; color: #fff; font-size: 14px; cursor: pointer; }
   #input-bar button:disabled { background: #999; cursor: default; }
 </style>
 </head>
 <body>
 
 <div id="schedule">
-  <h2>实时日程</h2>
+  <h2><span class="live-dot"></span>实时日程</h2>
+  <div id="map-container"></div>
+  <div class="map-legend" id="map-legend"></div>
   <div id="schedule-content"><p class="empty-hint">加载中…</p></div>
 </div>
 
@@ -90,44 +140,322 @@ const inputEl = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const scheduleEl = document.getElementById("schedule-content");
 
-function addMessage(role, text, pending) {
+// 跟 schedule_widgets.py 里 _AIRPORT_COLOR/_HOTEL_COLOR 保持一致（那两个是固定色，不按天分配）
+const AIRPORT_COLOR = "#33414f";
+const HOTEL_COLOR = "#8a6d3b";
+
+let map = null;
+try {
+  map = new AMap.Map("map-container", { zoom: 11, center: [120.15, 30.25] });
+} catch (e) {
+  console.warn("高德地图初始化失败（可能是 AMAP_JS_KEY/安全密钥还没配置）：", e);
+}
+
+function addMessage(role, content, pending) {
   const div = document.createElement("div");
   div.className = "msg " + role + (pending ? " pending" : "");
-  div.textContent = text;
+  if (typeof content === "string") {
+    div.textContent = content;
+  } else {
+    div.appendChild(content);
+  }
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return div;
 }
 
-function renderStop(stop) {
-  const isMeal = stop.type === "meal";
-  const label = isMeal ? (stop.meal_type || "餐饮") : "景点";
-  return `
-    <div class="stop ${isMeal ? "meal" : ""}">
-      <div class="icon">${isMeal ? "🍜" : "📍"}</div>
-      <div>
-        <div class="place">${stop.place}（${label}）</div>
-        <div class="detail">${stop.arrival_transport} 到达 · ${stop.arrival_time} - ${stop.end_time}</div>
+function addSystemNote(text) {
+  addMessage("system", text, false);
+}
+
+// ---------------------------------------------------------------------
+// 右侧：聊天 widgets 渲染
+// ---------------------------------------------------------------------
+function renderPostList(data) {
+  const wrap = document.createElement("div");
+  wrap.className = "post-list";
+  (data.posts || []).forEach(p => {
+    const card = document.createElement("div");
+    card.className = "post-card";
+    card.innerHTML = `
+      <div class="top"><span class="place">${p.place || ""}</span><span class="rating">${p.rating ? "★" + p.rating : ""}</span></div>
+      <div class="meta">
+        ${p.time_slot ? `<span class="chip">${p.time_slot}</span>` : ""}
+        ${p.avg_cost != null ? `<span class="chip">人均 ¥${p.avg_cost}</span>` : ""}
+        ${p.verified_trip ? `<span class="chip">已验证</span>` : ""}
       </div>
-    </div>`;
+      ${p.caption ? `<div class="caption">${p.caption}</div>` : ""}
+      ${p.avoid_tips ? `<div class="tip">避坑：${p.avoid_tips}</div>` : ""}
+    `;
+    wrap.appendChild(card);
+  });
+  return wrap;
+}
+
+function optionLabel(item) {
+  // attraction_picker 的候选用 place，flight/hotel_picker 的候选用 name
+  return item.place || item.name || "（未命名）";
+}
+
+function optionSub(item) {
+  if (item.provider_type === "flight") {
+    return `${item.depart_time || "?"} 起飞 → ${item.arrive_time || "?"} 到达 · ${item.status || ""}`;
+  }
+  if (item.provider_type === "hotel") {
+    return `${item.check_in || "?"} ~ ${item.check_out || "?"} · ${item.cancel_policy || ""}`;
+  }
+  return [item.time_slot, item.caption].filter(Boolean).join(" · ");
+}
+
+function optionCost(item) {
+  if (item.price != null) return `¥${item.price}` + (item.provider_type === "hotel" ? " / 晚" : "");
+  if (item.avg_cost != null) return `人均 ¥${item.avg_cost}`;
+  return "";
+}
+
+// 三个"选择型" widget（attraction_picker / flight_picker / hotel_picker）共用同一套渲染+回传逻辑
+function renderPicker(widgetType, data, headTitle) {
+  const options = data.options || [];
+  const maxSelect = data.max_select || 1;
+  const picked = new Set();
+
+  const wrap = document.createElement("div");
+  wrap.className = "picker";
+
+  const head = document.createElement("div");
+  head.className = "picker__head";
+  head.innerHTML = `<b>${headTitle}</b><span class="count">已选 <span class="n">0</span> / ${maxSelect}</span>`;
+  wrap.appendChild(head);
+
+  const grid = document.createElement("div");
+  grid.className = "picker__grid";
+
+  const foot = document.createElement("div");
+  foot.className = "picker__foot";
+  const confirmBtn = document.createElement("button");
+  confirmBtn.textContent = "确认选择";
+  confirmBtn.disabled = true;
+  foot.innerHTML = `<span class="hint">最多选 ${maxSelect} 个</span>`;
+  foot.appendChild(confirmBtn);
+
+  function updateCount() {
+    head.querySelector(".n").textContent = picked.size;
+    confirmBtn.disabled = picked.size === 0;
+  }
+
+  options.forEach((item, idx) => {
+    const key = item.post_id || item.name || String(idx);
+    const opt = document.createElement("div");
+    opt.className = "opt";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        if (picked.size >= maxSelect) {
+          checkbox.checked = false;
+          return;
+        }
+        picked.add(key);
+        opt.classList.add("picked");
+      } else {
+        picked.delete(key);
+        opt.classList.remove("picked");
+      }
+      updateCount();
+    });
+
+    const row1 = document.createElement("div");
+    row1.className = "row1";
+    row1.innerHTML = `<span class="place">${optionLabel(item)}</span>`;
+    row1.appendChild(checkbox);
+
+    opt.appendChild(row1);
+    const sub = document.createElement("div");
+    sub.className = "sub";
+    sub.textContent = optionSub(item);
+    opt.appendChild(sub);
+    const cost = document.createElement("div");
+    cost.className = "cost";
+    cost.textContent = optionCost(item);
+    opt.appendChild(cost);
+
+    opt.addEventListener("click", (e) => {
+      if (e.target !== checkbox) checkbox.click();
+    });
+
+    grid.appendChild(opt);
+    opt.dataset.key = key;
+    opt._item = item;
+  });
+
+  confirmBtn.addEventListener("click", async () => {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = "提交中…";
+    const selected = Array.from(grid.children)
+      .filter(opt => picked.has(opt.dataset.key))
+      .map(opt => opt._item);
+    try {
+      const res = await fetch("/widget-response", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ widget: widgetType, selected }),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      confirmBtn.textContent = "已确认";
+      addSystemNote(`已确认：${selected.map(optionLabel).join("、")}`);
+      await refreshSchedule();
+    } catch (err) {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = "确认选择";
+      addSystemNote("提交失败：" + err);
+    }
+  });
+
+  wrap.appendChild(grid);
+  wrap.appendChild(foot);
+  return wrap;
+}
+
+const WIDGET_TITLES = {
+  attraction_picker: "选出你最想去的地方",
+  flight_picker: "选一个航班",
+  hotel_picker: "选一间酒店",
+};
+
+function renderWidgets(widgets) {
+  (widgets || []).forEach(w => {
+    const block = document.createElement("div");
+    block.className = "widget-block";
+    const tag = document.createElement("div");
+    tag.className = "widget-tag";
+    tag.textContent = "widget: " + w.widget;
+    block.appendChild(tag);
+
+    if (w.widget === "post_list") {
+      block.appendChild(renderPostList(w.data));
+    } else if (w.widget in WIDGET_TITLES) {
+      block.appendChild(renderPicker(w.widget, w.data, WIDGET_TITLES[w.widget]));
+    } else {
+      return; // 未知 widget 类型，先不渲染
+    }
+    messagesEl.appendChild(block);
+  });
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// ---------------------------------------------------------------------
+// 左侧：实时日程渲染（航班/酒店/异常提醒/地图/每日时间线）
+// ---------------------------------------------------------------------
+function renderMap(tripMap) {
+  if (!map || !tripMap) return;
+  map.clearMap();
+  const data = tripMap.data || {};
+  const markers = data.markers || [];
+  const routes = data.routes || [];
+
+  const overlays = [];
+  markers.forEach(m => {
+    const circle = new AMap.CircleMarker({
+      center: [m.lng, m.lat],
+      radius: 7,
+      strokeColor: "#fff",
+      strokeWeight: 2,
+      fillColor: m.color,
+      fillOpacity: 1,
+      zIndex: 20,
+      cursor: "pointer",
+    });
+    const label = m.type === "airport" ? `${m.place}（${m.role === "depart" ? "出发" : "到达"}）`
+      : m.type === "hotel" ? `${m.name || m.place}`
+      : m.place;
+    const info = new AMap.InfoWindow({ content: `<div style="font-size:12px;">${label}</div>`, offset: new AMap.Pixel(0, -10) });
+    circle.on("click", () => info.open(map, [m.lng, m.lat]));
+    circle.setMap(map);
+    overlays.push(circle);
+  });
+
+  routes.forEach(r => {
+    const line = new AMap.Polyline({
+      path: r.coordinates.map(c => [c[0], c[1]]),
+      strokeColor: r.color,
+      strokeWeight: 4,
+      strokeOpacity: 0.85,
+      lineJoin: "round",
+    });
+    line.setMap(map);
+    overlays.push(line);
+  });
+
+  if (overlays.length) map.setFitView(overlays);
+}
+
+function renderMapLegend(tripMap) {
+  const legend = (tripMap && tripMap.data && tripMap.data.days_legend) || [];
+  let html = "";
+  legend.forEach(d => {
+    html += `<div class="item"><span class="dot" style="background:${d.color};border-radius:50%;"></span>${d.date}</div>`;
+  });
+  html += `<div class="item"><span class="dot" style="background:${AIRPORT_COLOR};"></span>机票起降</div>`;
+  html += `<div class="item"><span class="dot" style="background:${HOTEL_COLOR};border-radius:50%;"></span>酒店</div>`;
+  return html;
+}
+
+function renderStopIcon(type) {
+  return type === "meal" ? "🍜" : type === "airport" ? "✈️" : type === "hotel" ? "🛏️" : "📍";
+}
+
+function renderDayTimeline(dayTimeline) {
+  const days = (dayTimeline && dayTimeline.data && dayTimeline.data.days) || [];
+  if (!days.length) return `<p class="empty-hint">还没有行程安排，去右边跟编排 Agent 聊聊吧。</p>`;
+  let html = "";
+  days.forEach(day => {
+    html += `<div class="day-module">
+      <div class="day-module__head" style="background:${day.color};">${day.date}</div>
+      <div class="day-module__body">`;
+    if (!day.stops.length) {
+      html += `<p class="empty-hint">这天暂无安排</p>`;
+    } else {
+      day.stops.forEach(stop => {
+        const label = stop.type === "meal" ? (stop.meal_type || "餐饮") : "景点";
+        html += `<div class="tl-stop">
+          <div class="time">${stop.time_range}</div>
+          <div class="body">
+            <div class="place">${renderStopIcon(stop.type)} ${stop.place}（${label}）</div>
+            <div class="detail">${stop.arrival_transport || ""}</div>
+          </div>
+        </div>`;
+      });
+    }
+    html += `</div></div>`;
+  });
+  return html;
 }
 
 function renderSchedule(trip) {
+  document.getElementById("map-legend").innerHTML = renderMapLegend(trip.trip_map);
+  renderMap(trip.trip_map);
+
   let html = "";
 
   if (trip.flights && trip.flights.length) {
-    html += "<h3>航班</h3>";
+    html += "<h3>机票</h3>";
     trip.flights.forEach(f => {
-      html += `<div class="card"><div class="title">${f.flight_no || ""} ${f.from_ || ""} → ${f.to || ""}</div>
-        <div class="meta">${f.depart_time || ""} - ${f.arrive_time || ""} · ${f.status || ""}</div></div>`;
+      html += `<div class="booking-card flight">
+        <div class="row1"><span class="kind">机票</span><span class="confirmed">已确认</span></div>
+        <div class="title">${f.flight_no || ""} ${f.from_ || ""} → ${f.to || ""}</div>
+        <div class="sub">${f.depart_time || ""} 起飞 → ${f.arrive_time || ""} 到达 · ${f.status || ""}</div>
+      </div>`;
     });
   }
 
   if (trip.hotels && trip.hotels.length) {
     html += "<h3>酒店</h3>";
     trip.hotels.forEach(h => {
-      html += `<div class="card"><div class="title">${h.name || ""}</div>
-        <div class="meta">${h.check_in || ""} ~ ${h.check_out || ""} · ¥${h.price ?? "-"}</div></div>`;
+      html += `<div class="booking-card hotel">
+        <div class="row1"><span class="kind">酒店</span><span class="confirmed">¥${h.price ?? "-"} / 晚</span></div>
+        <div class="title">${h.name || ""}</div>
+        <div class="sub">${h.check_in || ""} ~ ${h.check_out || ""} · ${h.cancel_policy || ""}</div>
+      </div>`;
     });
   }
 
@@ -139,20 +467,7 @@ function renderSchedule(trip) {
     });
   }
 
-  html += "<h3>每日行程</h3>";
-  if (!trip.days || !trip.days.length) {
-    html += `<p class="empty-hint">还没有行程安排，去右边跟编排 Agent 聊聊吧。</p>`;
-  } else {
-    trip.days.forEach(day => {
-      html += `<div class="day-block"><div class="day-date">${day.date}</div>`;
-      if (!day.stops.length) {
-        html += `<p class="empty-hint">这天暂无安排</p>`;
-      } else {
-        day.stops.forEach(stop => { html += renderStop(stop); });
-      }
-      html += `</div>`;
-    });
-  }
+  html += "<h3>每日行程</h3>" + renderDayTimeline(trip.day_timeline);
 
   scheduleEl.innerHTML = html;
 }
@@ -181,6 +496,7 @@ async function sendMessage() {
     const data = await res.json();
     pendingEl.classList.remove("pending");
     pendingEl.textContent = data.chat_reply || data.error || "（没有回复）";
+    renderWidgets(data.widgets);
     await refreshSchedule();
   } catch (err) {
     pendingEl.classList.remove("pending");
