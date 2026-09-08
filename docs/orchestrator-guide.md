@@ -93,7 +93,7 @@ orchestrator/
 
 **职责**：查库存/比价。模型档位 `MODEL_LIGHT`。**还是纯占位假数据**，没有真实的比价/查库存来源可接。真正确认预订后应该调 `trip_plan.add_hotel()` 落地，目前流程里没有"确认预订"这个触发点。
 
-`orchestrate()` 里 `booking` 意图命中时会把这里返回的 `candidates` 分别喂给 `widgets.build_flight_compare_widget()`/`widgets.build_hotel_list_widget()`（按 `candidates` 里的 `provider_type` 字段分流，见下面 `widgets.py` 一节），目前假数据只有 `provider_type: "hotel"` 一条，所以 `flight_compare` 插件暂时永远是空的。
+`orchestrate()` 里 `booking` 意图命中时会把这里返回的 `candidates` 分别喂给 `widgets.build_flight_picker_widget()`/`widgets.build_hotel_picker_widget()`（按 `candidates` 里的 `provider_type` 字段分流，见下面 `widgets.py` 一节），目前假数据只有 `provider_type: "hotel"` 一条，所以 `flight_picker` 插件暂时永远是空的。
 
 ## agents/exception_agent.py -- 异常应变 Agent
 
@@ -115,17 +115,19 @@ orchestrator/
 |---|---|
 | `build_post_list_widget(candidates, top_k=3, use_llm_rerank=False)` | 帖子展示插件：默认直接截取候选集前 `top_k` 个（候选集已经是真实排序过的，不用额外调 LLM）；传 `use_llm_rerank=True` 走 LLM 二次筛选 |
 | `build_attraction_picker_widget(candidates, max_select=3, pool_size=6, use_llm_rerank=True)` | 景点选择插件：从候选里选出 `pool_size` 个放进"可选池"返回给前端，用户从池子里最多勾 `max_select` 个；默认走 LLM 精选候选池（LLM 只能选真实 ID） |
-| `build_flight_compare_widget(candidates, top_k=3, use_llm_rerank=True)` | 机票比价插件：从 `candidates` 里只挑 `provider_type == "flight"` 的，走 LLM 综合价格/退改政策精选 `top_k` 个；筛出来是空的就返回 `None`（调用方按 `None` 跳过，不展示空插件） |
-| `build_hotel_list_widget(candidates, top_k=3, use_llm_rerank=True)` | 酒店推荐插件：跟 `build_flight_compare_widget` 同一个模式，只挑 `provider_type == "hotel"` 的；同样可能返回 `None` |
+| `build_flight_picker_widget(candidates, max_select=1, pool_size=3, use_llm_rerank=True)` | 机票选择插件：跟 `build_attraction_picker_widget` 同一套"可选池 + 前端勾选 + 结果回传"契约，只是机票通常只订一个，默认 `max_select=1`；从 `candidates` 里只挑 `provider_type == "flight"` 的，走 LLM 精选出 `pool_size` 个放进候选池；筛出来是空的就返回 `None`（调用方按 `None` 跳过，不展示空插件） |
+| `build_hotel_picker_widget(candidates, max_select=1, pool_size=3, use_llm_rerank=True)` | 酒店选择插件：跟 `build_flight_picker_widget` 同一个模式，只挑 `provider_type == "hotel"` 的；同样可能返回 `None` |
 
 **依赖**：
 - `content_agent.py` 返回的 `recommendations` 每条都带 `post_id` 字段（`store.query_similar_posts()` 本来就返回这个字段，之前 `content_agent.py` 组装返回值时漏传了，现已补上），`build_post_list_widget`/`build_attraction_picker_widget` 靠这个字段做 ID 校验。
-- `build_flight_compare_widget`/`build_hotel_list_widget` 的候选（`ota_hotel_agent.run()` 的 `candidates`）没有独立 id 字段，改用 `name` 字段当 `_llm_select` 的校验 key——跟 `post_id` 是同样的作用，只是换了个字段名。
+- `build_flight_picker_widget`/`build_hotel_picker_widget` 的候选（`ota_hotel_agent.run()` 的 `candidates`）没有独立 id 字段，改用 `name` 字段当 `_llm_select` 的校验 key——跟 `post_id` 是同样的作用，只是换了个字段名。
 
-**待接事项**（用户明确说了先做这两个 widget，其余下一步再加，避免一次性铺太大）：
-- 用户在 `attraction_picker` 里勾选完之后怎么传回后端——`POST /widget-response` 这个接口还没定义，`server.py`/`web/index.html` 目前都不认这个交互
+**四个 widget 分两种交互模式**：`post_list` 是纯展示（截取直接列出来）；`attraction_picker`/`flight_picker`/`hotel_picker` 是"可选池 + 前端勾选 + 结果回传"——`options` + `max_select` 是统一契约，机票/酒店默认 `max_select=1`（通常只订一个），景点默认 `max_select=3`（可以多选几个）。
+
+**待接事项**：
+- 三个"选择型"widget（`attraction_picker`/`flight_picker`/`hotel_picker`）勾选完之后怎么传回后端——`POST /widget-response` 这个接口还没定义，`server.py`/`web/index.html` 目前都不认这个交互；机票/酒店选完之后触发"确认预订"（调 `trip_plan.add_hotel()` 落地）也要等这个接口
 - 前端 `web/index.html` 还不会渲染 `widget` 字段（现在编排 Agent 已经把 `widgets` 数组塞进 `/chat` 返回值了，但页面 JS 还没处理，等于目前是"传了但没人用"）
-- `build_flight_compare_widget`/`build_hotel_list_widget` 只是包了一层展示逻辑，`ota_hotel_agent.py` 本身还是纯占位假数据（一条写死的 `"占位酒店/票务 X"`，`provider_type` 固定是 `"hotel"`），所以现在真跑起来永远只有 `hotel_list` 有内容，`flight_compare` 会一直是 `None`（被跳过）——除非先给 `ota_hotel_agent.py` 补真实/更丰富的候选数据
+- `build_flight_picker_widget`/`build_hotel_picker_widget` 只是包了一层展示/选择逻辑，`ota_hotel_agent.py` 本身还是纯占位假数据（一条写死的 `"占位酒店/票务 X"`，`provider_type` 固定是 `"hotel"`），所以现在真跑起来永远只有 `hotel_picker` 有内容，`flight_picker` 会一直是 `None`（被跳过）——除非先给 `ota_hotel_agent.py` 补真实/更丰富的候选数据
 - 讨论过的其他 widget 想法还没做：反馈评分插件、异常变更确认插件、人格问卷引导插件
 
 ## main.py -- 入口脚本

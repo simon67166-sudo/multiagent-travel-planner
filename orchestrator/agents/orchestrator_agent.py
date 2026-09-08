@@ -106,8 +106,8 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
         # 两个 widget 各自按 provider_type 从同一份 candidates 里挑，查不到对应类型就返回 None
         booking_candidates = results["booking"]["candidates"]
         for widget in (
-            widgets.build_flight_compare_widget(booking_candidates),
-            widgets.build_hotel_list_widget(booking_candidates),
+            widgets.build_flight_picker_widget(booking_candidates),
+            widgets.build_hotel_picker_widget(booking_candidates),
         ):
             if widget is not None:
                 output_widgets.append(widget)
