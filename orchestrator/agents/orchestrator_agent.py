@@ -102,6 +102,15 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
         if candidates:
             output_widgets.append(widgets.build_post_list_widget(candidates))
             output_widgets.append(widgets.build_attraction_picker_widget(candidates))
+    if "booking" in results:
+        # 两个 widget 各自按 provider_type 从同一份 candidates 里挑，查不到对应类型就返回 None
+        booking_candidates = results["booking"]["candidates"]
+        for widget in (
+            widgets.build_flight_compare_widget(booking_candidates),
+            widgets.build_hotel_list_widget(booking_candidates),
+        ):
+            if widget is not None:
+                output_widgets.append(widget)
 
     summary_for_llm = json.dumps(results, ensure_ascii=False)
     reply = llm_tool.call_llm(

@@ -78,6 +78,44 @@ def build_attraction_picker_widget(
     return {"widget": "attraction_picker", "data": {"options": pool, "max_select": max_select}}
 
 
+def _filter_by_provider(candidates: list[dict], provider_type: str) -> list[dict]:
+    """ota_hotel_agent 的 candidates 用 provider_type 字段区分机票/酒店，两个 widget 各自只挑自己那部分。"""
+    return [c for c in candidates if c.get("provider_type") == provider_type]
+
+
+def build_flight_compare_widget(candidates: list[dict], top_k: int = 3, use_llm_rerank: bool = True) -> dict | None:
+    """
+    机票比价插件：candidates 通常是 ota_hotel_agent.run() 的 candidates（本函数只挑 provider_type == "flight" 的）。
+    候选里没有独立 id 字段，用 name 当 _llm_select 的校验 key（跟 post_id 的作用一样，防止 LLM 编造不存在的选项）。
+    候选为空（比如这轮没查到机票）就返回 None，调用方按 None 跳过，不展示空插件。
+    """
+    flights = _filter_by_provider(candidates, "flight")
+    if not flights:
+        return None
+    selected = (
+        _llm_select(flights, "name", top_k, "综合价格和退改政策，选出最值得推荐的机票选项")
+        if use_llm_rerank
+        else flights[:top_k]
+    )
+    return {"widget": "flight_compare", "data": {"flights": selected}}
+
+
+def build_hotel_list_widget(candidates: list[dict], top_k: int = 3, use_llm_rerank: bool = True) -> dict | None:
+    """
+    酒店推荐插件：candidates 通常是 ota_hotel_agent.run() 的 candidates（本函数只挑 provider_type == "hotel" 的）。
+    候选为空就返回 None，调用方按 None 跳过。
+    """
+    hotels = _filter_by_provider(candidates, "hotel")
+    if not hotels:
+        return None
+    selected = (
+        _llm_select(hotels, "name", top_k, "综合价格、评分和取消政策，选出最值得推荐的酒店")
+        if use_llm_rerank
+        else hotels[:top_k]
+    )
+    return {"widget": "hotel_list", "data": {"hotels": selected}}
+
+
 if __name__ == "__main__":
     demo_candidates = [
         {"post_id": "p1", "place": "西湖", "rating": 4.7, "similarity_score": 0.95},
@@ -92,3 +130,12 @@ if __name__ == "__main__":
             indent=2,
         )
     )
+
+    demo_booking_candidates = [
+        {"name": "杭州东-北京南 G21", "price": 553, "inventory": 12, "rating": 4.8, "provider_type": "flight"},
+        {"name": "杭州萧山-首都机场 MU5137", "price": 780, "inventory": 3, "rating": 4.2, "provider_type": "flight"},
+        {"name": "西湖国宾馆", "price": 1280, "inventory": 2, "cancel_policy": "24小时内免费取消", "rating": 4.9, "provider_type": "hotel"},
+        {"name": "如家·西湖店", "price": 320, "inventory": 8, "cancel_policy": "不可取消", "rating": 4.1, "provider_type": "hotel"},
+    ]
+    print(json.dumps(build_flight_compare_widget(demo_booking_candidates, top_k=1), ensure_ascii=False, indent=2))
+    print(json.dumps(build_hotel_list_widget(demo_booking_candidates, top_k=1), ensure_ascii=False, indent=2))
