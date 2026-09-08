@@ -27,6 +27,7 @@ def run(shared_state: dict, location_hint: str, top_k: int = 3) -> dict:
     return {
         "recommendations": [
             {
+                "post_id": p.get("post_id"),
                 "place": p.get("place"),
                 "time_slot": p.get("time_slot"),
                 "avg_cost": p.get("avg_cost"),

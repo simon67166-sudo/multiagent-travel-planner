@@ -33,6 +33,7 @@ orchestrator/
     route_agent.py                # 行程/路线 Agent
     ota_hotel_agent.py            # OTA/酒店 Agent（还是纯占位）
     exception_agent.py            # 异常应变 Agent
+  widgets.py                      # 展示插件：右侧聊天框里的富交互小组件，跟 Agent 逻辑解耦
   main.py                         # 薄入口：re-export 编排 Agent 的两个函数 + __main__ 完整 demo
   store.py / trip_plan.py / persona.py   # 不变
   server.py / web/                # 不变，还是 import main，接口不受这次拆分影响
@@ -74,6 +75,8 @@ orchestrator/
 | `classify_intent(user_message)` | 调模型判断这轮要触发 `content`/`route`/`booking`/`exception` 里的哪几个 |
 | `orchestrate(user_message, shared_state)` | 主流程：意图识别 → 分发调用 4 个子 Agent（子 Agent 直接改 `shared_state` 里的 `trip_plan`，不用再手动写回）→ 生成回复，返回 `(output, shared_state)` |
 
+`orchestrate()` 返回的 `output` 里除了 `chat_reply`/`community_panel`/`map_panel`，还有一个 `widgets` 数组（见下面 `widgets.py` 一节）：`content` 意图命中时会调 `widgets.build_post_list_widget()` + `widgets.build_attraction_picker_widget()`，命中候选为空就是空数组。
+
 ## agents/content_agent.py -- 达人/内容 Agent
 
 **职责**：两阶段检索第一阶段。模型档位 `MODEL_FULL`（UGC 语义提炼），目前还没实际调用 LLM（纯向量检索）。
@@ -95,6 +98,28 @@ orchestrator/
 **职责**：按地点名字匹配 `trip_plan` 里的行程节点，命中就删掉并记一条天气异常。模型档位架构文档里写的是"中等模型"，目前只有 `MODEL_FULL`/`MODEL_LIGHT` 两档，先待定。
 
 `run(shared_state, event_type, event_detail=None)`：`event_detail` 目前是纯子串匹配（整句用户消息去匹配地点名字），很粗糙，真实版本应该先做实体识别。
+
+## widgets.py -- 展示插件（右侧聊天框富交互组件）
+
+**职责**：右侧聊天框里除了纯文字回复之外的富交互小组件（帖子列表、景点勾选等），跟 Agent/编排逻辑解耦——组件只负责"从真实候选集里挑/怎么展示"，不重新跑检索或编内容。
+
+**设计原则**：
+- 候选集永远来自真实代码算出来的数据（目前是 `content_agent.run()` 的 `recommendations`，已经是 `store.query_similar_posts()` 按人格相似度排过序的真实结果），不允许凭空捏造。
+- 要用 LLM 做"选择/排序"时，LLM 只能从候选集里选 ID，不允许自己编内容；`_llm_select()` 会校验 LLM 返回的 ID 是否都在候选集里，筛掉任何编造的 ID（防幻觉），LLM 调用/解析失败时优雅降级成"按候选集原有顺序截取前 N 个"，不影响整体流程。
+- 每个 widget 统一格式 `{"widget": "<type>", "data": {...}}`，前端按 `widget` 类型分发渲染，渲染逻辑完全不用管数据是怎么算出来的。
+- 模型档位：`_llm_select()` 内部用 `llm_tool.MODEL_LIGHT`（选择/排序是结构化任务，不需要强模型）。
+
+| 函数 | 作用 |
+|---|---|
+| `build_post_list_widget(candidates, top_k=3, use_llm_rerank=False)` | 帖子展示插件：默认直接截取候选集前 `top_k` 个（候选集已经是真实排序过的，不用额外调 LLM）；传 `use_llm_rerank=True` 走 LLM 二次筛选 |
+| `build_attraction_picker_widget(candidates, max_select=3, pool_size=6, use_llm_rerank=True)` | 景点选择插件：从候选里选出 `pool_size` 个放进"可选池"返回给前端，用户从池子里最多勾 `max_select` 个；默认走 LLM 精选候选池（LLM 只能选真实 ID） |
+
+**依赖**：`content_agent.py` 返回的 `recommendations` 每条都带 `post_id` 字段（`store.query_similar_posts()` 本来就返回这个字段，之前 `content_agent.py` 组装返回值时漏传了，现已补上），`widgets.py` 靠这个字段做 ID 校验。
+
+**待接事项**（用户明确说了先做这两个 widget，其余下一步再加，避免一次性铺太大）：
+- 用户在 `attraction_picker` 里勾选完之后怎么传回后端——`POST /widget-response` 这个接口还没定义，`server.py`/`web/index.html` 目前都不认这个交互
+- 前端 `web/index.html` 还不会渲染 `widget` 字段（现在编排 Agent 已经把 `widgets` 数组塞进 `/chat` 返回值了，但页面 JS 还没处理，等于目前是"传了但没人用"）
+- 讨论过的其他 widget 想法还没做：反馈评分插件、异常变更确认插件、人格问卷引导插件、机票比价模块、酒店推荐展示模块
 
 ## main.py -- 入口脚本
 
@@ -238,3 +263,4 @@ python orchestrator/server.py
 4. 两阶段检索第二阶段（候选集内部按内容相关性排序）还没实现，`content_agent` 里 `location_hint` 参数目前没用上
 5. 反馈闭环（用户点评行程 → 校准 persona）还没接：`store.log_history()` 记录和 `persona.apply_feedback()` 校准都写好了，但没人在 `orchestrate()` 里调用它们
 6. `map_tool.py` 目前只查"两点之间"，没做"多点最优顺序"规划；`polyline` 路线坐标数据也还没接进 `web/index.html` 做真正的地图可视化，现在只是文字列表
+7. `widgets.py` 的 `post_list`/`attraction_picker` 已经接进 `orchestrate()` 输出的 `widgets` 数组，但 `POST /widget-response` 回传接口和前端渲染都还没做（详见 `widgets.py` 一节的"待接事项"），另外几个 widget 想法（反馈评分/异常确认/人格问卷/机票比价/酒店推荐）也还没开始

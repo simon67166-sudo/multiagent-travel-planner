@@ -17,6 +17,7 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
 import llm_tool
 import persona
 import trip_plan
+import widgets
 from agents import content_agent, exception_agent, ota_hotel_agent, route_agent
 
 
@@ -93,6 +94,15 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
 
     # 不需要再手动"写回共享状态"——route_agent/exception_agent 已经直接改了 shared_state["trip_plan"]
 
+    # 展示插件：candidates 直接复用 content_agent 已经算好、排过序的真实推荐结果，
+    # 插件只管挑/展示，不重新跑检索逻辑（详见 widgets.py 顶部的设计说明）。
+    output_widgets = []
+    if "content" in results:
+        candidates = results["content"]["recommendations"]
+        if candidates:
+            output_widgets.append(widgets.build_post_list_widget(candidates))
+            output_widgets.append(widgets.build_attraction_picker_widget(candidates))
+
     summary_for_llm = json.dumps(results, ensure_ascii=False)
     reply = llm_tool.call_llm(
         [
@@ -108,6 +118,7 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
         "chat_reply": reply,
         "community_panel": results.get("content", {}).get("recommendations", []),
         "map_panel": results.get("route", {}),
+        "widgets": output_widgets,
     }
     return output, shared_state
 
