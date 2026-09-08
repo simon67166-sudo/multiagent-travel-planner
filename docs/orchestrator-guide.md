@@ -34,7 +34,7 @@ orchestrator/
     ota_hotel_agent.py            # OTA/酒店 Agent（还是纯占位）
     exception_agent.py            # 异常应变 Agent
   widgets.py                      # 展示插件：右侧聊天框里的富交互小组件，跟 Agent 逻辑解耦
-  schedule_widgets.py             # 左侧日程面板展示组件（目前只有地图标点），跟 widgets.py 同一个分离思路
+  schedule_widgets.py             # 左侧日程面板展示组件（地图+连线、每日时间线、机票酒店面板），跟 widgets.py 同一个分离思路
   main.py                         # 薄入口：re-export 编排 Agent 的两个函数 + __main__ 完整 demo
   store.py / trip_plan.py / persona.py   # 不变
   server.py / web/                # 不变，还是 import main，接口不受这次拆分影响
@@ -133,21 +133,33 @@ orchestrator/
 
 ## schedule_widgets.py -- 左侧日程面板展示组件
 
-**职责**：服务对象是左侧实时日程面板（`server.py` 的 `GET /trip`，`web/index.html` 目前的文字列表），跟右侧聊天框的 `widgets.py` 是同一个"数据/展示分离"思路——这里只算"给前端画图用的数据"，不产出任何 HTML/画布逻辑，真正怎么画留给前端。模型档位：不需要 LLM，纯确定性计算（按天分配颜色 + 查真实经纬度）。
+**职责**：服务对象是左侧实时日程面板（`server.py` 的 `GET /trip`，`web/index.html` 目前的文字列表），跟右侧聊天框的 `widgets.py` 是同一个"数据/展示分离"思路——这里只算"给前端画图/排版用的数据"，不产出任何 HTML/画布逻辑，真正怎么画留给前端。模型档位：不需要 LLM，纯确定性计算（按天/类型分配颜色 + 查真实地理数据）。三个 widget：
 
 | 函数 | 作用 |
 |---|---|
-| `build_trip_map_widget(trip_plan_obj, city=None)` | 把 `trip_plan` 里每天的行程节点标进地图，同一天的所有节点用同一个颜色的图标（颜色按"第几天"从固定调色板里分配，超过 8 天循环复用）。地点坐标用 `map_tool.geocode()` 查真实经纬度，查不到的地点跳过并记进 `geocode_failures`，不让一个查询失败拖垮整张地图 |
+| `build_trip_map_widget(trip_plan_obj, city=None)` | 地图组件：把每天的景点/餐饮节点标进地图（同一天同一个颜色，颜色按"第几天"从固定调色板分配，超过 8 天循环复用），并把当天节点依次连成一条**真实路线**（查真实路况，不是直线连线，颜色跟当天 markers 一致）；机票起降机场、酒店地址也各标一个点，用固定颜色（不参与按天上色，因为它们不属于"某一天"） |
+| `build_day_timeline_widget(trip_plan_obj)` | 每日行程时间线：把每天的节点按时间顺序整理成竖排列表，按天分模块，模块颜色跟 `build_trip_map_widget` 里同一天的颜色对齐，方便地图和列表对照着看 |
+| `build_booking_panel_widget(trip_plan_obj)` | 机票/酒店面板：原样呈现 `trip_plan` 里已经落地确认的 `flights`/`hotels` 记录——注意这跟 `widgets.py` 的 `build_flight_picker_widget`/`build_hotel_picker_widget`不是一回事，那两个是"聊天框里给用户挑的候选推荐"，这里是"已经确认、要显示在左侧行程里的记录" |
 
-返回结构：`{"widget": "trip_map", "data": {"markers": [...], "days_legend": [...], "geocode_failures": [...]}}`
-- `markers` 每条：`day`（日期）/ `color` / `place` / `node_id` / `type` / `lng` / `lat`
-- `days_legend`：每天对应的颜色，前端拿这个画图例
-- `geocode_failures`：查不到坐标的地点（比如高德 key 没配、地名太模糊），前端可以提示"部分地点未能定位"
+`build_trip_map_widget` 返回结构：
+```
+{"widget": "trip_map", "data": {
+  "markers": [{day, color, place, node_id, type, lng, lat, ...}],   # type: attraction|meal|airport|hotel
+  "routes": [{"day":, "color":, "coordinates": [[lng,lat], ...]}],
+  "days_legend": [{"date":, "color":}],
+  "geocode_failures": [{"place":, "reason":}],
+  "route_failures": [{"day":, "from":, "to":, "reason":}],
+}}
+```
+- 景点/餐饮 marker 的 `day`/`color` 按天分配；机票（`type: "airport"`，额外带 `role: "depart"|"arrive"`、`flight_no`、`status`）和酒店（`type: "hotel"`，额外带 `name`/`check_in`/`check_out`）的 `day` 固定是 `None`，颜色分别固定为深灰蓝/棕色（`_AIRPORT_COLOR`/`_HOTEL_COLOR`），不占用按天调色板
+- `routes` 里的坐标是把 `map_tool.route_between()` 返回的多段 `polyline` 展平成一条连续的 `[lng, lat]` 序列，直接给前端画线；查询失败的那一段跳过并记进 `route_failures`，不影响其他天/其他段
+- **字段约定**：`flights` 的 `from_`/`to`、`hotels` 的 `address` 建议存能被地理编码识别的地名/地址（比如"杭州萧山国际机场"），不建议只存三字码（比如 `"HGH"`）——高德地理编码认不出机场三字码，会直接进 `geocode_failures`
 
 **现状/限制**：
-- 目前只有这一个函数（标点），路线连线（把每天的 `polyline` 也画出来）、地点聚合/去重展示这些还没做
-- 跟 `route_agent.py` 一样依赖 `AMAP_KEY`，没配置时 `markers` 会是空的、`geocode_failures` 里全是查询失败记录（不会导致整体报错）
-- 还没接进 `server.py`/`web/index.html`，`GET /trip` 目前不会返回这个 widget 的数据
+- 跟 `route_agent.py` 一样依赖 `AMAP_KEY`，没配置时 `markers`/`routes` 会是空的、`*_failures` 里全是查询失败记录（不会导致整体报错，自测已验证这个降级路径）
+- `route_agent.py` 里已经算过一次相邻站点的交通方式/耗时，这里为了拿到完整 `polyline` 又独立查了一次路线（避免"展示层"反过来依赖某个 Agent 的内部计算结果），会有一点重复的高德 API 调用，demo/比赛规模的免费额度足够用，不是问题
+- 三个 widget 都还没接进 `server.py`/`web/index.html`，`GET /trip` 目前不会返回这些数据，左侧面板还是纯文字列表
+- 目前没有任何 Agent 真的调用过 `trip_plan.add_flight()`/`add_hotel()`（`ota_hotel_agent.py` 只返回候选，没有"确认预订"触发点，见前面 `ota_hotel_agent.py` 一节），所以 `build_booking_panel_widget`/机票酒店 marker 现在跑起来都是空的，要等那个触发点接上才有真实数据
 
 ## main.py -- 入口脚本
 
@@ -292,4 +304,4 @@ python orchestrator/server.py
 5. 反馈闭环（用户点评行程 → 校准 persona）还没接：`store.log_history()` 记录和 `persona.apply_feedback()` 校准都写好了，但没人在 `orchestrate()` 里调用它们
 6. `map_tool.py` 目前只查"两点之间"，没做"多点最优顺序"规划；`polyline` 路线坐标数据也还没接进 `web/index.html` 做真正的地图可视化，现在只是文字列表
 7. `widgets.py` 的四个插件（`post_list`/`attraction_picker`/`flight_picker`/`hotel_picker`）已经接进 `orchestrate()` 输出的 `widgets` 数组，但 `POST /widget-response` 回传接口和前端渲染都还没做（详见 `widgets.py` 一节的"待接事项"），另外几个 widget 想法（反馈评分/异常确认/人格问卷）也还没开始
-8. `schedule_widgets.py` 的 `build_trip_map_widget()` 还没接进 `server.py`/`web/index.html`，左侧日程面板目前还是纯文字列表，没有地图；路线连线（把 `polyline` 也画出来）也还没做
+8. `schedule_widgets.py` 的三个 widget（`trip_map`/`day_timeline`/`booking_panel`）还没接进 `server.py`/`web/index.html`，左侧日程面板目前还是纯文字列表；另外没有 Agent 真的调用过 `trip_plan.add_flight()`/`add_hotel()`，机票酒店相关的 marker/面板现在跑起来都是空的
