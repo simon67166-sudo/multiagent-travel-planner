@@ -34,6 +34,7 @@ orchestrator/
     ota_hotel_agent.py            # OTA/酒店 Agent（还是纯占位）
     exception_agent.py            # 异常应变 Agent
   widgets.py                      # 展示插件：右侧聊天框里的富交互小组件，跟 Agent 逻辑解耦
+  schedule_widgets.py             # 左侧日程面板展示组件（目前只有地图标点），跟 widgets.py 同一个分离思路
   main.py                         # 薄入口：re-export 编排 Agent 的两个函数 + __main__ 完整 demo
   store.py / trip_plan.py / persona.py   # 不变
   server.py / web/                # 不变，还是 import main，接口不受这次拆分影响
@@ -129,6 +130,24 @@ orchestrator/
 - 前端 `web/index.html` 还不会渲染 `widget` 字段（现在编排 Agent 已经把 `widgets` 数组塞进 `/chat` 返回值了，但页面 JS 还没处理，等于目前是"传了但没人用"）
 - `build_flight_picker_widget`/`build_hotel_picker_widget` 只是包了一层展示/选择逻辑，`ota_hotel_agent.py` 本身还是纯占位假数据（一条写死的 `"占位酒店/票务 X"`，`provider_type` 固定是 `"hotel"`），所以现在真跑起来永远只有 `hotel_picker` 有内容，`flight_picker` 会一直是 `None`（被跳过）——除非先给 `ota_hotel_agent.py` 补真实/更丰富的候选数据
 - 讨论过的其他 widget 想法还没做：反馈评分插件、异常变更确认插件、人格问卷引导插件
+
+## schedule_widgets.py -- 左侧日程面板展示组件
+
+**职责**：服务对象是左侧实时日程面板（`server.py` 的 `GET /trip`，`web/index.html` 目前的文字列表），跟右侧聊天框的 `widgets.py` 是同一个"数据/展示分离"思路——这里只算"给前端画图用的数据"，不产出任何 HTML/画布逻辑，真正怎么画留给前端。模型档位：不需要 LLM，纯确定性计算（按天分配颜色 + 查真实经纬度）。
+
+| 函数 | 作用 |
+|---|---|
+| `build_trip_map_widget(trip_plan_obj, city=None)` | 把 `trip_plan` 里每天的行程节点标进地图，同一天的所有节点用同一个颜色的图标（颜色按"第几天"从固定调色板里分配，超过 8 天循环复用）。地点坐标用 `map_tool.geocode()` 查真实经纬度，查不到的地点跳过并记进 `geocode_failures`，不让一个查询失败拖垮整张地图 |
+
+返回结构：`{"widget": "trip_map", "data": {"markers": [...], "days_legend": [...], "geocode_failures": [...]}}`
+- `markers` 每条：`day`（日期）/ `color` / `place` / `node_id` / `type` / `lng` / `lat`
+- `days_legend`：每天对应的颜色，前端拿这个画图例
+- `geocode_failures`：查不到坐标的地点（比如高德 key 没配、地名太模糊），前端可以提示"部分地点未能定位"
+
+**现状/限制**：
+- 目前只有这一个函数（标点），路线连线（把每天的 `polyline` 也画出来）、地点聚合/去重展示这些还没做
+- 跟 `route_agent.py` 一样依赖 `AMAP_KEY`，没配置时 `markers` 会是空的、`geocode_failures` 里全是查询失败记录（不会导致整体报错）
+- 还没接进 `server.py`/`web/index.html`，`GET /trip` 目前不会返回这个 widget 的数据
 
 ## main.py -- 入口脚本
 
@@ -272,4 +291,5 @@ python orchestrator/server.py
 4. 两阶段检索第二阶段（候选集内部按内容相关性排序）还没实现，`content_agent` 里 `location_hint` 参数目前没用上
 5. 反馈闭环（用户点评行程 → 校准 persona）还没接：`store.log_history()` 记录和 `persona.apply_feedback()` 校准都写好了，但没人在 `orchestrate()` 里调用它们
 6. `map_tool.py` 目前只查"两点之间"，没做"多点最优顺序"规划；`polyline` 路线坐标数据也还没接进 `web/index.html` 做真正的地图可视化，现在只是文字列表
-7. `widgets.py` 的 `post_list`/`attraction_picker` 已经接进 `orchestrate()` 输出的 `widgets` 数组，但 `POST /widget-response` 回传接口和前端渲染都还没做（详见 `widgets.py` 一节的"待接事项"），另外几个 widget 想法（反馈评分/异常确认/人格问卷/机票比价/酒店推荐）也还没开始
+7. `widgets.py` 的四个插件（`post_list`/`attraction_picker`/`flight_picker`/`hotel_picker`）已经接进 `orchestrate()` 输出的 `widgets` 数组，但 `POST /widget-response` 回传接口和前端渲染都还没做（详见 `widgets.py` 一节的"待接事项"），另外几个 widget 想法（反馈评分/异常确认/人格问卷）也还没开始
+8. `schedule_widgets.py` 的 `build_trip_map_widget()` 还没接进 `server.py`/`web/index.html`，左侧日程面板目前还是纯文字列表，没有地图；路线连线（把 `polyline` 也画出来）也还没做
