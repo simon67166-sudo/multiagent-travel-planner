@@ -4,3 +4,10 @@ orchestrator/.env
 orchestrator/data/
 __pycache__/
 *.pyc
+
+# Local credentials and conversation state
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite*

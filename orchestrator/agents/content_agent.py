@@ -14,7 +14,6 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR_DIR))
 
 import persona
-import store
 
 
 def run(shared_state: dict, location_hint: str, top_k: int = 3) -> dict:
@@ -22,6 +21,7 @@ def run(shared_state: dict, location_hint: str, top_k: int = 3) -> dict:
     location_hint 目前没用上——它是留给"内容相关性排序"（两阶段检索第二阶段）的输入，
     那部分排序算法还没实现，先按人格相似度原样返回。
     """
+    import store
     vector = persona.compute_persona_vector(shared_state["persona"], shared_state["scenario"])
     posts = store.query_similar_posts(vector, top_k=top_k)
     return {
@@ -44,6 +44,7 @@ def run(shared_state: dict, location_hint: str, top_k: int = 3) -> dict:
 
 
 if __name__ == "__main__":
+    import store
     import json
 
     demo_persona = persona.bootstrap_from_onboarding(
