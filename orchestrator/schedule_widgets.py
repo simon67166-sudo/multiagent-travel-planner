@@ -104,17 +104,18 @@ def build_trip_map_widget(trip_plan_obj: dict, city: str | None = None) -> dict:
     days_legend = []
     geocode_failures = []
     route_failures = []
-    geocode_cache: dict[str, tuple[float, float]] = {}
+    geocode_cache: dict[tuple[str, str | None], tuple[float, float]] = {}
 
-    def geocode_or_record_failure(place: str) -> tuple[float, float] | None:
-        if place in geocode_cache:
-            return geocode_cache[place]
+    def geocode_or_record_failure(place: str, *, geocode_city: str | None = city) -> tuple[float, float] | None:
+        cache_key = (place, geocode_city)
+        if cache_key in geocode_cache:
+            return geocode_cache[cache_key]
         try:
-            geocode_cache[place] = map_tool.geocode(place, city=city)
+            geocode_cache[cache_key] = map_tool.geocode(place, city=geocode_city)
         except Exception as e:
             geocode_failures.append({"place": place, "reason": str(e)})
             return None
-        return geocode_cache[place]
+        return geocode_cache[cache_key]
 
     # --- 每天的景点/餐饮：标点 + 连线 ---
     for day_index, day in enumerate(rendered["days"]):
@@ -150,11 +151,14 @@ def build_trip_map_widget(trip_plan_obj: dict, city: str | None = None) -> dict:
             prev_place = place
 
     # --- 机票：起飞/降落机场各标一个点，不参与按天上色 ---
+    # 注意：这里不传 city 限定——出发/到达机场天然分属两个不同城市，用行程主城市限定
+    # geocode 反而会把出发机场错误匹配成"主城市里名字最像的机场"（比如查"上海虹桥"却限定
+    # city="杭州"，会被高德强行匹配成杭州萧山机场附近的结果），这个坑是接真实 key 测试时踩出来的。
     for flight in rendered["flights"]:
         for role, place in (("depart", flight.get("from_")), ("arrive", flight.get("to"))):
             if not place:
                 continue
-            coord = geocode_or_record_failure(place)
+            coord = geocode_or_record_failure(place, geocode_city=None)
             if coord is None:
                 continue
             lng, lat = coord
