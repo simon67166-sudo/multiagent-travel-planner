@@ -1,9 +1,10 @@
-"""Small-demo online providers; cache results and throttle public requests."""
+"""港澳附近遊数据源 -- 只用高德（POI 搜索/周边地点/路线），天气仍用 Open-Meteo
+（高德天气 API 只有城市级别的逐日预报，没有这个功能需要的按出游时段的小时级预报）。
+带缓存 + 限速，避免公共接口被打爆。"""
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import math
-import os
 from threading import RLock
 import time
 from urllib.parse import urlencode
@@ -12,8 +13,8 @@ import requests
 _LOCK = RLock()
 _CACHE = {}
 _LAST = 0.0
-CITY = {"澳門": {"center": (113.5439,22.1987), "bbox": (113.52,22.10,113.61,22.22), "english": "Macau"},
-        "香港": {"center": (114.17,22.30), "bbox": (113.83,22.14,114.45,22.58), "english": "Hong Kong"}}
+CITY = {"澳門": {"center": (113.5439,22.1987), "bbox": (113.52,22.10,113.61,22.22)},
+        "香港": {"center": (114.17,22.30), "bbox": (113.83,22.14,114.45,22.58)}}
 
 def get_json(url, params=None, ttl=1800):
     global _LAST
@@ -59,46 +60,15 @@ def amap_poi(raw,stamp):
             "source":"高德 POI","source_url":"https://uri.amap.com/marker?"+urlencode({"position":raw["location"],"name":raw["name"]}),"fetched_at":stamp}
 
 def find_origin(city,query):
-    if os.getenv("NEARBY_PROVIDER","osm")=="amap":
-        data=_amap("place/text",{"keywords":query,"city":city,"citylimit":"true","offset":5})
-        options=[amap_poi(p,data["_fetched_at"]) for p in data.get("pois",[]) if p.get("location")]
-    else:
-        aliases={"大三巴":"Ruins of St. Paul", "議事亭前地":"Senado Square", "尖沙咀":"Tsim Sha Tsui", "中環":"Central"}
-        lng,lat=CITY[city]["center"]
-        data=get_json("https://photon.komoot.io/api/",{"q":aliases.get(query,query)+" "+CITY[city]["english"],"lat":lat,"lon":lng,"limit":5},ttl=86400)
-        options=[]
-        for feature in data.get("features",[]):
-            props=feature.get("properties",{}); coord=feature.get("geometry",{}).get("coordinates",[])
-            if len(coord)!=2: continue
-            typ={"N":"node","W":"way","R":"relation"}.get(props.get("osm_type"),"node")
-            ident=f"{typ}/{props.get('osm_id')}"
-            options.append({"id":ident,"name":props.get("name",query),"lng":coord[0],"lat":coord[1],"crs":"WGS84",
-                            "source":"OpenStreetMap / Photon","source_url":"https://www.openstreetmap.org/"+ident,"fetched_at":data["_fetched_at"]})
+    data=_amap("place/text",{"keywords":query,"city":city,"citylimit":"true","offset":5})
+    options=[amap_poi(p,data["_fetched_at"]) for p in data.get("pois",[]) if p.get("location")]
     options=[p for p in options if in_city(city,p["lng"],p["lat"])]
     if not options: raise ValueError("找不到該城市內的位置，請輸入更明確的地標或地址")
     return options[0]
 
 def nearby(city,origin,radius=1500):
-    if origin["crs"]=="GCJ02":
-        data=_amap("place/around",{"location":f"{origin['lng']},{origin['lat']}","radius":radius,"types":"110000|050000|140100","sortrule":"distance","offset":25})
-        return [amap_poi(p,data["_fetched_at"]) for p in data.get("pois",[]) if p.get("location") and p.get("id")!=origin["id"]]
-    point=f"around:{int(radius)},{origin['lat']},{origin['lng']}"
-    query=f'[out:json][timeout:20];(nwr({point})["tourism"~"^(attraction|museum|viewpoint|gallery)$"]["name"];nwr({point})["leisure"="park"]["name"];nwr({point})["amenity"~"^(restaurant|cafe)$"]["name"];);out center 80;'
-    data=get_json("https://overpass-api.de/api/interpreter",{"data":query})
-    result=[]; seen=set()
-    for raw in data.get("elements",[]):
-        tag=raw.get("tags",{}); loc=raw.get("center",raw)
-        if "lon" not in loc or "lat" not in loc: continue
-        ident=f"{raw['type']}/{raw['id']}"; name=tag.get("name:zh-Hant") or tag.get("name:zh") or tag.get("name")
-        if ident==origin["id"] or not name or name in seen: continue
-        poi={"id":ident,"name":name,"lng":loc["lon"],"lat":loc["lat"],"crs":"WGS84",
-             "category":tag.get("tourism") or tag.get("amenity") or tag.get("leisure"),
-             "address":tag.get("addr:full") or tag.get("addr:street"),"opening_hours":tag.get("opening_hours"),
-             "wheelchair":tag.get("wheelchair"),"cuisine":tag.get("cuisine"),"price":None,
-             "source":"OpenStreetMap","source_url":"https://www.openstreetmap.org/"+ident,"fetched_at":data["_fetched_at"]}
-        if not in_city(city,poi["lng"],poi["lat"]) or distance(origin,poi)>radius: continue
-        seen.add(name); result.append(poi)
-    return sorted(result,key=lambda p:distance(origin,p))[:30]
+    data=_amap("place/around",{"location":f"{origin['lng']},{origin['lat']}","radius":radius,"types":"110000|050000|140100","sortrule":"distance","offset":25})
+    return [amap_poi(p,data["_fetched_at"]) for p in data.get("pois",[]) if p.get("location") and p.get("id")!=origin["id"]]
 
 def navigation_link(a,b,mode="walking"):
     return "https://www.google.com/maps/dir/?"+urlencode({"api":1,"origin":a["name"],"destination":b["name"],"travelmode":mode})
@@ -110,27 +80,14 @@ def route(a,b,mode="walking"):
         result["steps"]=["開啟公交方案，設定出發日期與時間。","查看上車站、行車方向、轉乘站及下車站。","班次、票價、末班車以營運商公告為準；尚未取得即時公交方案。"]
         return result
     try:
-        if a["crs"]=="GCJ02":
-            data=_amap("direction/"+mode,{"origin":f"{a['lng']},{a['lat']}","destination":f"{b['lng']},{b['lat']}"})
-            paths=data.get("route",{}).get("paths",[])
-            if not paths: return result
-            path=paths[0]; coords=[]
-            for step in path.get("steps",[]):
-                coords.extend([list(map(float,c.split(","))) for c in step.get("polyline","").split(";") if c])
-            steps=[s["instruction"] for s in path.get("steps",[]) if s.get("instruction")]
-            source="https://lbs.amap.com/api/webservice/guide/api/direction"
-        else:
-            profile="routed-foot" if mode=="walking" else "routed-car"
-            data=get_json(f"https://routing.openstreetmap.de/{profile}/route/v1/driving/{a['lng']},{a['lat']};{b['lng']},{b['lat']}",{"overview":"full","geometries":"geojson","steps":"true"},ttl=3600)
-            if data.get("code")!="Ok" or not data.get("routes"): return result
-            path=data["routes"][0]; coords=path["geometry"]["coordinates"]
-            directions={"left":"左轉","right":"右轉","slight left":"靠左","slight right":"靠右","straight":"直行","sharp left":"向左急轉","sharp right":"向右急轉","uturn":"迴轉"}
-            steps=[]
-            for leg in path.get("legs",[]):
-                for step in leg.get("steps",[]):
-                    m=step.get("maneuver",{}); action="抵達" if m.get("type")=="arrive" else directions.get(m.get("modifier"),"沿路前進")
-                    steps.append(f"{action} {step.get('name') or '道路'}，約 {round(step.get('distance',0))} 米")
-            source="https://routing.openstreetmap.de/"
+        data=_amap("direction/"+mode,{"origin":f"{a['lng']},{a['lat']}","destination":f"{b['lng']},{b['lat']}"})
+        paths=data.get("route",{}).get("paths",[])
+        if not paths: return result
+        path=paths[0]; coords=[]
+        for step in path.get("steps",[]):
+            coords.extend([list(map(float,c.split(","))) for c in step.get("polyline","").split(";") if c])
+        steps=[s["instruction"] for s in path.get("steps",[]) if s.get("instruction")]
+        source="https://lbs.amap.com/api/webservice/guide/api/direction"
         result.update(available=True,coordinates=coords,steps=steps,distance_m=round(float(path["distance"])),
                       duration_min=max(1,math.ceil(float(path["duration"])/60)),source_url=source,fetched_at=data["_fetched_at"])
     except RuntimeError:
@@ -151,7 +108,9 @@ def summarize_weather(raw,start,end):
             "max_rain_probability":max(rain) if rain else None,"reminders":reminders or ["預報可能更新，出發前請再次確認天氣。"]}
 
 def weather(city,origin,start,end):
-    lng,lat=(origin["lng"],origin["lat"]) if origin.get("crs")=="WGS84" else CITY[city]["center"]
+    # origin 现在永远是高德 GCJ02 坐标，不能直接喂给 Open-Meteo（它要 WGS84），
+    # 用城市中心点的固定 WGS84 坐标查天气，跟 GCJ-02 地图坐标分开，不混用坐标系。
+    lng,lat=CITY[city]["center"]
     try:
         raw=get_json("https://api.open-meteo.com/v1/forecast",{"longitude":lng,"latitude":lat,"hourly":"temperature_2m,precipitation_probability,weather_code","forecast_days":16,"timezone":"Asia/Macau"},ttl=600)
         result=summarize_weather(raw,start,end); result["fetched_at"]=raw["_fetched_at"]

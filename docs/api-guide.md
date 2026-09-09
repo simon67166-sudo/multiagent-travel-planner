@@ -16,24 +16,23 @@
 ## 外部資料接口
 | 用途 | 目前服務及接口 | 文件 |
 |---|---|---|
-| 地點定位 | GET https://photon.komoot.io/api/ | https://photon.komoot.io/ |
-| 周邊地點 | GET https://overpass-api.de/api/interpreter | https://dev.overpass-api.de/overpass-doc/en/ |
-| 步行/駕車路線 | https://routing.openstreetmap.de/routed-foot/route/v1/driving/ 或 routed-car | https://routing.openstreetmap.de/about.html 及 https://github.com/Project-OSRM/osrm-backend/blob/master/docs/http.md |
+| 地點定位 | 高德 GET /v3/place/text | https://lbs.amap.com/api/webservice/guide/api/search/ |
+| 周邊地點 | 高德 GET /v3/place/around | https://lbs.amap.com/api/webservice/guide/api/search/ |
+| 步行/駕車路線 | 高德 GET /v3/direction/walking、/v3/direction/driving | https://lbs.amap.com/api/webservice/guide/api/direction |
+| 地圖畫面 | 高德 JS API 2.0（AMap.Map/Marker/Polyline） | https://lbs.amap.com/api/jsapi-v2/summary |
 | 天氣數值預報 | GET https://api.open-meteo.com/v1/forecast | https://open-meteo.com/en/docs |
-| 地圖畫面 | Leaflet + OpenStreetMap tiles | https://leafletjs.com/examples/quick-start/ |
-| 可選高德 POI | /v3/place/text、/v3/place/around | https://lbs.amap.com/api/webservice/guide/api/search/ |
-| 可選高德路線 | /v3/direction/walking、/v3/direction/driving | https://lbs.amap.com/api/webservice/guide/api/direction |
 
+港澳附近遊已改成只用高德（地點搜尋/周邊地點/路線都是），不再有 OSM/Photon/Overpass/OSRM/Leaflet 備援；
+天氣仍用 Open-Meteo——高德天氣 API 只有城市級逐日預報，沒有這裡需要的按出遊時段小時級預報。
 公共接口目前不使用你的 LLM 金鑰，有服務各自的使用限制，並非無限量服務。程式內有快取和限速。
 天氣標示為 Open-Meteo 數值預報；香港天文台、澳門氣象局是官方查核連結，尚未直接抓取官方警告 API。
 Google Maps 公交連結是交由地圖服務查詢的入口，沒有抓取公交即時班次、票價或站台。
 小紅書尚未接入；目前不能宣稱查詢了小紅書。後續須另行確定授權資料來源或匯入使用者提供的內容及來源連結。
 
-## 高德可選設定
-預設 `NEARBY_PROVIDER=osm`，港澳附近遊不需高德 Key。
-要測高德，於本機 `.env` 設 `NEARBY_PROVIDER=amap`，並設定 AMAP_KEY、AMAP_JS_KEY、AMAP_JS_SECURITY_CODE 後重啟。
-Web服務 Key 查資料，JS Key 畫地圖；本輪沒有可用高德 Key，尚未驗收港澳高德服務覆蓋。
-GCJ-02 與 WGS84 分開展示，不把高德座標直接画到 OSM 地圖。
+## 高德設定（必填，非可選）
+`AMAP_KEY`（Web服務，查資料）、`AMAP_JS_KEY`（Web端 JS API，畫地圖）、`AMAP_JS_SECURITY_CODE`（安全密鑰）
+三個都要配進 `.env`，否則行程地圖、港澳附近遊都無法正常運作（會優雅降級成文字/錯誤提示，不會整體崩潰）。
+所有座標統一是高德 GCJ-02，天氣查詢用城市中心點的固定 WGS84 坐標（跟地圖坐標分開，不混用坐標系）。
 
 ## 本機 HTTP 接口
 瀏覽器 cookie `travel_session` 保持同一會話。JSON 回傳，輸入錯誤 HTTP400，模型/資料服務失敗通常 HTTP502。

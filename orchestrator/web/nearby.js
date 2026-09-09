@@ -1,8 +1,6 @@
-/* Nearby UI: render external content as text, preserve provider coordinate systems. */
+/* Nearby UI: render external content as text; map rendering only uses 高德 AMap (GCJ-02). */
 let currentNearbyPlan = null;
 let nearbyMap = null;
-let nearbyMapKind = null;
-let nearbyLayer = null;
 let nearbyBusy = false;
 const nearbyById = id => document.getElementById(id);
 function nearbyText(parent, tag, text) {
@@ -32,44 +30,16 @@ function drawNearbyMap(plan) {
   const container = nearbyById("nearby-map"); container.style.display = "block";
   nearbyById("map-container").style.display = "none";
   nearbyById("map-legend").style.display = "none";
-  const kind = plan.crs === "GCJ02" ? "amap" : "leaflet";
-  if (nearbyMap && nearbyMapKind !== kind) {
-    if (nearbyMapKind === "amap") nearbyMap.destroy(); else nearbyMap.remove();
-    nearbyMap = null; container.replaceChildren();
-  }
-  nearbyMapKind = kind;
   const points = [plan.origin, ...plan.stops];
-  if (kind === "leaflet" && typeof L !== "undefined") {
-    if (!nearbyMap) {
-      nearbyMap = L.map(container).setView([plan.origin.lat, plan.origin.lng], 15);
-      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom:19, attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> | <a href="https://www.openstreetmap.org/">修正地圖</a>'
-      }).addTo(nearbyMap);
-      nearbyLayer = L.layerGroup().addTo(nearbyMap);
-    }
-    nearbyLayer.clearLayers();
-    points.forEach((p,i) => {
-      const label = document.createElement("span"); label.textContent = `${i}. ${p.name}`;
-      L.marker([p.lat,p.lng]).bindPopup(label).bindTooltip(label.textContent).addTo(nearbyLayer);
-    });
-    plan.legs.forEach(leg => {
-      if (!leg.available || !leg.coordinates || leg.coordinates.length < 2) return;
-      const coords = leg.coordinates.map(p => [p[1],p[0]]);
-      L.polyline(coords, {color:"#0b7054",weight:5}).addTo(nearbyLayer);
-      const mid = Math.floor((coords.length-1)/2); const a=coords[mid], b=coords[mid+1];
-      const angle = -Math.atan2(b[0]-a[0],b[1]-a[1])*180/Math.PI;
-      L.marker(a,{interactive:false,icon:L.divIcon({className:"route-arrow",html:`<span style="display:block;color:#09513e;font-size:22px;transform:rotate(${angle}deg)">➤</span>`,iconSize:[20,20],iconAnchor:[10,10]})}).addTo(nearbyLayer);
-    });
-    nearbyMap.invalidateSize(); nearbyMap.fitBounds(points.map(p => [p.lat,p.lng]),{padding:[24,24],maxZoom:17});
-  } else if (kind === "amap" && typeof AMap !== "undefined") {
-    if (!nearbyMap) nearbyMap = new AMap.Map(container,{zoom:15,center:[plan.origin.lng,plan.origin.lat]});
-    nearbyMap.clearMap();
-    points.forEach((p,i) => new AMap.Marker({position:[p.lng,p.lat],title:`${i}. ${p.name}`,map:nearbyMap}));
-    plan.legs.forEach(leg => { if (leg.available && leg.coordinates.length) new AMap.Polyline({path:leg.coordinates,showDir:true,strokeColor:"#0b7054",strokeWeight:5,map:nearbyMap}); });
-    nearbyMap.setFitView();
-  } else {
-    container.textContent = "地圖元件未載入；請使用下面的分段導航連結。高德座標不會直接畫在另一種地圖上。";
+  if (typeof AMap === "undefined") {
+    container.textContent = "地圖元件未載入（AMAP_JS_KEY/安全密鑰可能未設置）；請使用下面的分段導航連結。";
+    return;
   }
+  if (!nearbyMap) nearbyMap = new AMap.Map(container,{zoom:15,center:[plan.origin.lng,plan.origin.lat]});
+  nearbyMap.clearMap();
+  points.forEach((p,i) => new AMap.Marker({position:[p.lng,p.lat],title:`${i}. ${p.name}`,map:nearbyMap}));
+  plan.legs.forEach(leg => { if (leg.available && leg.coordinates.length) new AMap.Polyline({path:leg.coordinates,showDir:true,strokeColor:"#0b7054",strokeWeight:5,map:nearbyMap}); });
+  nearbyMap.setFitView();
 }
 
 function renderNearbyWeather(weather) {
