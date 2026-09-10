@@ -30,6 +30,11 @@ function drawNearbyMap(plan) {
   const container = nearbyById("nearby-map"); container.style.display = "block";
   nearbyById("map-container").style.display = "none";
   nearbyById("map-legend").style.display = "none";
+  if (plan.crs !== "GCJ02") {
+    if (nearbyMap) { nearbyMap.destroy(); nearbyMap = null; }
+    container.textContent = "這份行程使用舊版地圖座標，請按『生成附近遊攻略』重新查詢高德路線。原對話與行程記錄仍保留。";
+    return;
+  }
   const points = [plan.origin, ...plan.stops];
   if (typeof AMap === "undefined") {
     container.textContent = "地圖元件未載入（AMAP_JS_KEY/安全密鑰可能未設置）；請使用下面的分段導航連結。";

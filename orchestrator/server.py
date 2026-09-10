@@ -112,7 +112,7 @@ def get_trip():
     state = session_store.load(g.session_id) or new_state()
     trip = state["trip_plan"]
     rendered = trip_plan.render(trip)
-    rendered["trip_map"] = schedule_widgets.build_trip_map_widget(trip, city=_DEMO_CITY)
+    rendered["trip_map"] = schedule_widgets.build_trip_map_widget(trip, city=state.get("city", _DEMO_CITY))
     rendered["day_timeline"] = schedule_widgets.build_day_timeline_widget(trip)
     rendered["booking_panel"] = schedule_widgets.build_booking_panel_widget(trip)
     if state.get("nearby_plan"):
@@ -191,7 +191,7 @@ def apply_selection(widget, selected, state):
     if widget == "attraction_picker":
         places = [item.get("place") for item in selected if item.get("place")]
         if places:
-            route_agent.run(state, places=places, city=_DEMO_CITY)
+            route_agent.run(state, places=places, city=state.get("city", _DEMO_CITY))
     elif widget == "flight_picker":
         for item in selected:
             trip_plan.add_flight(
