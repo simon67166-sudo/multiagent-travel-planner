@@ -161,12 +161,13 @@ orchestrator/
 - `routes` 里的坐标是把 `map_tool.route_between()` 返回的多段 `polyline` 展平成一条连续的 `[lng, lat]` 序列，直接给前端画线；查询失败的那一段跳过并记进 `route_failures`，不影响其他天/其他段
 - **字段约定**：`flights` 的 `from_`/`to`、`hotels` 的 `address` 建议存能被地理编码识别的地名/地址（比如"杭州萧山国际机场"），不建议只存三字码（比如 `"HGH"`）——高德地理编码认不出机场三字码，会直接进 `geocode_failures`
 
-**现状**：三个 widget 已经接进 `server.py` 的 `GET /trip`，`web/index.html` 用高德 JS API 真的把地图画出来了（见 `server.py + web/index.html` 一节）。
+**现状**：三个 widget 已经接进 `server.py` 的 `GET /trip`，`web/index.html` 用高德 JS API 真的把地图画出来了（见 `server.py + web/index.html` 一节）；已经用真实 `AMAP_KEY` 端到端验证过，标点/连线/机票酒店坐标都是真实经纬度。
 
 **现状/限制**：
 - 跟 `route_agent.py` 一样依赖 `AMAP_KEY`（后端查经纬度/路线用的那个，注意不是前端画图用的 `AMAP_JS_KEY`），没配置时 `markers`/`routes` 会是空的、`*_failures` 里全是查询失败记录（不会导致整体报错，自测+真实端到端联调都验证过这个降级路径）
 - `route_agent.py` 里已经算过一次相邻站点的交通方式/耗时，这里为了拿到完整 `polyline` 又独立查了一次路线（避免"展示层"反过来依赖某个 Agent 的内部计算结果），会有一点重复的高德 API 调用，demo/比赛规模的免费额度足够用，不是问题
 - `POST /widget-response` 确认机票/酒店后会真的调 `trip_plan.add_flight()`/`add_hotel()`，`build_booking_panel_widget`/机票酒店 marker 现在跑起来是有真实数据的（端到端联调过：选中机票+酒店 → `/trip` 能看到确认记录）
+- **机票起降机场地理编码不传 `city`**：`build_trip_map_widget(trip_plan_obj, city=...)` 的 `city` 参数只用于景点/餐饮/酒店这些"行程主城市内"的地点，机场坐标查询故意不传 `city`——接真实 key 测试时踩到过一个坑：查"上海虹桥国际机场"时如果传了 `city="杭州"`，高德会把它强行匹配成杭州萧山机场附近的结果（两个机场坐标几乎重合），因为出发/到达机场天然可能分属两个不同城市，用行程主城市限定反而会查错
 
 ## main.py -- 入口脚本
 
