@@ -30,6 +30,8 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request, g
 from uuid import uuid4
 import re
+from copy import deepcopy
+import guardian_http
 from session_store import SessionStore
 from openai import OpenAIError
 
@@ -87,10 +89,11 @@ def model_error(error):
 @app.get("/session")
 def get_session():
     with session_store.edit(g.session_id, new_state) as state:
+        team = guardian_http.current_team(session_store, state)
         messages = [{"role": m["role"], "content": m["content"]}
                     for m in state.get("messages", [])
                     if m.get("role") in ("user", "assistant") and m.get("content") and not m.get("tool_calls")]
-        result = {"messages": messages, "widgets": state.get("pending_widgets", [])}
+        result = {"messages": messages, "widgets": state.get("pending_widgets", []), "team": team, "version": team["version"]}
         if state.get("nearby_plan"):
             result["nearby_plan"] = state["nearby_plan"]
         return jsonify(result)
@@ -110,9 +113,14 @@ def index():
 @app.get("/trip")
 def get_trip():
     state = session_store.load(g.session_id) or new_state()
+    team = guardian_http.current_team(session_store, state)
     trip = state["trip_plan"]
     rendered = trip_plan.render(trip)
-    rendered["trip_map"] = schedule_widgets.build_trip_map_widget(trip, city=state.get("city", _DEMO_CITY))
+    rendered.update(version=team["version"], revision=team["revision"], migration_notes=team["itinerary"].get("migration_notes", []))
+    if state.get("nearby_plan") or state.get("mode")=="demo":
+        rendered["trip_map"] = {"widget":"trip_map","data":{"markers":[],"routes":[],"days_legend":[]}}
+    else:
+        rendered["trip_map"] = schedule_widgets.build_trip_map_widget(trip, city=state.get("city", _DEMO_CITY))
     rendered["day_timeline"] = schedule_widgets.build_day_timeline_widget(trip)
     rendered["booking_panel"] = schedule_widgets.build_booking_panel_widget(trip)
     if state.get("nearby_plan"):
@@ -129,7 +137,16 @@ def chat():
     if not message or len(message) > 8000:
         return jsonify({"error": "message 長度必須是 1 到 8000 字"}), 400
     with session_store.edit(g.session_id, new_state) as state:
+        team = guardian_http.current_team(session_store, state)
         output, _ = main.orchestrate(message, state)
+        draft = output.pop("proposed_itinerary", None)
+        if draft: state.update(draft)
+        pending = guardian_http.proposal_for(session_store, state, team, "對話行程調整提案", output.get("sources"))
+        if pending:
+            output["proposal"] = pending
+            output["chat_reply"] += "\n已建立提案，請發起人接受後更新正式行程。"
+        output.pop("nearby_plan", None)
+        output.update(version=team["version"], revision=team["revision"])
     return jsonify(output)
 
 
@@ -141,23 +158,37 @@ def validation_error(error):
 def nearby_script():
     return app.response_class((_WEB_DIR / "nearby.js").read_text(encoding="utf-8"), mimetype="text/javascript")
 
+@app.get("/guardian.js")
+def guardian_script():
+    return app.response_class((_WEB_DIR / "guardian.js").read_text(encoding="utf-8"), mimetype="text/javascript")
+
+@app.get("/guardian.css")
+def guardian_css():
+    return app.response_class((_WEB_DIR / "guardian.css").read_text(encoding="utf-8"), mimetype="text/css")
+
 @app.post("/nearby-plan")
 def nearby_plan():
     payload = request.get_json(silent=True)
     with session_store.edit(g.session_id, new_state) as state:
-        plan = nearby_planner.build_plan(payload)
+        team = guardian_http.current_team(session_store, state)
+        if isinstance(payload, dict):
+            payload = deepcopy(payload)
+            payload["members"] = [{"name":m["name"],"preferences":str(m["preferences"])} for m in team["members"]]
+        plan = nearby_planner.build_plan(payload, group_members=team["members"])
         reply = nearby_planner.plan_reply(plan)
         state["nearby_plan"] = plan
         state["city"] = plan["request"]["city"]
         state.setdefault("messages", []).extend([
             {"role": "user", "content": "規劃附近遊：" + plan["request"].get("location", "")},
             {"role": "assistant", "content": reply}])
-    return jsonify({"nearby_plan": plan, "chat_reply": reply})
+        proposal = guardian_http.proposal_for(session_store, state, team, "附近遊行程提案")
+    return jsonify({"proposal":proposal,"chat_reply":reply+"\n這是提案，接受後才更新正式行程。","version":team["version"]})
 
 @app.post("/nearby-weather")
 def nearby_weather():
     with session_store.edit(g.session_id, new_state) as state:
-        plan = state.get("nearby_plan")
+        guardian_http.current_team(session_store, state)
+        plan = deepcopy(state.get("nearby_plan"))
         if not plan:
             return jsonify({"error": "請先建立港澳附近遊行程"}), 400
         req = plan["request"]
@@ -176,6 +207,7 @@ def widget_response():
     if not isinstance(widget, str) or not isinstance(selected, list) or not selected or not all(isinstance(item, dict) for item in selected):
         return jsonify({"error": "無效的選擇資料"}), 400
     with session_store.edit(g.session_id, new_state) as state:
+        team = guardian_http.current_team(session_store, state)
         offered = next((w for w in state.get("pending_widgets", []) if w.get("widget") == widget), None)
         if not offered or len(selected) > offered["data"].get("max_select", 1):
             return jsonify({"error": "卡片已失效或超出選擇數量"}), 400
@@ -183,8 +215,9 @@ def widget_response():
         if any(item not in options for item in selected) or any(item in selected[:i] for i, item in enumerate(selected)):
             return jsonify({"error": "選項不在本次候選清單"}), 400
         apply_selection(widget, selected, state)
+        proposal = guardian_http.proposal_for(session_store,state,team,"加入候選（尚未實際預訂）")
         state["pending_widgets"] = [w for w in state["pending_widgets"] if w.get("widget") != widget]
-    return jsonify({"status": "ok"})
+    return jsonify({"status":"proposal","proposal":proposal})
 
 
 def apply_selection(widget, selected, state):
@@ -198,6 +231,8 @@ def apply_selection(widget, selected, state):
                 state["trip_plan"],
                 {
                     "flight_no": item.get("flight_no"),
+                    "data_kind":item.get("data_kind","demo"), "booking_status":"not_booked",
+                    "price":item.get("price"), "currency":item.get("currency"),
                     "from_": item.get("from_"),
                     "to": item.get("to"),
                     "depart_time": item.get("depart_time"),
@@ -211,6 +246,8 @@ def apply_selection(widget, selected, state):
                 state["trip_plan"],
                 {
                     "name": item.get("name"),
+                    "data_kind":item.get("data_kind","demo"), "booking_status":"not_booked",
+                    "currency":item.get("currency"),
                     "address": item.get("address"),
                     "check_in": item.get("check_in"),
                     "check_out": item.get("check_out"),
@@ -222,7 +259,9 @@ def apply_selection(widget, selected, state):
         raise RuntimeError("Unsupported widget")
 
 
+guardian_http.register(app, lambda: session_store, new_state)
+
 if __name__ == "__main__":
     # debug=False：这个服务准备通过 Cloudflare Tunnel 暴露到公网给队友访问，
     # Werkzeug 的调试器（debug=True）在公网环境下有远程执行代码的风险，不能开。
-    app.run(debug=False, port=5000)
+    app.run(debug=False, host=os.getenv("TRAVEL_HOST","127.0.0.1"), port=int(os.getenv("TRAVEL_PORT","5000")))

@@ -128,6 +128,7 @@
   #nearby-status { font-size:12px; color:#735321; white-space:pre-wrap; }
   @media(max-width:800px) { body {display:block;height:auto;} #schedule {width:100%;max-width:none;} #chat {min-height:500px;} }
 </style>
+<link rel="stylesheet" href="/guardian.css">
 </head>
 <body>
 
@@ -142,9 +143,9 @@
       <label>遊覽小時<input id="nearby-hours" type="number" min="1" max="10" value="3" required></label>
       <label>交通<select id="nearby-mode"><option value="walking">步行</option><option value="driving">駕車路線估算</option><option value="transit">公交（另查班次）</option></select></label>
     </div>
-    <p>同行者與需求（可自由增減；未填代表未登記）</p>
-    <div id="nearby-members"></div>
-    <button id="add-member" type="button">＋新增同行者</button>
+    <p>同行者請使用上方邀請連結加入，並在「我的偏好」填寫；以下不會覆蓋團隊資料。</p>
+    <div id="nearby-members" hidden></div>
+    <button id="add-member" hidden type="button">＋新增同行者</button>
     <button id="build-nearby" type="submit">生成附近遊攻略</button>
     <div id="nearby-status" role="status"></div>
   </form>
@@ -331,8 +332,10 @@ function renderPicker(widgetType, data, headTitle) {
         body: JSON.stringify({ widget: widgetType, selected }),
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
-      confirmBtn.textContent = "已确认";
-      addSystemNote(`已确认：${selected.map(optionLabel).join("、")}`);
+      const result = await res.json();
+      confirmBtn.textContent = "提案已建立";
+      addSystemNote(`已加入待確認提案：${selected.map(optionLabel).join("、")}。尚未實際預訂。`);
+      if (window.TravelGuardian) await window.TravelGuardian.showResult(result);
       await refreshSchedule();
     } catch (err) {
       confirmBtn.disabled = false;
@@ -398,7 +401,7 @@ function renderMap(tripMap) {
     const label = m.type === "airport" ? `${m.place}（${m.role === "depart" ? "出发" : "到达"}）`
       : m.type === "hotel" ? `${m.name || m.place}`
       : m.place;
-    const info = new AMap.InfoWindow({ content: `<div style="font-size:12px;">${label}</div>`, offset: new AMap.Pixel(0, -10) });
+    const info = new AMap.InfoWindow({ content: `<div style="font-size:12px;">${escapedData(label)}</div>`, offset: new AMap.Pixel(0, -10) });
     circle.on("click", () => info.open(map, [m.lng, m.lat]));
     circle.setMap(map);
     overlays.push(circle);
@@ -461,7 +464,14 @@ function renderDayTimeline(dayTimeline) {
   return html;
 }
 
+function escapedData(value) {
+  if (typeof value === "string") return value.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  if (Array.isArray(value)) return value.map(escapedData);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k,v])=>[k,escapedData(v)]));
+  return value;
+}
 function renderSchedule(trip) {
+  trip = escapedData(trip);
   document.getElementById("map-legend").innerHTML = renderMapLegend(trip.trip_map);
   renderMap(trip.trip_map);
 
@@ -471,7 +481,7 @@ function renderSchedule(trip) {
     html += "<h3>机票</h3>";
     trip.flights.forEach(f => {
       html += `<div class="booking-card flight">
-        <div class="row1"><span class="kind">机票</span><span class="confirmed">已确认</span></div>
+        <div class="row1"><span class="kind">机票</span><span class="confirmed">行程已採用・未實際預訂</span></div>
         <div class="title">${f.flight_no || ""} ${f.from_ || ""} → ${f.to || ""}</div>
         <div class="sub">${f.depart_time || ""} 起飞 → ${f.arrive_time || ""} 到达 · ${f.status || ""}</div>
       </div>`;
@@ -482,7 +492,7 @@ function renderSchedule(trip) {
     html += "<h3>酒店</h3>";
     trip.hotels.forEach(h => {
       html += `<div class="booking-card hotel">
-        <div class="row1"><span class="kind">酒店</span><span class="confirmed">¥${h.price ?? "-"} / 晚</span></div>
+        <div class="row1"><span class="kind">酒店</span><span class="confirmed">${h.currency || "幣別待確認"} ${h.price ?? "未知"} / 晚・未實際預訂</span></div>
         <div class="title">${h.name || ""}</div>
         <div class="sub">${h.check_in || ""} ~ ${h.check_out || ""} · ${h.cancel_policy || ""}</div>
       </div>`;
@@ -528,8 +538,9 @@ async function sendMessage() {
     pendingEl.classList.remove("pending");
     pendingEl.textContent = data.chat_reply || data.error || "（没有回复）";
     renderWidgets(data.widgets);
-    if (data.nearby_plan) renderNearby(data.nearby_plan);
+    if (window.TravelGuardian) await window.TravelGuardian.showResult(data);
     await refreshSchedule();
+    if (window.TravelGuardian) await window.TravelGuardian.refresh();
   } catch (err) {
     pendingEl.classList.remove("pending");
     pendingEl.textContent = "请求失败：" + err;
@@ -552,6 +563,7 @@ async function restoreSession() {
     renderWidgets(data.widgets || []);
     if (data.nearby_plan) restoreNearby(data.nearby_plan);
     await refreshSchedule();
+    if (window.TravelGuardian) await window.TravelGuardian.refresh();
   } catch (err) {
     addMessage("assistant", "載入失敗，請重新整理頁面：" + err);
   } finally {
@@ -560,5 +572,6 @@ async function restoreSession() {
 }
 restoreSession();
 </script>
+<script src="/guardian.js"></script>
 </body>
 </html>

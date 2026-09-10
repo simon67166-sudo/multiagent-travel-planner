@@ -35,6 +35,7 @@ class SessionStore:
             if state is None:
                 state = factory()
             yield state
+            state.pop("_guardian", None)  # Request-only authority snapshot; never persist stale team data.
             serialized = json.dumps(state, ensure_ascii=False)
             connection = self._connect()
             try:

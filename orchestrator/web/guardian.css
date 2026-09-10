@@ -1,0 +1,26 @@
+#travel-guardian { color: #20372d; background: #f4f8f5; border: 1px solid #cbded1; border-radius: 12px; padding: 16px; margin-bottom: 20px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+#travel-guardian * { box-sizing: border-box; }
+#travel-guardian h2 { font-size: 19px; margin: 0 0 10px; }
+#travel-guardian h3 { font-size: 16px; margin: 16px 0 8px; }
+#travel-guardian h4 { font-size: 14px; margin: 8px 0; }
+#travel-guardian p { margin: 8px 0; white-space: pre-wrap; }
+#travel-guardian label { display: block; margin: 9px 0; }
+#travel-guardian input:not([type=checkbox]), #travel-guardian select, #travel-guardian textarea { display: block; width: 100%; margin-top: 4px; padding: 8px; border: 1px solid #a9bcb0; border-radius: 6px; background: white; color: #20372d; font: inherit; }
+#travel-guardian input[type=checkbox] { margin-left: 10px; accent-color: #0b5d3b; }
+#travel-guardian input[type=range] { padding: 0; accent-color: #0b5d3b; }
+#travel-guardian button { border: 1px solid #0b5d3b; background: #fff; color: #0b5d3b; border-radius: 6px; padding: 8px 10px; margin: 4px 6px 4px 0; font: inherit; cursor: pointer; min-height: 36px; }
+#travel-guardian button[type=submit] { background: #0b5d3b; color: white; }
+#travel-guardian button:disabled { opacity: .5; cursor: not-allowed; }
+#travel-guardian :is(button, input, select, textarea, summary, a):focus-visible { outline: 3px solid #b77a17; outline-offset: 3px; }
+#travel-guardian details { border-top: 1px solid #cbded1; padding: 10px 0; margin-top: 10px; }
+#travel-guardian summary { cursor: pointer; font-weight: 600; }
+#travel-guardian fieldset { border: 1px solid #cbded1; border-radius: 6px; margin: 12px 0; min-width: 0; }
+#travel-guardian .tg-grid, #travel-guardian .tg-compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+#travel-guardian .tg-compare section { border-left: 3px solid #cbded1; padding-left: 8px; }
+#travel-guardian .tg-card { background: #fff; padding: 10px; border: 1px solid #d8e3db; border-radius: 8px; margin: 8px 0; }
+#travel-guardian .tg-notice { color: #345f47; min-height: 24px; }
+#travel-guardian .tg-error { color: #9b3024; }
+#travel-guardian .tg-roster { padding: 0; list-style: none; }
+#travel-guardian .tg-roster li { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid #d8e3db; padding: 4px 0; }
+#travel-guardian .tg-sources a { display: inline-block; color: #0b5d3b; margin: 4px 8px; text-decoration: underline; }
+@media (max-width: 480px) { #travel-guardian .tg-grid, #travel-guardian .tg-compare { grid-template-columns: 1fr; } }

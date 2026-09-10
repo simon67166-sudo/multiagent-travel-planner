@@ -11,6 +11,7 @@ def validate_request(data):
     if not isinstance(data,dict): raise ValueError("請提供行程資料")
     request=deepcopy(data)
     aliases={"澳门":"澳門","Hong Kong":"香港","Macau":"澳門"}
+    if not isinstance(request.get("city"), str): raise ValueError("請選擇澳門或香港")
     request["city"]=aliases.get(request.get("city"),request.get("city"))
     if request["city"] not in sources.CITY: raise ValueError("目前請選擇澳門或香港")
     if not isinstance(request.get("location"),str) or not 1<=len(request["location"].strip())<=200:
@@ -53,18 +54,32 @@ def rank_candidates(candidates,members):
         return fallback
 
 
-def build_plan(data):
+def build_plan(data, group_members=None):
     request=validate_request(data)
     start=datetime.fromisoformat(request["date"]+"T"+request["start_time"]); end=start+timedelta(hours=request["hours"])
     origin=sources.find_origin(request["city"],request["location"])
     candidates=sources.nearby(request["city"],origin)
+    if group_members is not None:
+        from guardian_service import validate_itinerary
+        filtered=[]
+        for poi in candidates:
+            check=validate_itinerary({"nearby_plan":{"stops":[poi]}},group_members)
+            if not check["violations"]:
+                poi["unknowns"]=check["unknowns"]
+                filtered.append(poi)
+        candidates=filtered
     ranked=rank_candidates(candidates,request["members"])
     selected=[]; legs=[]; current=origin; cursor=start; timed=True
     max_stops=min(6,max(1,int(request["hours"])))
     pool=ranked[:8]
     while pool and len(selected)<max_stops:
         poi=min(pool,key=lambda p:sources.distance(current,p)); pool.remove(poi)
-        leg=sources.route(current,poi,request["mode"])
+        if request["mode"]=="transit":
+            from guardian_sources import route as transit_route
+            leg=transit_route(current,poi,request["city"],"transit")
+        else: leg=sources.route(current,poi,request["mode"])
+        if leg.get("available") and not isinstance(leg.get("duration_min"),(int,float)):
+            leg["available"]=False
         leg.update(from_name=current["name"],to_name=poi["name"],navigation_url=leg.get("navigation_url",sources.navigation_link(current,poi,request["mode"])),
                    transit_url=leg.get("transit_url",sources.navigation_link(current,poi,"transit")))
         stay=45 if poi.get("category") in ("museum","restaurant") else 30
@@ -74,6 +89,9 @@ def build_plan(data):
             arrival_text=arrival.strftime("%H:%M"); finish_text=finish.strftime("%H:%M"); cursor=finish
         else:
             timed=False; arrival_text="待確認交通時間"; finish_text="待確認"
+        if group_members is not None:
+            check=validate_itinerary({"nearby_plan":{"stops":selected+[poi],"legs":legs+[leg]}},group_members)
+            if check["violations"]: continue
         selected.append({**poi,"arrival_time":arrival_text,"end_time":finish_text,"suggested_stay_minutes":stay,
                          "visit_note":f"建議停留 {stay} 分鐘；營業時間及入場條件須出發前核對。"})
         legs.append(leg); current=poi
@@ -107,7 +125,7 @@ def from_chat(message,state):
 保留已知的同行者，不限制清單人數，不虛構成員。只更新用戶明確修改的需求。缺少 city 或 location，回傳 {"question":"需要追問的問題"}。
 未指定日期用今天，未指定時間用10:00，未指定時長用3小時，未指定方式用walking。只輸出JSON。"""
     context={"today":today,"previous_request":state.get("nearby_plan",{}).get("request"),"message":message}
-    raw=llm_tool.call_llm([{"role":"system","content":prompt},{"role":"user","content":json.dumps(context,ensure_ascii=False)}])
+    raw=llm_tool.call_llm([{"role":"system","content":prompt},{"role":"user","content":json.dumps(context,ensure_ascii=False)}],model=llm_tool.MODEL_LIGHT)
     try:
         clean=raw.strip()
         if clean.startswith("```"): clean="\n".join(clean.splitlines()[1:-1])
@@ -115,5 +133,8 @@ def from_chat(message,state):
     except (ValueError,TypeError): raise ValueError("需求解析失敗，請使用港澳附近遊表單填寫起點及日期") from None
     if isinstance(request,dict) and isinstance(request.get("question"),str):
         return {"chat_reply":request["question"],"widgets":[],"map_panel":{},"community_panel":[]},state
-    plan=build_plan(request); state["nearby_plan"]=plan; state["city"]=plan["request"]["city"]
+    members=state.get("_guardian",{}).get("members")
+    if members is not None and isinstance(request,dict):
+        request["members"]=[{"name":m["name"],"preferences":json.dumps(m["preferences"],ensure_ascii=False)} for m in members]
+    plan=build_plan(request,group_members=members); state["nearby_plan"]=plan; state["city"]=plan["request"]["city"]
     return {"chat_reply":plan_reply(plan),"nearby_plan":plan,"widgets":[],"map_panel":{},"community_panel":[]},state

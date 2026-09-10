@@ -62,7 +62,11 @@ class WebTests(unittest.TestCase):
             state["pending_widgets"] = [{"widget": "hotel_picker", "data": {"options": [item], "max_select": 1}}]
         response = self.a.post("/widget-response", json={"widget": "hotel_picker", "selected": [item]})
         self.assertEqual(response.status_code, 200)
-        self.assertIn("test hotel", json.dumps(self.store.load(sid)["trip_plan"]))
+        self.assertNotIn("test hotel", json.dumps(self.store.load(sid)["trip_plan"]))
+        proposal = response.json["proposal"]
+        self.assertIsNotNone(proposal)
+        accepted = self.a.post("/proposals/"+proposal["id"]+"/accept",json={"expected_version":proposal["base_version"]})
+        self.assertEqual(accepted.status_code,200,accepted.json)
         self.assertEqual(self.a.post("/widget-response", json={"widget": "hotel_picker", "selected": [item]}).status_code, 400)
         self.assertNotIn("test hotel", json.dumps(self.b.get("/trip").json))
         self.assertIn("test hotel", json.dumps(self.a.get("/trip").json))
@@ -72,6 +76,10 @@ class WebTests(unittest.TestCase):
         with patch("nearby_planner.build_plan",return_value=plan), patch("nearby_planner.plan_reply",return_value="nearby plan"):
             response=self.a.post("/nearby-plan",json={"city":"香港"})
         self.assertEqual(response.status_code,200)
+        self.assertNotIn("nearby_plan",self.a.get("/session").json)
+        proposal=response.json["proposal"]
+        self.assertEqual(proposal["itinerary"]["nearby_plan"],plan)
+        self.assertEqual(self.a.post("/proposals/"+proposal["id"]+"/accept",json={"expected_version":0}).status_code,200)
         self.assertEqual(self.a.get("/session").json["nearby_plan"],plan)
         self.assertNotIn("nearby_plan",self.b.get("/session").json)
 

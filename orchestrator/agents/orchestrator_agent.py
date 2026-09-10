@@ -88,6 +88,9 @@ def classify_intent(user_message: str, history: list[dict] | None = None) -> lis
 # 主流程：意图识别 → 分发调用子 Agent → 汇总 → 生成回复
 # ---------------------------------------------------------------------------
 def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
+    if shared_state.get("_guardian"):
+        from guardian_service import chat
+        return chat(user_message, shared_state)
     history = deepcopy(shared_state.get("messages", []))
     intents = classify_intent(user_message, history)
 

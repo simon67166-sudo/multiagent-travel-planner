@@ -12,3 +12,6 @@ Status: foundation store implemented; HTTP integration in progress. Skill engine
 Canonical state: {city, trip_plan, nearby_plan, mode?}; nearby_plan is a map projection in the same immutable itinerary version, not an independently writable plan. Team revision changes for member preferences/membership; itinerary version increments only on accept. Proposals capture both. Session chat history stays private.
 
 Validation commands: python -m unittest discover -s tests -v; Node --check for each frontend script. Live providers need locally configured credentials; demo tests do not spend model quota.
+
+
+2026-09-11 checkpoint: user requested an intermediate, tested commit before quota exhaustion. Foundation + integrated baseline implemented; 87 tests passing. Final scope NOT completed. See docs/guardian-checkpoint.md for exact gaps and resumption steps.

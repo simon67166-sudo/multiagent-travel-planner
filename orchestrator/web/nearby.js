@@ -30,6 +30,11 @@ function drawNearbyMap(plan) {
   const container = nearbyById("nearby-map"); container.style.display = "block";
   nearbyById("map-container").style.display = "none";
   nearbyById("map-legend").style.display = "none";
+  if (plan.demo || plan.data_kind === "demo" || !plan.origin) {
+    if (nearbyMap) { nearbyMap.destroy(); nearbyMap=null; }
+    container.textContent="演示地點為虛構，沒有真實導航線。切換真實查詢並設定高德 Key 後顯示路線。";
+    return;
+  }
   if (plan.crs !== "GCJ02") {
     if (nearbyMap) { nearbyMap.destroy(); nearbyMap = null; }
     container.textContent = "這份行程使用舊版地圖座標，請按『生成附近遊攻略』重新查詢高德路線。原對話與行程記錄仍保留。";
@@ -43,7 +48,7 @@ function drawNearbyMap(plan) {
   if (!nearbyMap) nearbyMap = new AMap.Map(container,{zoom:15,center:[plan.origin.lng,plan.origin.lat]});
   nearbyMap.clearMap();
   points.forEach((p,i) => new AMap.Marker({position:[p.lng,p.lat],title:`${i}. ${p.name}`,map:nearbyMap}));
-  plan.legs.forEach(leg => { if (leg.available && leg.coordinates.length) new AMap.Polyline({path:leg.coordinates,showDir:true,strokeColor:"#0b7054",strokeWeight:5,map:nearbyMap}); });
+  (plan.legs || []).forEach(leg => { if (leg.available && (leg.coordinates || []).length) new AMap.Polyline({path:leg.coordinates,showDir:true,strokeColor:"#0b7054",strokeWeight:5,map:nearbyMap}); });
   nearbyMap.setFitView();
 }
 
@@ -63,17 +68,17 @@ function renderNearby(plan) {
   const output=nearbyById("nearby-output"); output.replaceChildren();
   const intro=nearbyText(output,"section",""); intro.className="nearby-card";
   nearbyText(intro,"h3",`${plan.request.city} · ${plan.request.date} 附近遊建議`);
-  nearbyText(intro,"p",`定位：${plan.origin.name}。請確認這是你要出發的位置。`);
-  nearbyText(intro,"p",`${plan.request.members.length} 位已登記成員 · ${plan.currency} · ${plan.request.hours} 小時`);
-  nearbyLink(intro,"起點資料",plan.origin.source_url);
+  nearbyText(intro,"p",`定位：${plan.origin?.name || "演示情境，未提供真實座標"}。請確認這是你要出發的位置。`);
+  nearbyText(intro,"p",`${(plan.request.members || []).length} 位已登記成員 · ${plan.currency} · ${plan.request.hours} 小時`);
+  nearbyLink(intro,"起點資料",plan.origin?.source_url);
   plan.reminders.forEach(t => nearbyText(intro,"p",t));
   const weather=nearbyText(output,"section",""); weather.id="nearby-weather"; weather.className="nearby-card";
-  renderNearbyWeather(plan.weather);
+  renderNearbyWeather(plan.weather || {});
   plan.stops.forEach((stop,i) => {
     const card=nearbyText(output,"section",""); card.className="nearby-card";
     nearbyText(card,"h3",`${i+1}. ${stop.arrival_time}–${stop.end_time} ${stop.name}`);
     nearbyText(card,"p",stop.visit_note);
-    nearbyText(card,"p",`地址：${stop.address || "來源未提供"}；價格：${stop.price ?? "未知"}；來源營業時間：${stop.opening_hours || "未知"}`);
+    nearbyText(card,"p",`地址：${stop.address || "來源未提供"}；價格：${typeof stop.price === "object" && stop.price ? `${stop.price.currency} ${stop.price.amount}` : stop.price ?? "未知"}；來源營業時間：${stop.opening_hours || "未知"}`);
     nearbyLink(card,"地點資料",stop.source_url);
     nearbyText(card,"small",` ${stop.source || ""} · ${stop.fetched_at || ""}`);
     const leg=plan.legs[i]; if (!leg) return;
@@ -83,13 +88,13 @@ function renderNearby(plan) {
     nearbyLink(card,"開啟導航",leg.navigation_url); nearbyLink(card,"查公交／轉乘",leg.transit_url); nearbyLink(card,"路線資料來源",leg.source_url);
   });
   const help=nearbyText(output,"section",""); help.className="nearby-card"; nearbyText(help,"h3","交通使用方式");
-  plan.transport_help.forEach(t => nearbyText(help,"p",t));
+  (plan.transport_help || ["演示未提供真實交通資料。"]).forEach(t => nearbyText(help,"p",t));
   drawNearbyMap(plan);
 }
 function restoreNearby(plan) {
   const r=plan.request;
   for (const [id,key] of [["city","city"],["location","location"],["date","date"],["time","start_time"],["hours","hours"],["mode","mode"]]) nearbyById("nearby-"+id).value=r[key];
-  nearbyById("nearby-members").replaceChildren(); r.members.forEach(m => addNearbyMember(m.name,m.preferences || ""));
+  nearbyById("nearby-members").replaceChildren(); (r.members || []).forEach(m => addNearbyMember(m.name,m.preferences || ""));
   renderNearby(plan);
 }
 async function refreshNearbyWeather() {
@@ -111,10 +116,10 @@ nearbyById("nearby-form").onsubmit=async event => {
   try {
     const response=await fetch("/nearby-plan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
     const result=await response.json(); if (!response.ok) throw new Error(result.error || "規劃失敗");
-    renderNearby(result.nearby_plan);
+    if (window.TravelGuardian) await window.TravelGuardian.showResult(result);
     addMessage("user",`規劃 ${data.city} ${data.location} 附近遊`); addMessage("assistant",result.chat_reply);
-    nearbyById("nearby-status").textContent="建議行程已保存。頁面開啟時每10分鐘更新天氣，不會自動修改行程。";
+    nearbyById("nearby-status").textContent="提案已建立，請在團隊面板比較並接受。正式行程尚未修改。";
   } catch (e) { nearbyById("nearby-status").textContent=e.message; }
   finally { nearbyBusy=false; nearbyById("build-nearby").disabled=false; }
 };
-setInterval(() => { if (document.visibilityState === "visible") refreshNearbyWeather(); },600000);
+// Guardian owns the single visible-page event polling loop.

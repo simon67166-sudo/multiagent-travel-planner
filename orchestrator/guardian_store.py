@@ -23,8 +23,7 @@ def encode(value): return json.dumps(value,ensure_ascii=False,allow_nan=False)
 def identifier(): return secrets.token_hex(16)
 
 def canonical_itinerary(state):
-    result=deepcopy(state) if "trip_plan" in state and "city" in state and "messages" not in state else {}
-    result={k:v for k,v in result.items() if k in ("trip_plan","nearby_plan","city","legacy_nearby_plan","migration_notes","mode")}
+    result={k:deepcopy(state[k]) for k in ("trip_plan","nearby_plan","city","legacy_nearby_plan","migration_notes","mode") if k in state}
     result["city"]=state.get("city","澳門")
     result["trip_plan"]=deepcopy(state.get("trip_plan") or trip_plan.new_trip_plan("trip-"+identifier()))
     result["nearby_plan"]=deepcopy(state.get("nearby_plan"))
