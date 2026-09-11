@@ -1,6 +1,4 @@
 CLAUDE.local.md
-.env
-orchestrator/.env
 orchestrator/data/
 __pycache__/
 *.pyc
