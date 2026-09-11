@@ -22,6 +22,7 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR_DIR))
 
 import map_tool
+import nearby_sources
 import trip_plan
 import weather_tool
 
@@ -104,7 +105,25 @@ def _real_leg(from_point: dict, to_point: dict, city: str | None) -> dict | None
     """查 from_point -> to_point 的真实交通方式/耗时（2km 阈值切驾车，跟 _estimate_transport
     同一个阈值）。查不到返回 None，调用方自己决定怎么降级，不在这里格式化成文字
     （_estimate_transport 是给 run() 用的，返回值直接是格式化字符串；这个是给 schedule()
-    用的，需要拿到真实分钟数去推进时间游标，不能只有一句人话）。"""
+    用的，需要拿到真实分钟数去推进时间游标，不能只有一句人话）。
+
+    from_point/to_point 只要带 lng/lat（schedule() 传进来的候选/起点都带，因为
+    content_agent.py 已经用 nearby_sources.find_origin()/nearby() 查过一次真实坐标了），
+    就直接用 nearby_sources.route() 按坐标查，不再重新地理编码——map_tool.route_between()
+    每次都要用地名重新查一次坐标，对港澳这种同名地点多的场景不可靠（这个 session 前面已经
+    在 content_agent.py/route_agent.py 的种子扩展里踩过并绕开这个坑，这里用坐标直接查是
+    同一个道理，顺便也省一次地理编码的网络往返）。坐标缺失才退回按名字查，理论上不该发生
+    （schedule() 调用前已经用 candidate.get("lng") is not None 过滤过），只是防御性兜底。"""
+    if from_point.get("lng") is not None and to_point.get("lng") is not None:
+        a = {"lng": from_point["lng"], "lat": from_point["lat"], "name": from_point.get("place") or from_point.get("name"), "crs": "GCJ02"}
+        b = {"lng": to_point["lng"], "lat": to_point["lat"], "name": to_point.get("place") or to_point.get("name"), "crs": "GCJ02"}
+        info = nearby_sources.route(a, b, mode="walking")
+        if info["available"] and info["distance_m"] > _WALK_DRIVE_THRESHOLD_M:
+            info = nearby_sources.route(a, b, mode="driving")
+        if not info["available"]:
+            return None
+        return {"distance_m": info["distance_m"], "duration_min": info["duration_min"], "mode": info["mode"]}
+
     from_name = from_point.get("place") or from_point.get("name")
     to_name = to_point.get("place") or to_point.get("name")
     try:
@@ -162,6 +181,9 @@ def _place_day(day_plan: dict, ordered_stops: list[dict], start_point: dict | No
             day_plan, node_id, "attraction", stop.get("place") or stop.get("name"),
             arrival_transport=transport_label, arrival_time=arrival.strftime("%H:%M"),
             end_time=finish.strftime("%H:%M"), after_id=prev_id,
+            # 把候选已经查到的真实坐标顺手存进节点里——content_agent.py 老早就查过了，不存
+            # 下来的话 schedule_widgets.py 画地图时只能拿地点名字重新地理编码，不可靠也多余
+            lng=stop.get("lng"), lat=stop.get("lat"),
         )
         prev_id = node_id
         cursor = finish

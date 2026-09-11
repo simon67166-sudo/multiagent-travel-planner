@@ -46,6 +46,39 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(stops[0]["arrival_time"], "10:10")
         self.assertEqual(stops[0]["end_time"], "10:40")  # museum 不含"食"字，走 30 分钟停留档
 
+    def test_place_day_stores_coordinates_on_stop(self):
+        # 2026-09-15：修复"地图重新按名字地理编码导致坐标不可靠"的 bug——候选自带的真实坐标
+        # 要顺手存进 trip_plan 节点里，不能排完班就扔掉，不然 schedule_widgets.py 只能靠
+        # 不可靠的 map_tool.geocode() 重新猜一次
+        import trip_plan
+        from agents import route_agent
+        origin={"lng":113.54,"lat":22.19,"name":"起点"}
+        poi={"lng":113.541,"lat":22.191,"place":"博物馆","category":"museum"}
+        leg={"mode":"walking","duration_min":10,"distance_m":500}
+        trip = trip_plan.new_trip_plan("test-place-day-coords")
+        day_plan = trip_plan.get_or_create_day(trip, "day-1")
+        with patch.object(route_agent, "_real_leg", return_value=leg):
+            route_agent._place_day(day_plan, [poi], origin, "10:00", 5, "澳门")
+        stops = trip_plan.day_stops(day_plan)
+        self.assertEqual(stops[0]["lng"], 113.541)
+        self.assertEqual(stops[0]["lat"], 22.191)
+
+    def test_real_leg_skips_geocoding_when_coordinates_known(self):
+        # 候选/起点带坐标（schedule() 传进来的都带，因为 content_agent.py 已经用
+        # nearby_sources.find_origin()/nearby() 查过一次）就该直接按坐标查路线，不该再用
+        # map_tool.geocode() 按名字重新查一次——对港澳同名地点场景不可靠，是这个 session
+        # 已经踩过并绕开的坑
+        import map_tool
+        from agents import route_agent
+        a={"lng":113.54,"lat":22.19,"place":"甲地"}
+        b={"lng":113.541,"lat":22.191,"place":"乙地"}
+        fake_route={"available":True,"distance_m":300,"duration_min":5,"mode":"walking","coordinates":[]}
+        with patch.object(map_tool,"geocode",side_effect=AssertionError("不该调用 geocode()")), \
+             patch("nearby_sources.route",return_value=fake_route) as route_mock:
+            leg = route_agent._real_leg(a, b, "澳门")
+        self.assertEqual(leg["distance_m"], 300)
+        route_mock.assert_called_once()
+
     def test_place_day_never_fakes_a_failed_route(self):
         # 原 test_missing_route_never_draws_fake_line 的等价替代：查路线失败时不能编造到达时间，
         # 要老实标"待定（地图查询失败）"，不能假装查到了什么

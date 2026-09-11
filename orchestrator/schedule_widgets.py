@@ -30,6 +30,7 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR_DIR))
 
 import map_tool
+import nearby_sources
 import trip_plan as trip_plan_module
 
 _DAY_COLOR_PALETTE = [
@@ -118,8 +119,25 @@ def _parse_polyline_segments(segments: list[str]) -> list[list[float]]:
     return coords
 
 
-def _route_leg_coords(place_a: str, place_b: str, city: str | None) -> list[list[float]]:
-    """查 place_a -> place_b 的真实路线（超过阈值自动从步行切驾车），返回展平的坐标序列。"""
+def _route_leg_coords(
+    place_a: str, place_b: str, city: str | None,
+    coord_a: tuple[float, float] | None = None, coord_b: tuple[float, float] | None = None,
+) -> list[list[float]]:
+    """查 place_a -> place_b 的真实路线（超过阈值自动从步行切驾车），返回展平的坐标序列。
+
+    coord_a/coord_b 给了（节点上存的真实坐标，见 route_agent._place_day() 的 lng/lat）就直接
+    按坐标查，不再重新地理编码——跟 route_agent._real_leg() 同一个道理。缺坐标（比如走老的
+    run() 接口排的行程，节点没存坐标）才退回按名字查。"""
+    if coord_a is not None and coord_b is not None:
+        a = {"lng": coord_a[0], "lat": coord_a[1], "name": place_a, "crs": "GCJ02"}
+        b = {"lng": coord_b[0], "lat": coord_b[1], "name": place_b, "crs": "GCJ02"}
+        info = nearby_sources.route(a, b, mode="walking")
+        if info["available"] and info["distance_m"] > _WALK_DRIVE_THRESHOLD_M:
+            info = nearby_sources.route(a, b, mode="driving")
+        if not info["available"]:
+            raise ValueError("路线查询失败（坐标已知但高德路线规划无结果）")
+        return info["coordinates"]
+
     info = map_tool.route_between(place_a, place_b, mode="walking", city=city)
     if info["distance_m"] > _WALK_DRIVE_THRESHOLD_M:
         info = map_tool.route_between(place_a, place_b, mode="driving", city=city)
@@ -191,7 +209,12 @@ def build_trip_map_widget(trip_plan_obj: dict, city: str | None = None) -> dict:
             place = stop.get("place")
             if not place:
                 continue
-            coord = geocode_or_record_failure(place)
+            # 节点上存了坐标（route_agent.schedule() 排的行程都会存，见 route_agent._place_day()）
+            # 就直接用，不重新地理编码；没有（比如走老的 run() 接口排的行程）才退回按名字查
+            if stop.get("lng") is not None and stop.get("lat") is not None:
+                coord = (stop["lng"], stop["lat"])
+            else:
+                coord = geocode_or_record_failure(place)
             if coord is not None:
                 lng, lat = coord
                 clusterable_markers.append(
@@ -207,7 +230,7 @@ def build_trip_map_widget(trip_plan_obj: dict, city: str | None = None) -> dict:
                 )
             if prev_place is not None:
                 try:
-                    coords = _route_leg_coords(prev_place, place, city)
+                    coords = _route_leg_coords(prev_place, place, city, prev_coord, coord)
                     pending_routes.append(
                         {"day": day["date"], "color": color, "coordinates": coords, "anchor": prev_coord or coord}
                     )
