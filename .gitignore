@@ -4,3 +4,4 @@ orchestrator/.env
 orchestrator/data/
 __pycache__/
 *.pyc
+~$数据库原始.xlsx

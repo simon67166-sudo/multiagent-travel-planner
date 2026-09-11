@@ -42,6 +42,9 @@ orchestrator/
     exception_agent.py            # 异常应变 Agent
   widgets.py                      # 展示插件：右侧聊天框里的富交互小组件，跟 Agent 逻辑解耦
   schedule_widgets.py             # 左侧日程面板展示组件（地图+连线、每日时间线、机票酒店面板），跟 widgets.py 同一个分离思路
+  standardize_hk_macau_data.py    # 把组员整理的港澳达人数据 Excel 转成标准化 JSON（见文末专门一节）
+  import_hk_macau_data.py         # 把标准化 JSON 灌进 Chroma（人格向量怎么算在这一步）
+  data_sources/hk_macau_posts.json  # 标准化后的港澳达人数据库（229 条，本地人认证 + 小红书两个来源）
   main.py                         # 薄入口：re-export 编排 Agent 的两个函数 + __main__ 完整 demo
   store.py / trip_plan.py / persona.py   # 不变
   server.py / web/                # 不变，还是 import main，接口不受这次拆分影响
@@ -90,6 +93,8 @@ orchestrator/
 **职责**：两阶段检索第一阶段。模型档位 `MODEL_FULL`（UGC 语义提炼），目前还没实际调用 LLM（纯向量检索）。
 
 `run(shared_state, location_hint, top_k=3)`：算 persona 向量 → `store.query_similar_posts()` 查候选。`location_hint` 留给"内容相关性排序"（两阶段检索第二阶段）用，那部分还没实现。
+
+返回的 `recommendations` 每条现在除了原有字段，还带港澳数据库的字段：`city`/`category`/`post_type`/`address`/`tags`/`verified_local`（杭州那批老 demo 数据没有这些，会是 `None`/空列表/`False`，不影响原有字段读取）。
 
 ## agents/route_agent.py -- 行程/路线 Agent
 
@@ -186,7 +191,7 @@ orchestrator/
 | `save_image(post_id, filename, image_bytes)` | 写一张图，返回存进 `content["images"]` 的相对路径 |
 | `resolve_image_path(相对路径)` | 相对路径转本地绝对路径，读图用 |
 | `add_post(post_id, persona_vector, content)` | 存一条帖子。`content` 字段见下表 |
-| `query_similar_posts(persona_vector, top_k=5)` | 两阶段检索第一阶段：按人格向量相似度找候选帖子，返回时带 `similarity_score` |
+| `query_similar_posts(persona_vector, top_k=5)` | 两阶段检索第一阶段：按人格向量相似度找候选帖子，返回时带 `similarity_score`；`verified_local=True` 的帖子会被优先加权（见下面说明） |
 | `delete_post(post_id)` | 删帖 |
 | `log_history(user_id, trip_id, record)` | 追加一条行程反馈记录 |
 | `get_history(user_id=None)` | 读历史记录，不传 `user_id` 读全部 |
@@ -198,10 +203,67 @@ orchestrator/
 | `place` / `time_slot` / `avg_cost` / `rating` / `avoid_tips` / `verified_trip` | 结构化字段，对齐 `agent-interfaces.md` 达人 Agent 输出契约 |
 | `caption` | 帖子正文文字，可选 |
 | `images` | 图片相对路径列表，可选，由 `save_image()` 生成 |
+| `tags` | 标签列表，可选，跟 `images` 一样序列化存（`tags_json`），查询时还原回列表 |
+| `city` / `category` / `post_type` / `address` / `verified_local` | 港澳达人数据库用的字段（见 `import_hk_macau_data.py` 一节），`verified_local=True` 表示本地人认证来源 |
+
+**"本地人认证"优先加权是怎么做的**：`query_similar_posts()` 先按 `top_k * 3` 多捞一些候选（不是只捞 `top_k` 个），把 `verified_local=True` 的帖子相似度乘一个固定系数 `_VERIFIED_LOCAL_BOOST = 1.15`，再按加权后的分数重新排序截到 `top_k`。这个"先多捞再重排"是必须的——如果直接对 Chroma 已经按原始距离截好的 `top_k` 结果加权，加权只能在这几条里面换个顺序，换不进被漏掉的本地人帖子，加权就没意义了。
 
 **待定/限制**：
 - 内容相关性排序（两阶段检索第二阶段）没实现，留给调用方在 `query_similar_posts()` 的候选集里自己排
 - 图片存本地文件系统，部署到 ModelScope Studio 时要换成对象存储（OSS/CDN），`images` 字段到时候存 URL 而不是本地路径，上层调用方式不变
+- `_VERIFIED_LOCAL_BOOST` 系数（1.15）是拍的，没有做过效果对比调优，觉得加权效果不明显/太强可以直接改这个常量
+
+---
+
+## standardize_hk_macau_data.py + import_hk_macau_data.py -- 港澳达人数据库
+
+**背景**：组员手动整理了一份港澳（澳门/香港）达人推荐/避坑数据，存在仓库根目录的 `数据库原始.xlsx` 里，来源分两种：
+- **本地人认证**（Excel 里的"本地人澳门"/"本地人香港" sheet）：饮食/景点/Tips 分类推荐 + 单独一张避坑表
+- **小红书**（"小红书澳门"/"小红书香港" sheet）：褒贬都有的普通帖子，不算本地人认证来源
+
+这两种来源对应 `store.py` 里新加的 `verified_local` 字段——本地人认证的帖子在检索时会被优先加权（见 `store.py` 一节），小红书来源不加权。这个字段是原始数据自带的真实来源标记（组员整理的时候已经分好表了），不是靠算法从内容"判断"出来的。
+
+**两步流程**（分开是为了标准化出错时不用重新灌一次向量库）：
+
+| 脚本 | 作用 |
+|---|---|
+| `standardize_hk_macau_data.py` | 读 `数据库原始.xlsx`，标准化字段 + 编号，写出 `data_sources/hk_macau_posts.json`。不碰 Chroma |
+| `import_hk_macau_data.py` | 读标准化 JSON，用 `persona.infer_post_persona_vector()` 给每条帖子算一个人格向量，调 `store.add_post()` 灌进 Chroma |
+
+**编号规则**（城市前缀 + 类型字母 + 三位数字，类型内连续编号，不区分本地人/小红书来源）：
+
+| | 澳门·推荐 | 澳门·避坑 | 香港·推荐 | 香港·避坑 |
+|---|---|---|---|---|
+| 编号格式 | `MF/MS/MT` + 三位数字 | `MN` + 三位数字 | `HF/HS/HT` + 三位数字 | `HN` + 三位数字 |
+| 示例 | MF001, MS001, MT001 | MN001, MN002 | HF001, HS001, HT001 | HN001, HN002 |
+| 说明 | 饮食/景点/Tips，正常分类 | 全部统一放这里，不分饮食/景点 | 同左 | 同左 |
+
+解读：`M`=Macau，`H`=Hong Kong（城市前缀）；`F`=Food，`S`=Sight，`T`=Tips（推荐分类）；`N`=No（避坑专用，统一放一起不细分）。
+
+**原始表格解析上的坑**：Excel 里不同分类小节的列不是对齐的（比如"本地人香港"的 Tips 小节没有单独的"名称"列，内容直接写在名称那一格；"本地人香港"饮食小节比"本地人澳门"多一列"推荐人"），`standardize_hk_macau_data.py` 按每个小节自己的表头动态取列，不能假设固定列位置——这个坑是解析的时候踩出来的，写死列位置会导致数据错位。
+
+**当前数据量**（229 条，跑 `python standardize_hk_macau_data.py` 会打印这个分布）：
+
+| 前缀 | 条数 | 前缀 | 条数 |
+|---|---|---|---|
+| MF | 50（本地人30+小红书20） | HF | 19（本地人**9**+小红书10） |
+| MS | 50 | HS | 20 |
+| MT | 50 | HT | 20 |
+| MN | 10 | HN | 10 |
+
+**已知数据缺口**：香港饮食类本地人认证只有 9 条，不是目标的 10 条——原始表格里就是这样，组员应该是漏填了一条，不是解析脚本的 bug，不影响其他数据使用。
+
+**怎么重新跑**：
+```
+python orchestrator/standardize_hk_macau_data.py   # 改了 Excel 或标准化逻辑之后跑
+python orchestrator/import_hk_macau_data.py         # 改了人格反推逻辑，或者清空过 orchestrator/data/chroma 之后跑
+```
+`import_hk_macau_data.py` 用的是 `upsert`（`store.add_post()` 内部调的），同一个 id 重复导入会覆盖不会重复，可以放心重跑。
+
+**待接事项**：
+- 避坑类帖子（`MN`/`HN`）反推出来的人格向量是中性默认值（见 `persona.py` 一节的已知局限），检索排名上不占优势也不吃亏，更合理的做法（不管人格匹配度、只要地点/类型对上就该出现）属于两阶段检索第二阶段，还没实现
+- `verified_local` 优先加权的系数（1.15）没有做过 A/B 效果对比，是拍的经验值
+- `content_agent.py` 的两阶段检索第二阶段接上之后，`category`（饮食/景点/Tips）字段可以用来做更精细的"用户问吃的就优先出饮食类"这种过滤，现在还没用上
 
 ---
 
@@ -266,11 +328,20 @@ trip_plan = {
 | `update_stable_traits(persona, **fields)` | 读写跨场景稳定特质，同样有校验 |
 | `apply_feedback(persona, scenario, dimension, new_value, reason="")` | 按维度校准，写入 + 留痕（`feedback_log`）。"该改成什么值"由调用方决定，这里只负责写入 |
 | `budget_filter_ok(a_score, b_score, max_diff=0.25)` | 判断两个 `budget_score` 是否够接近，硬过滤专用，独立于相似度向量 |
-| `compute_persona_vector(persona, scenario)` | 拼出向量：`[novelty_score, taste multi-hot, pace_score, social_mode one-hot, interest_theme multi-hot]`，固定 20 维（词表大小变了维度也会变） |
+| `compute_persona_vector(persona, scenario)` | 拼出向量：`[novelty_score, taste multi-hot, pace_score, social_mode one-hot, interest_theme multi-hot]`，固定 21 维（词表大小变了维度也会变，加了"葡国菜"后从 20 变 21） |
+| `infer_post_persona_vector(scenario, tags=None, avg_cost=None, category=None)` | 港澳达人数据库导入专用：这些帖子是组员手动整理的真实内容，没有"发帖人自己的问卷答案"，用标签/人均/分类反推一个大致合理的人格向量，见下面单独说明 |
+
+**`infer_post_persona_vector()` 是怎么反推的**（启发式估计，不是精确画像）：
+- `_TAG_TO_TASTE`/`_TAG_TO_INTEREST` 两个关键词映射表，对标签文本做子串匹配，匹配上就计入对应的 `taste`/`interest_theme`；匹配不上的标签（比如"三代传承""400年历史"这种描述性但不构成人格维度信号的）直接丢弃，不强行凑
+- `category`（饮食/景点）也会补一条弱信号：饮食→"美食探店"，景点→"人文历史"
+- `avg_cost` 线性换算成 `budget_score`（0～250 元映射到 0～1，250 元封顶），换算公式很粗糙，不是精确定价模型
+- 标签里出现"小众/冷门/隐世"这类词 → `novelty_score` 偏高（0.75）；出现"网红/热门/必打卡" → 偏低（0.3）；都没有就是中性 0.5
+- `social_mode` 故意不猜——单条帖子看不出"适合独行/家庭/朋友"，留空对应 `compute_persona_vector()` 里那段 one-hot 全 0，这是合法的"未指定"编码
+- **已知局限**：避坑（`避雷理由`）类帖子在标准化数据里没有 `tags`/`avg_cost`/`category`，反推出来的人格向量是中性默认值（`novelty=0.5, budget=0.5`，无 taste/interest），跟任何用户人格的相似度都不会特别高也不会特别低——这类帖子更适合"不管人格匹配度、只要地点/类型对上就该出现"，属于两阶段检索第二阶段（内容相关性排序）该管的事，那部分还没实现
 
 **待定/限制**：
 - `compute_persona_vector()` 是数值特征拼接，不是真实语义 embedding，以后接真实 embedding 模型可以整体替换掉函数体，调用方（`store.py`）接口不用变
-- 改 `_TASTE_VOCAB`/`_INTEREST_VOCAB` 词表会改变向量维度，如果本地 Chroma 已经有存量数据，改词表前要清掉 `orchestrator/data/chroma` 重新灌数据，不然新旧向量维度对不上（这个坑已经踩过一次）
+- 改 `_TASTE_VOCAB`/`_INTEREST_VOCAB` 词表会改变向量维度，如果本地 Chroma 已经有存量数据，改词表前要清掉 `orchestrator/data/chroma` 重新灌数据，不然新旧向量维度对不上（这个坑已经踩过一次，这次加"葡国菜"也重新灌了一次数据）
 - 从一条用户反馈文本判断"该把哪个维度调成什么值"的算法没实现，留给编排/达人 Agent 决定
 
 ---
@@ -318,6 +389,7 @@ python orchestrator/server.py
 4. 两阶段检索第二阶段（候选集内部按内容相关性排序）还没实现，`content_agent` 里 `location_hint` 参数目前没用上
 5. 反馈闭环（用户点评行程 → 校准 persona）还没接：`store.log_history()` 记录和 `persona.apply_feedback()` 校准都写好了，但没人在 `orchestrate()` 里调用它们
 6. `map_tool.py` 目前只查"两点之间"，没做"多点最优顺序"规划（比如给定 5 个景点，没有算出最优游览顺序，只是按用户/LLM 给的顺序排）
-7. 三个高德 key（`AMAP_KEY`/`AMAP_JS_KEY`/`AMAP_JS_SECURITY_CODE`）需要去高德开放平台申请配置，没配的话地图相关功能会优雅降级但看不到真实效果
+7. 三个高德 key 已经申请配置好并真实验证过（西湖→灵隐寺路线、机场/酒店坐标都是真实高德数据）
 8. 讨论过的其他 widget 想法还没做：反馈评分插件、异常变更确认插件、人格问卷引导插件
 9. 单会话全局 state（`server.py` 里的 `_state`），没有登录/多用户/并发处理，真要多人同时用需要重新设计状态管理
+10. 港澳达人数据库（229 条，见 `standardize_hk_macau_data.py` 一节）已经标准化+导入 Chroma，`verified_local` 优先加权也接上了，但避坑类帖子的人格向量是中性默认值、`content_agent` 的 `category` 字段还没用来做精细过滤，这两个都属于两阶段检索第二阶段（第4条）的范畴

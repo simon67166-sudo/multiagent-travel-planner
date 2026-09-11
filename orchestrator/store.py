@@ -65,11 +65,17 @@ def add_post(post_id: str, persona_vector: list[float], content: dict[str, Any])
       图文字段：
         caption: str              帖子正文文字，可选
         images: list[str]         图片相对路径列表，可选；用 save_image() 写图拿到路径后传进来
+      港澳达人数据库导入用（见 import_hk_macau_data.py）：
+        city, category, post_type: str 结构化筛选字段
+        tags: list[str]           标签列表，可选，跟 images 一样序列化存
+        verified_local: bool      True=本地人认证来源，查询时会被优先加权（见 query_similar_posts）
     """
     content = dict(content)
     images = content.pop("images", None) or []
+    tags = content.pop("tags", None) or []
     stored = {k: v for k, v in content.items() if v is not None}
     stored["images_json"] = json.dumps(images, ensure_ascii=False)
+    stored["tags_json"] = json.dumps(tags, ensure_ascii=False)
     _community_collection.upsert(
         ids=[post_id],
         embeddings=[persona_vector],
@@ -77,12 +83,22 @@ def add_post(post_id: str, persona_vector: list[float], content: dict[str, Any])
     )
 
 
+_VERIFIED_LOCAL_BOOST = 1.15  # 本地人认证帖子的相似度加权系数，数值后面按需调
+_OVERFETCH_MULTIPLIER = 3  # 要让加权真的能把本地人帖子挤进 top_k（而不是只在候选集内部换个顺序），
+# 必须比 top_k 多查一些候选再重新排序截断，不然 Chroma 已经按原始距离截到 top_k 了，加权无从谈起
+
+
 def query_similar_posts(persona_vector: list[float], top_k: int = 5) -> list[dict]:
     """
-    第一阶段：按人格向量相似度找候选帖子，返回时带 similarity_score 和还原出来的 images 列表。
+    第一阶段：按人格向量相似度找候选帖子，返回时带 similarity_score 和还原出来的 images/tags 列表。
     第二阶段的内容相关性排序留给调用方（比如达人 Agent 自己）在这个候选集里再做。
+
+    verified_local=True 的帖子（本地人认证来源，见 import_hk_macau_data.py）会被优先加权：
+    先多捞 top_k * _OVERFETCH_MULTIPLIER 个候选，按加权后的分数重新排序再截到 top_k，
+    这样加权才真的能影响"谁能进 top_k"，不是只在最终结果里调换个先后顺序。
     """
-    result = _community_collection.query(query_embeddings=[persona_vector], n_results=top_k)
+    fetch_n = top_k * _OVERFETCH_MULTIPLIER
+    result = _community_collection.query(query_embeddings=[persona_vector], n_results=fetch_n)
     posts = []
     ids = result["ids"][0]
     metadatas = result["metadatas"][0]
@@ -90,15 +106,21 @@ def query_similar_posts(persona_vector: list[float], top_k: int = 5) -> list[dic
     for post_id, metadata, distance in zip(ids, metadatas, distances):
         metadata = dict(metadata)
         images = json.loads(metadata.pop("images_json", "[]") or "[]")
+        tags = json.loads(metadata.pop("tags_json", "[]") or "[]")
+        similarity_score = 1 / (1 + distance)  # 距离转相似度，公式后面按需调整
+        if metadata.get("verified_local"):
+            similarity_score *= _VERIFIED_LOCAL_BOOST
         posts.append(
             {
                 "post_id": post_id,
-                "similarity_score": 1 / (1 + distance),  # 距离转相似度，公式后面按需调整
+                "similarity_score": similarity_score,
                 "images": images,
+                "tags": tags,
                 **metadata,
             }
         )
-    return posts
+    posts.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return posts[:top_k]
 
 
 def delete_post(post_id: str) -> None:

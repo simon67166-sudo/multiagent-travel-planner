@@ -47,8 +47,29 @@ _STABLE_TAG_FIELDS = ("taste",)
 _STABLE_FIELDS = _STABLE_SCORE_FIELDS + _STABLE_TAG_FIELDS
 
 _SOCIAL_MODES = ("solo", "couple", "family", "friends")
-_TASTE_VOCAB = ("川菜", "粤菜", "江浙菜", "西北菜", "日料", "西餐", "清真", "海鲜")
+_TASTE_VOCAB = ("川菜", "粤菜", "江浙菜", "西北菜", "日料", "西餐", "清真", "海鲜", "葡国菜")
 _INTEREST_VOCAB = ("自然风光", "人文历史", "都市购物", "美食探店", "摄影打卡", "户外运动")
+
+# 港澳达人帖子导入用：标签关键词 -> 词表映射（子串匹配），覆盖 orchestrator/data_sources/
+# hk_macau_posts.json 里常见的标签用词。词表本身保持小而通用，不为了"覆盖所有标签"
+# 无限扩张——匹配不上的标签就是没有对应的人格维度信号，直接丢弃，不强行凑一个。
+_TAG_TO_TASTE = {
+    "葡国": "葡国菜", "葡式": "葡国菜", "马介休": "葡国菜",
+    "粤菜": "粤菜", "茶餐厅": "粤菜", "港式": "粤菜", "腸粉": "粤菜", "煲仔": "粤菜",
+    "日式": "日料", "刺身": "日料", "寿司": "日料",
+    "海鲜": "海鲜", "海味": "海鲜",
+    "西餐": "西餐", "西式": "西餐",
+}
+_TAG_TO_INTEREST = {
+    "历史": "人文历史", "古迹": "人文历史", "老字号": "人文历史", "文化遗产": "人文历史", "宗教": "人文历史",
+    "打卡": "摄影打卡", "拍照": "摄影打卡", "夜景": "摄影打卡", "网红": "摄影打卡",
+    "购物": "都市购物", "手信": "都市购物", "商场": "都市购物", "街": "都市购物",
+    "公园": "自然风光", "自然": "自然风光", "海滨": "自然风光", "山": "自然风光",
+    "徒步": "户外运动", "骑行": "户外运动", "运动": "户外运动",
+    "美食": "美食探店", "小吃": "美食探店", "夜宵": "美食探店",
+}
+_NOVELTY_HIGH_KEYWORDS = ("小众", "冷门", "隐世", "隐藏", "秘境")
+_NOVELTY_LOW_KEYWORDS = ("网红", "热门", "必打卡", "经典")
 
 
 def _clamp01(value: float) -> float:
@@ -172,6 +193,50 @@ def compute_persona_vector(persona: dict, scenario: str) -> list[float]:
     return vector
 
 
+def _budget_score_from_avg_cost(avg_cost: float | None) -> float:
+    """人均消费换算成 budget_score，粗略线性映射，不是精确定价模型：0 元 -> 0，250 元及以上封顶 1.0。"""
+    if avg_cost is None:
+        return 0.5
+    return max(0.0, min(1.0, float(avg_cost) / 250))
+
+
+def infer_post_persona_vector(
+    scenario: str, tags: list[str] | None = None, avg_cost: float | None = None, category: str | None = None
+) -> list[float]:
+    """
+    港澳达人帖子导入用：这些帖子是组员手动整理的真实内容，不是问卷填出来的，没有
+    "发帖人自己的人格问卷答案"可用——用标签/人均/分类这些帖子自带的信号，反推一个
+    大致合理的人格向量，撑住两阶段检索第一阶段的相似度匹配。是启发式估计，不是精确
+    画像，词表/关键词覆盖不到的标签直接丢弃，不强行凑维度。
+
+    social_mode 故意不猜（单条帖子看不出"适合独行/家庭/朋友"），留空即可——
+    compute_persona_vector() 对应的 one-hot 段会是全 0，这是合法的"未指定"编码。
+    """
+    tags = tags or []
+    tags_text = "、".join(tags)
+
+    taste = {vocab for keyword, vocab in _TAG_TO_TASTE.items() if keyword in tags_text}
+    interest = {vocab for keyword, vocab in _TAG_TO_INTEREST.items() if keyword in tags_text}
+    if category == "饮食":
+        interest.add("美食探店")
+    elif category == "景点":
+        interest.add("人文历史")
+
+    if any(k in tags_text for k in _NOVELTY_HIGH_KEYWORDS):
+        novelty = 0.75
+    elif any(k in tags_text for k in _NOVELTY_LOW_KEYWORDS):
+        novelty = 0.3
+    else:
+        novelty = 0.5
+
+    pseudo = new_persona("inferred-from-post")
+    update_stable_traits(pseudo, taste=sorted(taste), novelty_score=novelty)
+    set_scenario_traits(
+        pseudo, scenario, pace_score=0.5, budget_score=_budget_score_from_avg_cost(avg_cost), interest_theme=sorted(interest)
+    )
+    return compute_persona_vector(pseudo, scenario)
+
+
 if __name__ == "__main__":
     import json
 
@@ -249,3 +314,9 @@ if __name__ == "__main__":
     print("--- 反馈闭环：alice 说这次是朋友一起去的，不是家庭 ---")
     apply_feedback(alice, "vacation", "social_mode", "friends", reason="这次是朋友一起去的，不是家庭")
     print(json.dumps(alice, ensure_ascii=False, indent=2))
+
+    print("--- infer_post_persona_vector：港澳帖子反推人格向量 ---")
+    post_vec = infer_post_persona_vector(
+        "vacation", tags=["正宗葡国菜", "30年老店", "本地人认证"], avg_cost=169, category="饮食"
+    )
+    print("维度:", len(post_vec), "跟 alice/bob 向量维度一致:", len(post_vec) == len(alice_vec))

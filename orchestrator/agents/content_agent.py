@@ -37,6 +37,14 @@ def run(shared_state: dict, location_hint: str, top_k: int = 3) -> dict:
                 "verified_trip": p.get("verified_trip"),
                 "caption": p.get("caption"),
                 "images": p.get("images", []),
+                # 港澳达人数据库字段（见 import_hk_macau_data.py），杭州那批老数据没有这些字段，
+                # 会是 None/空列表，前端/widgets.py 按需读取，不强制要求
+                "city": p.get("city"),
+                "category": p.get("category"),
+                "post_type": p.get("post_type"),
+                "address": p.get("address"),
+                "tags": p.get("tags", []),
+                "verified_local": p.get("verified_local", False),
             }
             for p in posts
         ]
