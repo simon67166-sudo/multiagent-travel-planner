@@ -20,6 +20,18 @@ import trip_plan
 import widgets
 from agents import content_agent, exception_agent, ota_hotel_agent, route_agent
 
+# 跟 content_agent._extract_city 同一个"先跑起来，以后再换实体识别"的子串匹配思路，
+# 独立一份而不是互相 import 是因为这两个模块本来就没有依赖关系，不想为了共用 4 行代码
+# 建立跨模块耦合
+_KNOWN_CITIES = ("澳门", "香港")
+
+
+def _extract_city(text: str) -> str | None:
+    for city in _KNOWN_CITIES:
+        if city in text:
+            return city
+    return None
+
 
 # ---------------------------------------------------------------------------
 # 共享状态：编排 Agent 维护，子 Agent 按需读写
@@ -91,6 +103,11 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
     if "exception" in intents:
         # 占位：拿整句话去匹配行程里的地点名字，真实版本应该先做实体识别抽出具体地点
         results["exception"] = exception_agent.run(shared_state, event_type="unknown", event_detail=user_message)
+        # 额外真查一次和风天气灾害预警：不依赖用户有没有主动提到具体天气情况，
+        # 只要这轮消息里能提取出城市，就查真实预警数据；查不出城市就跳过，不强求
+        city = _extract_city(user_message)
+        if city:
+            results["exception"]["weather_check"] = exception_agent.check_weather(shared_state, city)
 
     # 不需要再手动"写回共享状态"——route_agent/exception_agent 已经直接改了 shared_state["trip_plan"]
 

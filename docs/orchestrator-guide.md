@@ -16,6 +16,8 @@ PARATERA_API_KEY=你的key
 AMAP_KEY=你的高德Web服务API Key
 AMAP_JS_KEY=你的高德Web端(JS API)Key
 AMAP_JS_SECURITY_CODE=你的安全密钥
+QWEATHER_KEY=你的和风天气API KEY
+QWEATHER_API_HOST=你的和风天气专属API Host
 ```
 高德的 key **分三样东西，缺一个都不行**：
 - `AMAP_KEY`：**Web服务** 类型，后端用（`map_tool.py` 查地理编码/路线）
@@ -23,6 +25,12 @@ AMAP_JS_SECURITY_CODE=你的安全密钥
 - `AMAP_JS_SECURITY_CODE`：安全密钥，高德 JS API 2.0 版本强制要求，在申请 `AMAP_JS_KEY` 的同一个应用页面能找到
 
 都在 https://lbs.amap.com 控制台"创建应用"里申请（一个应用可以同时创建 Web服务 + Web端(JS API) 两个 key，安全密钥在创建 Web端(JS API) key 的时候会一起给）。个人开发者未认证 6000次/天，实名认证后 30万次/月，demo 阶段够用。
+
+和风天气（`weather_tool.py` 用，灾害预警）去 https://dev.qweather.com 控制台"项目管理"申请：
+- `QWEATHER_KEY`：创建凭据时选 **API KEY** 类型，不要选 JWT（JWT 要自己写签名逻辑，demo 规模没必要）
+- `QWEATHER_API_HOST`：同一个项目页面上能看到，形如 `xxxxxxxxxx.re.qweatherapi.com`，**不用**带 `https://` 前缀——2023 年后注册的新账号是"一账号一专属域名"，公共的 `devapi.qweather.com` 对新 key 直接返回 404，必须用这个专属域名
+
+个人开发者免费版 1000次/天，灾害预警接口在免费的 8 个基础接口里（辐射/海洋/热带气旋等付费专项接口不在内，用不上）。
 
 每个文件都能直接 `python orchestrator/<路径>.py` 单独跑（包括 `agents/` 里的 5 个文件），文件末尾的 `if __name__ == "__main__":` 都是自测代码，可以照着抄用法。
 
@@ -34,6 +42,7 @@ AMAP_JS_SECURITY_CODE=你的安全密钥
 orchestrator/
   llm_tool.py                     # 通用 LLM 调用工具，跟"编排"本身无关，谁都能 import
   map_tool.py                     # 通用地图工具（高德地图 API）：地理编码 + 路径规划
+  weather_tool.py                  # 通用天气工具（和风天气 API）：灾害预警查询，给异常应变 Agent 用
   agents/
     orchestrator_agent.py         # 编排 Agent：new_shared_state + classify_intent + orchestrate
     content_agent.py              # 达人/内容 Agent
@@ -76,6 +85,19 @@ orchestrator/
 - 到达/结束的具体钟点时间（`arrival_time`/`end_time`）还是占位——那需要"一天几点开始"+"每站玩多久"这类还没定义的调度逻辑，跟地图 API 是两回事
 - 地图可视化（真的在网页上画一张地图+路线）还没做，`web/index.html` 目前只是文字列表展示行程，`polyline` 字段目前没被前端用上
 
+## weather_tool.py -- 通用天气工具（和风天气）
+
+**职责**：灾害预警查询，给异常应变 Agent 判断"这个城市现在是不是真的有极端天气"用，跟 `map_tool.py` 一样是通用基础设施。
+
+| 函数 | 作用 |
+|---|---|
+| `get_active_warnings(location, city=None)` | 查某个地名当前生效的灾害预警，返回列表，每条 `{"headline", "event_type", "severity", "description", "effective_time", "expire_time"}`；没有预警返回空列表（正常情况，不是错误） |
+
+- `severity` 取值：`unknown`/`minor`/`moderate`/`severe`/`extreme`，越靠后越严重——`exception_agent.check_weather()` 用这个字段决定要不要自动清空行程
+- 接口本身按经纬度查（`/weatheralert/v1/current/{lat}/{lon}`），不需要先转和风天气自己的 LocationID，所以直接复用 `map_tool.geocode()` 拿坐标，少一次网络调用
+- **和风天气新账号是"一账号一专属域名"**：2023 年后注册的 key 用公共的 `devapi.qweather.com`/`geoapi.qweather.com` 会直接 404，必须去控制台"项目管理"页面找到这个 key 专属的 API Host（形如 `xxxxxxxxxx.re.qweatherapi.com`），配进 `.env` 的 `QWEATHER_API_HOST`（见"环境准备"一节）——这是接入过程里踩的第一个坑，实测过公共域名连 key 是否有效都判断不出来，报错也不明显（直接 404 空 body，不是 JSON 格式的错误信息）
+- 2026-09-11 用真实预警数据验证过：查询当时有台风影响的海南（海口）能查到 2 条真实的雷电/大风黄色预警，字段解析正常；查没有预警的城市（香港）返回空列表，也验证过降级路径
+
 ## agents/orchestrator_agent.py -- 编排 Agent
 
 **职责**：星型架构的中枢。接收用户消息 → 意图识别 → 决定调用哪几个子 Agent → 汇总结果 → 生成回复。对应 [agent-interfaces.md 第三节](./agent-interfaces.md) 的节点拓扑，只是从 Dify 可视化节点换成了 Python 函数。模型档位用 `MODEL_FULL`（全系统推理最重）。
@@ -110,9 +132,19 @@ orchestrator/
 
 ## agents/exception_agent.py -- 异常应变 Agent
 
-**职责**：按地点名字匹配 `trip_plan` 里的行程节点，命中就删掉并记一条天气异常。模型档位架构文档里写的是"中等模型"，目前只有 `MODEL_FULL`/`MODEL_LIGHT` 两档，先待定。
+**职责**：两条独立路径，都会直接改 `shared_state["trip_plan"]`。模型档位架构文档里写的是"中等模型"，目前只有 `MODEL_FULL`/`MODEL_LIGHT` 两档，先待定。
 
-`run(shared_state, event_type, event_detail=None)`：`event_detail` 目前是纯子串匹配（整句用户消息去匹配地点名字），很粗糙，真实版本应该先做实体识别。
+| 函数 | 作用 |
+|---|---|
+| `run(shared_state, event_type, event_detail=None)` | 按地点名字匹配 `trip_plan` 里的行程节点，命中就删掉并记一条天气异常。`event_detail` 目前是纯子串匹配（整句用户消息去匹配地点名字），很粗糙，真实版本应该先做实体识别 |
+| `check_weather(shared_state, city)` | **真查** `weather_tool.py`（和风天气灾害预警），不依赖用户有没有主动提到天气——只要能确定城市就查真实数据 |
+
+`check_weather()` 的行为：
+- 有真实预警，会给每条预警都调一次 `trip_plan.add_weather_alert()`，字段是真实的（`event_type`/`severity`/`description` 直接来自和风天气，不再是 `run()` 里那种 `"未知"`/`"触发异常应变：xxx"` 占位文字）
+- 预警等级（`severity`）达到 `severe`/`extreme` 才自动清空当天所有行程节点——城市级预警没法像 `run()` 那样按地点名字定位到"具体是哪个景点受影响"，只能整体处理，所以严重程度门槛拉高（常量 `_AUTO_REMOVE_SEVERITY`），避免一条轻微预警就把整个行程清空；`moderate`/`minor` 只记录不动行程，留给用户自己决定
+- 没有预警返回 `has_warning: False`，是正常情况；`weather_tool` 查询本身失败（key 没配/地名查不到/网络问题）不会抛异常炸穿调用方，优雅降级返回带 `error` 字段的结果——跟 `route_agent.py` 处理 `map_tool` 查询失败是同一个思路
+- `orchestrator_agent.py` 里 `exception` 意图命中时会额外跑一次：从用户消息里提取城市（跟 `content_agent._extract_city` 同一套子串匹配思路，`_KNOWN_CITIES = ("澳门", "香港")`，独立一份没有互相 import，两个模块本来就不该耦合），提取到了才调用 `check_weather()`，结果挂在 `results["exception"]["weather_check"]` 里
+- 因为 `check_weather()` 是直接改 `shared_state["trip_plan"]`，`GET /trip` 会自动带出真实 `weather_alerts`（`trip_plan.render()` 本来就有这个字段），不需要改 `schedule_widgets.py` 或前端
 
 ## widgets.py -- 展示插件（右侧聊天框富交互组件）
 
