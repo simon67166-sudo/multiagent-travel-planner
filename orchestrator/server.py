@@ -186,6 +186,11 @@ def apply_selection(widget, selected, state):
                     "check_out": item.get("check_out"),
                     "price": item.get("price"),
                     "cancel_policy": item.get("cancel_policy"),
+                    # 真实坐标（ota_hotel_agent._search_real_hotels() 本来就带了）——存进
+                    # trip_plan 才有数据给 ota_hotel_agent._existing_hotel_distance_check() 用，
+                    # 判断这家已订酒店离行程终点远不远
+                    "lng": item.get("lng"),
+                    "lat": item.get("lat"),
                 },
             )
     else:

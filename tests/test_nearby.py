@@ -241,19 +241,79 @@ class NearbyTests(unittest.TestCase):
             content_agent._verify_and_fix_categories(recs)
         self.assertEqual(recs[0]["category"], "景点")
 
-    def test_anchor_place_from_trip_uses_earliest_day_first_geocoded_stop(self):
-        # 2026-09-15：酒店搜索要按已排行程的位置收窄，不能无差别搜整个城市——真实验证过
-        # 用地点当锚点（place_type="景点"）确实会把氹仔酒店排除出候选，只在文字里劝退
-        # 用户"别住氹仔"是不够的，因为真正能选的候选卡片没跟着收窄
+    def test_days_last_stops_takes_final_geocoded_node_per_day(self):
+        # 2026-09-15：晚上回酒店睡觉，"最后一站"比"第一站"更直接影响住宿体验，酒店锚点/
+        # 距离复核都基于每天最后一站，不是第一站
         import trip_plan
         from agents import ota_hotel_agent
-        trip = trip_plan.new_trip_plan("test-anchor-place")
-        day2 = trip_plan.get_or_create_day(trip, "2026-09-16")
-        trip_plan.add_stop(day2, "n1", "attraction", "黑沙环", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.55, lat=22.20)
+        trip = trip_plan.new_trip_plan("test-last-stops")
         day1 = trip_plan.get_or_create_day(trip, "2026-09-15")
         trip_plan.add_stop(day1, "n1", "attraction", "大三巴", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.54, lat=22.19)
+        trip_plan.add_stop(day1, "n2", "meal", "晚餐店", arrival_transport="步行", arrival_time="18:00", end_time="19:00", after_id="n1", lng=113.545, lat=22.195)
+        last_stops = ota_hotel_agent._days_last_stops(trip)
+        self.assertEqual(len(last_stops), 1)
+        self.assertEqual(last_stops[0]["place"], "晚餐店")
+
+    def test_anchor_place_from_trip_uses_multi_day_centroid(self):
+        # 2026-09-15：多天行程的锚点改成"所有天数最后一站坐标的重心"，不是只看某一天——
+        # 不然锚点只照顾了 Day1，Day3 跑去别的区域完全没考虑到
+        import trip_plan
+        from agents import ota_hotel_agent
+        trip = trip_plan.new_trip_plan("test-anchor-centroid")
+        day1 = trip_plan.get_or_create_day(trip, "2026-09-15")
+        trip_plan.add_stop(day1, "n1", "attraction", "大三巴", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.54, lat=22.19)
+        day2 = trip_plan.get_or_create_day(trip, "2026-09-16")
+        trip_plan.add_stop(day2, "n1", "attraction", "黑沙环", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.55, lat=22.20)
         anchor = ota_hotel_agent._anchor_place_from_trip(trip)
-        self.assertEqual(anchor, {"place": "大三巴", "lng": 113.54, "lat": 22.19})
+        self.assertAlmostEqual(anchor["lng"], (113.54 + 113.55) / 2)
+        self.assertAlmostEqual(anchor["lat"], (22.19 + 22.20) / 2)
+        self.assertIn(anchor["place"], ("大三巴", "黑沙环"))  # 离重心最近的那一站
+
+    def test_existing_hotel_distance_check_flags_far_days(self):
+        import trip_plan
+        from agents import ota_hotel_agent
+        trip = trip_plan.new_trip_plan("test-hotel-distance")
+        trip_plan.add_hotel(trip, {"name": "近城酒店", "lng": 113.54, "lat": 22.19})
+        day1 = trip_plan.get_or_create_day(trip, "2026-09-15")
+        trip_plan.add_stop(day1, "n1", "attraction", "近处景点", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.541, lat=22.191)
+        day2 = trip_plan.get_or_create_day(trip, "2026-09-16")
+        trip_plan.add_stop(day2, "n1", "attraction", "远处景点", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.7, lat=22.35)  # 明显远
+        reminder = ota_hotel_agent._existing_hotel_distance_check(trip)
+        self.assertIsNotNone(reminder)
+        self.assertIn("2026-09-16", reminder)
+        self.assertIn("远处景点", reminder)
+        self.assertNotIn("2026-09-15", reminder)
+
+    def test_existing_hotel_distance_check_returns_none_when_all_close(self):
+        import trip_plan
+        from agents import ota_hotel_agent
+        trip = trip_plan.new_trip_plan("test-hotel-distance-close")
+        trip_plan.add_hotel(trip, {"name": "近城酒店", "lng": 113.54, "lat": 22.19})
+        day1 = trip_plan.get_or_create_day(trip, "2026-09-15")
+        trip_plan.add_stop(day1, "n1", "attraction", "近处景点", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.541, lat=22.191)
+        self.assertIsNone(ota_hotel_agent._existing_hotel_distance_check(trip))
+
+    def test_existing_hotel_distance_check_skips_hotel_without_coordinates(self):
+        import trip_plan
+        from agents import ota_hotel_agent
+        trip = trip_plan.new_trip_plan("test-hotel-distance-no-coords")
+        trip_plan.add_hotel(trip, {"name": "老数据酒店"})  # 坐标透传修好之前订的老数据，没有 lng/lat
+        day1 = trip_plan.get_or_create_day(trip, "2026-09-15")
+        trip_plan.add_stop(day1, "n1", "attraction", "某景点", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.7, lat=22.35)
+        self.assertIsNone(ota_hotel_agent._existing_hotel_distance_check(trip))
+
+    def test_run_skips_hotel_search_when_already_booked(self):
+        # 已经订好酒店是用户确认过的真实决定，不该每次 booking 意图命中都重新搜一遍候选
+        # 去"暗示"换酒店
+        import trip_plan
+        from agents import ota_hotel_agent
+        trip = trip_plan.new_trip_plan("test-run-skip-search")
+        trip_plan.add_hotel(trip, {"name": "已订酒店", "lng": 113.54, "lat": 22.19})
+        state = {"trip_plan": trip, "city": "澳门"}
+        with patch.object(ota_hotel_agent, "_search_real_hotels") as search_mock:
+            result = ota_hotel_agent.run(state, location=None, date_range="2026-09-15~2026-09-17")
+        search_mock.assert_not_called()
+        self.assertFalse(any(c.get("provider_type") == "hotel" for c in result["candidates"]))
 
     def test_anchor_place_from_trip_returns_none_when_no_stops(self):
         import trip_plan

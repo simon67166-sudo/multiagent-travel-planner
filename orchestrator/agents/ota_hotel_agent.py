@@ -122,11 +122,27 @@ def _haversine_km(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
     return 6371 * 2 * math.asin(min(1, math.sqrt(math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2)))
 
 
+def _days_last_stops(trip_plan_obj: dict) -> list[dict]:
+    """取每天最后一个带坐标的节点——晚上回酒店睡觉，第二天早上从酒店出发，"最后一站离酒店
+    远不远"比"第一站"更直接影响住宿体验，酒店锚点/距离复核都基于这个。返回
+    [{"date":,"place":,"lng":,"lat":}, ...]，某天全部节点都没坐标（理论上不该发生）就跳过
+    那一天，不报错。"""
+    stops = []
+    for day_date in sorted(trip_plan_obj.get("days", {})):
+        for stop in reversed(trip_plan_module.day_stops(trip_plan_obj["days"][day_date])):
+            if stop.get("place") and stop.get("lng") is not None and stop.get("lat") is not None:
+                stops.append({"date": day_date, "place": stop["place"], "lng": stop["lng"], "lat": stop["lat"]})
+                break
+    return stops
+
+
 def _anchor_place_from_trip(trip_plan_obj: dict) -> dict | None:
-    """从已经排好的行程里挑一个"重心地点"给酒店搜索当锚点——取最早一天的第一个带坐标的站，
-    这样真正搜出来的候选会贴着已经确定的行程位置，不是漫无目的地搜整个城市。返回
-    {"place":, "lng":, "lat":}（坐标是这个节点排班时就查好、存进 trip_plan 的真实坐标，见
-    route_agent._place_day()/_fill_day_skeleton()，给下面的合理性校验用）。
+    """从已经排好的行程里算一个"重心地点"给酒店搜索当锚点——取所有天数最后一站坐标的
+    平均值（2026-09-15 起，不再只看某一天），这样搜出来的候选贴着整趟行程的重心，不是
+    只照顾其中一天、也不是漫无目的地搜整个城市。RollingGo 的 place 参数要一个真实地名做
+    文字检索（不接受裸坐标），用离重心最近的那一站的地点名字当查询文字，但返回的坐标本身
+    是重心点——后面 _search_real_hotels() 的合理性校验会更准确地反映"整趟行程"，不是
+    "某一天"。
 
     背景：真实 demo 演示时发现，编排 Agent 组句的自由文本会"聪明地"根据行程位置建议住哪个
     区域（比如"你的行程都在新马路一带，别住氹仔"），但那只是模型看着 JSON context 自由发挥，
@@ -138,11 +154,39 @@ def _anchor_place_from_trip(trip_plan_obj: dict) -> dict | None:
     没有排任何行程（比如用户还没问过内容推荐、直接先问订酒店）就返回 None，调用方退回
     城市级搜索，不强求。
     """
-    for day_date in sorted(trip_plan_obj.get("days", {})):
-        for stop in trip_plan_module.day_stops(trip_plan_obj["days"][day_date]):
-            if stop.get("place") and stop.get("lng") is not None and stop.get("lat") is not None:
-                return {"place": stop["place"], "lng": stop["lng"], "lat": stop["lat"]}
-    return None
+    last_stops = _days_last_stops(trip_plan_obj)
+    if not last_stops:
+        return None
+    avg_lng = sum(s["lng"] for s in last_stops) / len(last_stops)
+    avg_lat = sum(s["lat"] for s in last_stops) / len(last_stops)
+    nearest = min(last_stops, key=lambda s: _haversine_km(avg_lng, avg_lat, s["lng"], s["lat"]))
+    return {"place": nearest["place"], "lng": avg_lng, "lat": avg_lat}
+
+
+_HOTEL_CONVENIENCE_KM = 5  # 晚上回酒店，跟当天最后一站的距离在这个范围内算"不算特别远，不用换"
+
+
+def _existing_hotel_distance_check(trip_plan_obj: dict) -> str | None:
+    """已经订好酒店（trip_plan.hotels 非空）时，检查现有酒店离每天最后一站够不够近。都在
+    _HOTEL_CONVENIENCE_KM 内就返回 None（不用提醒）；某天超出了，返回一句提醒文字——不自动
+    重新搜索/推荐换酒店，酒店是用户已经确认预订的真实决定，系统不该擅自建议换，只在回复里
+    如实提醒，让用户自己决定要不要再查。酒店没有坐标（比如手填地址查不到，或者是坐标透传
+    修好之前订的老数据）就跳过检查，不报错。"""
+    hotels = trip_plan_obj.get("hotels", [])
+    if not hotels:
+        return None
+    hotel = hotels[0]
+    hotel_lng, hotel_lat = hotel.get("lng"), hotel.get("lat")
+    if hotel_lng is None or hotel_lat is None:
+        return None
+    far_days = [
+        s for s in _days_last_stops(trip_plan_obj)
+        if _haversine_km(hotel_lng, hotel_lat, s["lng"], s["lat"]) > _HOTEL_CONVENIENCE_KM
+    ]
+    if not far_days:
+        return None
+    names = "、".join(f"{s['date']}（{s['place']}）" for s in far_days)
+    return f"已预订的酒店「{hotel.get('name')}」离 {names} 这天的行程终点比较远，往返需要多预留交通时间。"
 
 
 def _search_real_hotels(city: str, check_in: str | None, check_out: str | None, nights: int, category: str | None, user_message: str | None, anchor: dict | None = None) -> tuple[list[dict], str | None]:
@@ -204,6 +248,11 @@ def _search_real_hotels(city: str, check_in: str | None, check_out: str | None, 
             "image_url": h.get("image_url"),
             "booking_url": h.get("booking_url"),
             "amenities": h.get("amenities", []),
+            # 真实坐标（hotel_tool.search_hotels() 本来就有），存进候选顺手带出去——
+            # server.py 的 apply_selection() 确认预订时会存进 trip_plan.hotels，
+            # 后面"已订酒店离行程远不远"的距离复核（_existing_hotel_distance_check()）要用
+            "lng": h.get("lng"),
+            "lat": h.get("lat"),
         }
         for h in hotels
     ]
@@ -224,14 +273,24 @@ def run(
     orchestrator_agent.py 里 booking 意图命中时会把这轮用户消息传进来。
 
     2026-09-15 起会先从 shared_state["trip_plan"] 里取一个已排行程的锚点地点
-    （_anchor_place_from_trip()），酒店搜索按这个地点收窄（见 _search_real_hotels()），
-    不再是不管行程位置、无差别搜整个城市。
+    （_anchor_place_from_trip()，所有天数最后一站坐标的重心），酒店搜索按这个地点收窄
+    （见 _search_real_hotels()），不再是不管行程位置、无差别搜整个城市。
+
+    已经订好酒店（trip_plan.hotels 非空）就不再搜新的酒店候选——用户已经做过真实预订
+    决定，不该每次 booking 意图命中都重新搜一遍候选去"暗示"换酒店；改成调
+    _existing_hotel_distance_check() 检查现有酒店离行程够不够近，有问题只在结果里带一句
+    提醒（result["hotel_distance_reminder"]），不自动推荐替代方案。
     """
     city = location or shared_state.get("city") or "澳门"
     check_in, check_out, nights = _parse_date_range(date_range)
+    trip_plan_obj = shared_state.get("trip_plan", {})
 
-    anchor = _anchor_place_from_trip(shared_state.get("trip_plan", {}))
-    hotel_candidates, hotel_error = _search_real_hotels(city, check_in, check_out, nights, category, user_message, anchor)
+    hotel_distance_reminder = _existing_hotel_distance_check(trip_plan_obj)
+    if trip_plan_obj.get("hotels"):
+        hotel_candidates, hotel_error = [], None
+    else:
+        anchor = _anchor_place_from_trip(trip_plan_obj)
+        hotel_candidates, hotel_error = _search_real_hotels(city, check_in, check_out, nights, category, user_message, anchor)
 
     # 去程用入住日期，回程用离店日期——往返机票配对，不是只有单程
     depart_date = check_in or (date.today() + timedelta(days=1)).isoformat()
@@ -258,6 +317,8 @@ def run(
     result = {"candidates": flight_candidates + hotel_candidates}
     if hotel_error:
         result["hotel_query_error"] = hotel_error
+    if hotel_distance_reminder:
+        result["hotel_distance_reminder"] = hotel_distance_reminder
     return result
 
 

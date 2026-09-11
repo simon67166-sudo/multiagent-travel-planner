@@ -223,6 +223,8 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
                 reply += "\n" + weather_check["suggested_adjustment"]
         if "booking" in results:
             reply += "\n已附上查询候选卡片；尚未进行实际预订。"
+            if results["booking"].get("hotel_distance_reminder"):
+                reply += "\n" + results["booking"]["hotel_distance_reminder"]
     elif "cancel" in results:
         # cancel 是真执行动作，回复用固定模板拼，不交给 LLM 生成——确认文案跟实际有没有真删掉
         # 必须完全对得上，不能有半点"是不是真删了"的不确定性
@@ -234,6 +236,8 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
             reply = "没有在你的行程里找到匹配的地点，可能已经不在行程里了，能再确认一下具体是哪一站吗？"
         if "booking" in results:
             reply += "\n已附上查询候选卡片；尚未进行实际预订。"
+            if results["booking"].get("hotel_distance_reminder"):
+                reply += "\n" + results["booking"]["hotel_distance_reminder"]
     else:
         # trip_plan 传渲染后的结构（trip_plan.render()：{"days":[{"date":,"stops":[有序数组]}],...}），
         # 不传原始的链表结构（{"head_id":,"nodes":{id:{...,"next_id":}}}）——真实 demo 演示时发现，原始
