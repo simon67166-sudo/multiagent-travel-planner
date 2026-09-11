@@ -64,11 +64,16 @@ def build_post_list_widget(candidates: list[dict], top_k: int = 3, use_llm_reran
 
 
 def build_attraction_picker_widget(
-    candidates: list[dict], max_select: int = 3, pool_size: int = 6, use_llm_rerank: bool = True
+    candidates: list[dict], max_select: int = 6, pool_size: int = 10, use_llm_rerank: bool = True
 ) -> dict:
     """
     景点选择插件：从候选里选出 pool_size 个放进"可选池"，前端展示给用户勾选最多 max_select 个。
     选择结果由前端回传给 server.py 的 POST /widget-response 接口，不在这个函数里处理。
+
+    max_select=6 是跟 route_agent._SLOT_TEMPLATE 一天最多 6 个节点（5 个槽位+1 个加塞）对齐的——
+    2026-09-15 起用户在这里选完确认才第一次触发排班（见 server.py 的 apply_selection()），选够
+    6 个正好能填满一天的骨架。pool_size=10 故意比 max_select 大，给用户留出真正能挑/筛选的空间，
+    不是"池子刚好等于上限，选不选都一样"。
 
     用 "place" 当 _llm_select 的校验 key，不是 "post_id"——2026-09-14 起 content_agent.run()
     的候选有两种来源（社区帖子带 post_id，高德 POI 不带），"place" 是两种来源都有的字段，

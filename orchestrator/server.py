@@ -154,12 +154,14 @@ def widget_response():
 
 def apply_selection(widget, selected, state):
     if widget == "attraction_picker":
-        # 传完整候选字典（不只是 place 字符串）——content_agent.run() 早就给每个候选挂好
-        # lng/lat 了，route_agent.run() 现在会优先用这些坐标直查路线，不重新地理编码
-        # （地理编码对港澳场景不可靠，见 route_agent.py 里 _real_leg() 的说明）
-        places = [item for item in selected if item.get("place")]
-        if places:
-            route_agent.run(state, places=places, city=state.get("city", _DEMO_CITY))
+        # 2026-09-15 起，排时间的触发点从"意图分类猜中了 route"改成"用户在这里选完确认"
+        # ——这是确定性动作，不会因为同一句话不同轮调用而结果不一样。走真正的骨架排班
+        # （route_agent.schedule()），不是老接口 route_agent.run() 那种单一占位日期顺序追加；
+        # picks 已经是完整候选字典（带 lng/lat/category），content_agent.run() 早就查好了，
+        # schedule() 直接能用
+        picks = [item for item in selected if item.get("place")]
+        if picks:
+            route_agent.schedule(state, picks, city=state.get("city", _DEMO_CITY), mode="trip", time_budget_days=1)
     elif widget == "flight_picker":
         for item in selected:
             trip_plan.add_flight(

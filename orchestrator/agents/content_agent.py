@@ -128,6 +128,69 @@ def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) ->
     return results
 
 
+_CATEGORY_FIX_PROMPT = """你是达人 Agent 的分类质检员。下面是一批候选地点（JSON 数组，每项：
+index/place/category/caption/address），标注的 category 有可能标错——比如一家餐厅被标成
+"景点"，或者一个景点被标成"饮食"。请逐条判断这个地点应该是"饮食"（餐厅/小吃/咖啡店这类）
+还是"景点"（观光/游览/打卡地这类），如果实在看不出来（比如信息太少），保留原分类不变。
+只输出需要改正的条目，格式 [{"index":,"category":"饮食"或"景点"}]，不需要改的不要输出；
+如果全部不需要改，输出空数组 []。只输出 JSON，不要输出其他任何文字。"""
+
+
+def _verify_and_fix_categories(recommendations: list[dict]) -> None:
+    """候选提交给编排 Agent 之前的分类质检：一批候选一次性打包成一次 MODEL_LIGHT 调用
+    （不是逐条调用——候选池经常几十条，逐条调模型会让这个 demo 本来就不快的延迟更差，
+    跟 route_agent._llm_review_day() 一天调一次是同一个"批量、不逐项"的思路）。
+
+    社区帖子的 category 是人工录入的，可能真的标错；高德 POI 的 category 是原始 type
+    字符串，本身就不是干净的"饮食/景点"二元标签——标错一条，route_agent._candidate_role()
+    就可能把餐厅塞进景点槽位（或者相反），骨架排班"每天至少一个景点+两顿饭"这个结构性
+    保证就被数据质量问题绕过去了。
+
+    原地修改 recommendations 里每个 dict 的 category 字段，不返回新列表。带 post_id 的
+    （社区帖子来源）改对了顺手写回数据库（store.update_post_category()）——高德 POI 没有
+    持久化来源，只改这次返回结果里的内存字段。LLM 调用/解析失败就什么都不改，不影响主
+    流程——这是质检，不是必需步骤。"""
+    if not recommendations:
+        return
+    payload = [
+        {"index": i, "place": r.get("place"), "category": r.get("category"), "caption": r.get("caption"), "address": r.get("address")}
+        for i, r in enumerate(recommendations)
+    ]
+    try:
+        raw = llm_tool.call_llm(
+            [
+                {"role": "system", "content": _CATEGORY_FIX_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            model=llm_tool.MODEL_LIGHT,
+        )
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = "\n".join(clean.splitlines()[1:-1])
+        fixes = json.loads(clean)
+        if not isinstance(fixes, list):
+            return
+    except Exception:
+        return
+
+    for fix in fixes:
+        if not isinstance(fix, dict):
+            continue
+        idx, new_category = fix.get("index"), fix.get("category")
+        if not isinstance(idx, int) or idx not in range(len(recommendations)) or new_category not in ("饮食", "景点"):
+            continue
+        candidate = recommendations[idx]
+        if candidate.get("category") == new_category:
+            continue
+        candidate["category"] = new_category
+        post_id = candidate.get("post_id")
+        if post_id:
+            try:
+                store.update_post_category(post_id, new_category)
+            except Exception:
+                pass  # 数据库写回失败不影响这次返回结果里已经改对的内存字段
+
+
 _NEARBY_PARSE_PROMPT = """将港澳周边游需求转成 JSON，字段：city(澳门/香港，缺省沿用上下文城市)、
 origin(起点地标/地址文字)、hours(1到10的数字，缺省3)。只更新用户明确提到的字段。
 缺少起点地标，回传 {"question":"需要追问的问题"}。只输出 JSON，不要输出其他文字。"""
@@ -186,6 +249,7 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int =
                 "clarification_needed": f"没查到「{parsed.get('origin')}」这个地方，能换个更具体的地标或地址吗？",
             }
         nearby_candidates = _nearby_plan(origin, city, persona_vector)
+        _verify_and_fix_categories(nearby_candidates)
         return {
             "recommendations": nearby_candidates,
             "nearby_params": {"origin": {"lng": origin["lng"], "lat": origin["lat"], "name": origin["name"]}, "hours": hours},
@@ -251,7 +315,9 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int =
             seen_places.add(candidate["place"])
             nearby_extra.append(candidate)
 
-    return {"recommendations": seed_recommendations + nearby_extra, "nearby_params": None, "clarification_needed": None}
+    recommendations = seed_recommendations + nearby_extra
+    _verify_and_fix_categories(recommendations)
+    return {"recommendations": recommendations, "nearby_params": None, "clarification_needed": None}
 
 
 if __name__ == "__main__":

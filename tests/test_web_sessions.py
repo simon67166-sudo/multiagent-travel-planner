@@ -67,6 +67,23 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("test hotel", json.dumps(self.b.get("/trip").json))
         self.assertIn("test hotel", json.dumps(self.a.get("/trip").json))
 
+    def test_attraction_picker_confirm_triggers_real_schedule(self):
+        # 2026-09-15：排时间的触发点从"意图分类猜中了 route"改成"用户在 attraction_picker
+        # 选完确认"——这里验证确认动作真的走到了 route_agent.schedule()（骨架排班，不是
+        # 已删除的老接口 run()），而且用的是候选自带的真实坐标，不会重新地理编码
+        import map_tool
+        self.a.get("/session")
+        sid = self.a.get_cookie("travel_session").value
+        item = {"place": "大三巴牌坊", "category": "景点", "lng": 113.54, "lat": 22.19, "source": "社区帖子"}
+        with self.store.edit(sid, dict) as state:
+            state["pending_widgets"] = [{"widget": "attraction_picker", "data": {"options": [item], "max_select": 6}}]
+        with patch.object(map_tool, "geocode", side_effect=AssertionError("不该调用 geocode()")):
+            response = self.a.post("/widget-response", json={"widget": "attraction_picker", "selected": [item]})
+        self.assertEqual(response.status_code, 200)
+        trip = self.store.load(sid)["trip_plan"]
+        self.assertIn("day-1", trip["days"])
+        self.assertIn("大三巴牌坊", json.dumps(trip, ensure_ascii=False))
+
     def test_nearby_endpoints_removed(self):
         # 2026-09-14：nearby 并入了达人 Agent（content_agent.run(mode="nearby") +
         # route_agent.schedule()），走 POST /chat 就行。这三个独立端点连同独立表单前端
@@ -83,11 +100,11 @@ class OrchestrationTests(unittest.TestCase):
         state = agent.new_shared_state("x")
         state["messages"] = [{"role": "user", "content": "previous preference"}, {"role": "assistant", "content": "ok"}]
         result = {"reply": "mock Macau", "is_mock": True, "evidence": []}
-        with patch.object(agent.llm_tool, "call_llm", return_value='["restaurant", "route"]') as classify, patch.object(agent.restaurant_agent, "run", return_value=result), patch.object(agent.route_agent, "run") as route:
+        with patch.object(agent.llm_tool, "call_llm", return_value='["restaurant"]') as classify, patch.object(agent.restaurant_agent, "run", return_value=result), patch.object(agent.route_agent, "schedule") as schedule:
             output, _ = agent.orchestrate("budget changed", state)
         self.assertIn("mock Macau", output["chat_reply"])
         self.assertIn("previous preference", json.dumps(classify.call_args_list[0].args[0]))
-        route.assert_not_called()
+        schedule.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

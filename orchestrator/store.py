@@ -152,6 +152,14 @@ def delete_post(post_id: str) -> None:
     _community_collection.delete(ids=[post_id])
 
 
+def update_post_category(post_id: str, category: str) -> None:
+    """修正一条社区帖子的分类标签（比如达人 Agent 的分类质检发现"这条帖子的地点实际是
+    餐厅，不是景点"）——只改 category 这一个 metadata 字段。Chroma 的 update() 是合并式
+    更新，不会动其他字段（place/caption/tags 等都原样保留），真实验证过。给
+    content_agent._verify_and_fix_categories() 用。"""
+    _community_collection.update(ids=[post_id], metadatas=[{"category": category}])
+
+
 # ---------------------------------------------------------------------------
 # 历史记录 -- 行程反馈日志，用于校准人格（agent-architecture.md 4.4），先不做向量检索
 # ---------------------------------------------------------------------------

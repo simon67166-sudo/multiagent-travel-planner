@@ -5,16 +5,16 @@
 做"是否影响体验"的软性复核（结构化判断，轻量模型），其余排班逻辑（选点/算时间）都是纯
 确定性计算，不需要 LLM。
 
-两个入口，都会真实调 map_tool.py/nearby_sources.py（高德地图 API）算交通时间：
-- run(shared_state, places, ...)：旧接口，`places` 是地点名字字符串或带 lng/lat 的候选
-  字典（混用也行），全部按顺序写进同一个占位日期。server.py 的 `POST /widget-response`
-  （attraction_picker 确认）还在用这个，坐标已知时会走 _real_leg() 坐标直查，不重新
-  地理编码。
-- schedule(shared_state, candidates, ...)：2026-09-14 新增的统一排时间接口，给编排 Agent
-  调用——`candidates` 是 content_agent.run() 产出的候选（带经纬度）。mode="nearby" 是
-  最近邻贪心 + 粗粒度小时预算；mode="trip"（2026-09-15 起）改成时段骨架排班——按
-  _SLOT_TEMPLATE（上午/下午/晚上景点 + 午餐/晚餐槽位）往里面填候选，槽位类型/时间窗口
-  天然保证类别配比、限制单段跳跃距离，见 _fill_day_skeleton()。
+唯一入口 schedule(shared_state, candidates, ...)：给编排 Agent 调用——`candidates` 是
+content_agent.run() 产出的候选（带经纬度）。mode="nearby" 是最近邻贪心 + 粗粒度小时预算；
+mode="trip"（2026-09-15 起）改成时段骨架排班——按 _SLOT_TEMPLATE（上午/下午/晚上景点 +
+午餐/晚餐槽位）往里面填候选，槽位类型/时间窗口天然保证类别配比、限制单段跳跃距离，见
+_fill_day_skeleton()。真实调 map_tool.py/nearby_sources.py（高德地图 API）算交通时间，
+坐标已知时走 _real_leg() 坐标直查，不重新地理编码。
+
+（2026-09-15 起：老接口 run() 已删除——排时间的触发点从"意图分类猜中了 route"改成"用户
+从 attraction_picker 选完候选、点确认"之后，server.py 的 apply_selection() 直接改调
+schedule()，run() 那种"单一占位日期顺序追加"彻底没有调用方了）
 """
 
 import json
@@ -32,74 +32,7 @@ import nearby_sources
 import trip_plan
 import weather_tool
 
-_PLACEHOLDER_DAY = "day-1"  # run() 专用占位：还没做多日期规划的老接口，继续写进同一天
 _WALK_DRIVE_THRESHOLD_M = 2000  # 两站直线距离超过这个就改算驾车，不然走路太久
-
-
-def _estimate_transport(prev_place: str, place: str, city: str | None) -> str:
-    """查 map_tool 算 prev_place -> place 的真实交通方式/耗时；查不到就退化成占位文字。"""
-    try:
-        info = map_tool.route_between(prev_place, place, mode="walking", city=city)
-        if info["distance_m"] > _WALK_DRIVE_THRESHOLD_M:
-            info = map_tool.route_between(prev_place, place, mode="driving", city=city)
-        mode_label = "步行" if info["mode"] == "walking" else "驾车/打车"
-        return f"{mode_label}约 {info['duration_min']} 分钟（约 {info['distance_m'] / 1000:.1f} 公里）"
-    except Exception as e:
-        return f"待定（地图查询失败：{e}）"
-
-
-def run(
-    shared_state: dict, places: list[str | dict] | None, time_budget: str | None = None, city: str | None = None
-) -> dict:
-    """
-    city: 可选的城市提示，传了地理编码更准（比如"西湖"在多个城市都有同名地点）。
-
-    places 元素可以是纯地点名字字符串（老用法），也可以是带 lng/lat 的候选字典
-    （2026-09-15 起 server.py 的 attraction_picker 确认流程改传这种）——字典形式会
-    优先用坐标直查（_real_leg()，不重新地理编码），字符串形式还是走老的 _estimate_transport()
-    按名字查。同一次调用里两种形式可以混用（虽然实际调用方通常不会混）。
-    """
-    day_plan = trip_plan.get_or_create_day(shared_state["trip_plan"], _PLACEHOLDER_DAY)
-
-    prev_id = day_plan["head_id"]
-    while prev_id and day_plan["nodes"][prev_id]["next_id"]:
-        prev_id = day_plan["nodes"][prev_id]["next_id"]
-    prev_node = day_plan["nodes"][prev_id] if prev_id else None
-    prev_point = {"place": prev_node["place"], "lng": prev_node.get("lng"), "lat": prev_node.get("lat")} if prev_node else None
-
-    for item in places or ["占位地点 A"]:
-        point = item if isinstance(item, dict) else {"place": item}
-        place = point.get("place") or point.get("name")
-
-        if prev_point is None:
-            arrival_transport = "首站"
-        elif point.get("lng") is not None and prev_point.get("lng") is not None:
-            leg = _real_leg(prev_point, point, city)
-            if leg:
-                mode_label = "步行" if leg["mode"] == "walking" else "驾车/打车"
-                arrival_transport = f"{mode_label}约 {leg['duration_min']} 分钟（约 {leg['distance_m'] / 1000:.1f} 公里）"
-            else:
-                arrival_transport = "待定（地图查询失败）"
-        else:
-            arrival_transport = _estimate_transport(prev_point["place"], place, city)
-
-        node_id = f"{_PLACEHOLDER_DAY}-node-{len(day_plan['nodes']) + 1}"
-        trip_plan.add_stop(
-            day_plan,
-            node_id,
-            "attraction",
-            place,
-            arrival_transport=arrival_transport,
-            arrival_time="待定",
-            end_time="待定",
-            after_id=prev_id,
-            lng=point.get("lng"),
-            lat=point.get("lat"),
-        )
-        prev_id = node_id
-        prev_point = point
-
-    return {"route": trip_plan.day_stops(day_plan)}
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +87,9 @@ def _stay_minutes(candidate: dict) -> int:
 
 
 def _real_leg(from_point: dict, to_point: dict, city: str | None) -> dict | None:
-    """查 from_point -> to_point 的真实交通方式/耗时（2km 阈值切驾车，跟 _estimate_transport
-    同一个阈值）。查不到返回 None，调用方自己决定怎么降级，不在这里格式化成文字
-    （_estimate_transport 是给 run() 用的，返回值直接是格式化字符串；这个是给 schedule()
-    用的，需要拿到真实分钟数去推进时间游标，不能只有一句人话）。
+    """查 from_point -> to_point 的真实交通方式/耗时（2km 阈值切驾车）。查不到返回 None，
+    调用方自己决定怎么降级，不在这里格式化成文字——返回真实分钟数给 _fill_day_skeleton()/
+    _place_day() 去推进时间游标，不是拼好的一句人话。
 
     from_point/to_point 只要带 lng/lat（schedule() 传进来的候选/起点都带，因为
     content_agent.py 已经用 nearby_sources.find_origin()/nearby() 查过一次真实坐标了），
@@ -476,9 +408,6 @@ def schedule(
 
 
 if __name__ == "__main__":
-    demo_shared_state = {"trip_plan": trip_plan.new_trip_plan("route-agent-demo-trip")}
-    print(json.dumps(run(demo_shared_state, places=["杭州西湖", "杭州灵隐寺"], city="杭州"), ensure_ascii=False, indent=2))
-
     print("--- schedule() 自测（真实数据，走 content_agent 产出的候选）---")
     import sys as _sys
     _sys.path.insert(0, str(_ORCHESTRATOR_DIR))

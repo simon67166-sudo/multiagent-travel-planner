@@ -93,42 +93,6 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(places, ["叠记咖喱美食", "文记咖啡"])
         self.assertEqual(deduped[0]["post_id"], "p1")  # 保留相似度更高的那条（p1 而不是 p3）
 
-    def test_run_uses_known_coordinates_without_geocoding(self):
-        # 2026-09-15：老接口 route_agent.run()（server.py 的 attraction_picker 确认流程在用）
-        # 之前只认地点名字字符串，坐标已知也会重新按名字地理编码——真实演示时因此把"巨记面家"
-        # 这类候选定位到内地同名店（截图里出现过"上海""新疆"）。修复后传完整候选字典
-        # （带 lng/lat）应该直接用坐标查路线，不再调用 map_tool.geocode()
-        import map_tool
-        import trip_plan
-        from agents import route_agent
-        state = {"trip_plan": trip_plan.new_trip_plan("test-run-coords")}
-        places = [
-            {"place": "甲地", "lng": 113.54, "lat": 22.19},
-            {"place": "乙地", "lng": 113.541, "lat": 22.191},
-        ]
-        fake_leg = {"mode": "walking", "duration_min": 5, "distance_m": 300}
-        with patch.object(map_tool, "geocode", side_effect=AssertionError("不该调用 geocode()")), \
-             patch.object(route_agent, "_real_leg", return_value=fake_leg) as leg_mock:
-            route_agent.run(state, places=places, city="澳门")
-        stops = trip_plan.day_stops(trip_plan.get_or_create_day(state["trip_plan"], "day-1"))
-        self.assertEqual(stops[0]["lng"], 113.54)
-        self.assertEqual(stops[1]["lng"], 113.541)
-        leg_mock.assert_called_once()
-
-    def test_run_falls_back_to_name_lookup_for_plain_strings(self):
-        # 老调用方（比如 route_agent.py 自己的 __main__ 自测块）还是传纯字符串列表，
-        # 这个兜底路径要保持不变
-        import map_tool
-        import trip_plan
-        from agents import route_agent
-        state = {"trip_plan": trip_plan.new_trip_plan("test-run-string-fallback")}
-        with patch.object(map_tool, "geocode", return_value=(113.54, 22.19)) as geocode_mock, \
-             patch.object(map_tool, "_direction", return_value={"distance_m": 300, "duration_min": 5, "polyline": []}):
-            route_agent.run(state, places=["甲地", "乙地"], city="澳门")
-        self.assertTrue(geocode_mock.called)
-        stops = trip_plan.day_stops(trip_plan.get_or_create_day(state["trip_plan"], "day-1"))
-        self.assertIsNone(stops[0].get("lng"))
-
     def test_place_day_never_fakes_a_failed_route(self):
         # 原 test_missing_route_never_draws_fake_line 的等价替代：查路线失败时不能编造到达时间，
         # 要老实标"待定（地图查询失败）"，不能假装查到了什么
@@ -241,6 +205,41 @@ class NearbyTests(unittest.TestCase):
         ]
         picked = content_agent._pick_seeds_with_category_balance(posts, top_k=3)
         self.assertEqual(picked, posts[:3])
+
+    def test_verify_and_fix_categories_applies_llm_corrections(self):
+        # 2026-09-15：达人 Agent 向编排提交候选之前的分类质检——社区帖子的 category 是人工
+        # 录入的，可能真的标错；高德 POI 的 category 是原始 type 字符串，本身就不是干净的
+        # "饮食/景点"标签。标错一条，route_agent._candidate_role() 就可能把餐厅塞进景点槽位
+        from agents import content_agent
+        recs = [
+            {"place": "甲餐厅", "category": "景点", "post_id": "p1"},
+            {"place": "乙景点", "category": "景点"},
+        ]
+        with patch.object(content_agent.llm_tool, "call_llm", return_value='[{"index":0,"category":"饮食"}]'):
+            content_agent._verify_and_fix_categories(recs)
+        self.assertEqual(recs[0]["category"], "饮食")
+        self.assertEqual(recs[1]["category"], "景点")  # 没被模型点名的不动
+
+    def test_verify_and_fix_categories_writes_back_only_for_community_posts(self):
+        from agents import content_agent
+        recs = [
+            {"place": "甲餐厅", "category": "景点", "post_id": "p1"},  # 社区帖子来源，带 post_id
+            {"place": "乙餐厅", "category": "景点"},  # 高德 POI 来源，没有 post_id
+        ]
+        with patch.object(content_agent.llm_tool, "call_llm",
+                           return_value='[{"index":0,"category":"饮食"},{"index":1,"category":"饮食"}]'), \
+             patch.object(content_agent.store, "update_post_category") as update_mock:
+            content_agent._verify_and_fix_categories(recs)
+        self.assertEqual(recs[0]["category"], "饮食")
+        self.assertEqual(recs[1]["category"], "饮食")
+        update_mock.assert_called_once_with("p1", "饮食")
+
+    def test_verify_and_fix_categories_degrades_gracefully_on_error(self):
+        from agents import content_agent
+        recs = [{"place": "甲餐厅", "category": "景点", "post_id": "p1"}]
+        with patch.object(content_agent.llm_tool, "call_llm", side_effect=RuntimeError("boom")):
+            content_agent._verify_and_fix_categories(recs)
+        self.assertEqual(recs[0]["category"], "景点")
 
     def test_anchor_place_from_trip_uses_earliest_day_first_geocoded_stop(self):
         # 2026-09-15：酒店搜索要按已排行程的位置收窄，不能无差别搜整个城市——真实验证过
