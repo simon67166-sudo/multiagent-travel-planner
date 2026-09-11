@@ -62,6 +62,21 @@ def _dedupe_by_place(posts: list[dict]) -> list[dict]:
     return deduped
 
 
+def _pick_seeds_with_category_balance(posts: list[dict], top_k: int) -> list[dict]:
+    """挑种子时优先保证至少 1 条"景点"类，剩下按相似度顺序（posts 已经排好序）补满 top_k。
+
+    不这么做的话，骨架式排班（route_agent.schedule() mode="trip"）的景点槽位可能天生没东西
+    填——人格向量偏"美食探店"这类标签时，纯相似度 top_k 经常清一色是"饮食"类帖子，每个
+    美食种子再去查周边真实 POI，一家餐厅周边搜出来的大概率还是餐厅，偏差会被放大（真实
+    demo 演示时出现过"推荐的3天行程每天都是美食"）。"景点"类候选不够就照常按相似度顺序
+    回退，不强求，跟"过滤完一个不剩就退回未过滤结果"是同一个"尽力而为，不硬凑"的哲学。"""
+    sight = next((p for p in posts if p.get("category") == "景点"), None)
+    if sight is None:
+        return posts[:top_k]
+    rest = [p for p in posts if p is not sight][: top_k - 1]
+    return [sight] + rest
+
+
 def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) -> list[dict]:
     """
     统一的"周边探索"接口：查真实高德周边 POI + 社区口碑复核，返回排好序的候选列表。
@@ -187,7 +202,7 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int =
     fetched = store.query_similar_posts(persona_vector, top_k=top_k * 5, city=city)
     deduped = _dedupe_by_place(fetched)
     filtered = [p for p in deduped if p.get("category") != "Tips"]
-    seed_posts = (filtered or deduped)[:top_k]
+    seed_posts = _pick_seeds_with_category_balance(filtered or deduped, top_k)
     seed_recommendations = [
         {
             "post_id": p.get("post_id"),
