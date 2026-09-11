@@ -29,6 +29,7 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR_DIR))
 
 import hotel_tool
+import trip_plan as trip_plan_module
 
 _DEFAULT_STAY_NIGHTS = 2
 
@@ -107,16 +108,81 @@ def _parse_date_range(date_range: str | None) -> tuple[str | None, str | None, i
         return check_in, check_out, _DEFAULT_STAY_NIGHTS
 
 
-def _search_real_hotels(city: str, check_in: str | None, check_out: str | None, nights: int, category: str | None, user_message: str | None) -> tuple[list[dict], str | None]:
-    """真查 hotel_tool（道旅 RollingGo），失败时优雅降级返回空列表 + 错误信息，不往上抛异常炸穿 orchestrate()。"""
+_ANCHOR_SANITY_KM = 50  # RollingGo 按地点名字匹配也可能像高德一样认错地方（生僻地名尤其容易
+# 撞到国外同名地方——真实测过"中西药局旧址"这种没那么出名的地标被匹配成美国圣路易斯，坐标
+# 直接跑去了密苏里州），查回来的酒店离锚点真实坐标这么远就当匹配失败，整批放弃退回城市级搜索
+
+
+def _haversine_km(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
+    """跟 route_agent.py/schedule_widgets.py 的同名公式一样，独立一份不建跨模块依赖。"""
+    import math
+
+    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
+    dlat, dlon = rlat2 - rlat1, math.radians(lng2 - lng1)
+    return 6371 * 2 * math.asin(min(1, math.sqrt(math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2)))
+
+
+def _anchor_place_from_trip(trip_plan_obj: dict) -> dict | None:
+    """从已经排好的行程里挑一个"重心地点"给酒店搜索当锚点——取最早一天的第一个带坐标的站，
+    这样真正搜出来的候选会贴着已经确定的行程位置，不是漫无目的地搜整个城市。返回
+    {"place":, "lng":, "lat":}（坐标是这个节点排班时就查好、存进 trip_plan 的真实坐标，见
+    route_agent._place_day()/_fill_day_skeleton()，给下面的合理性校验用）。
+
+    背景：真实 demo 演示时发现，编排 Agent 组句的自由文本会"聪明地"根据行程位置建议住哪个
+    区域（比如"你的行程都在新马路一带，别住氹仔"），但那只是模型看着 JSON context 自由发挥，
+    底下真正查酒店、真正会出现在 hotel_picker 卡片让用户选的候选，之前一直不管行程位置、
+    只按整个城市搜——嘴上说的和真正能选的不是一回事，用户点卡片照样能选中文字里劝退的
+    氹仔酒店。真实验证过：hotel_tool.search_hotels() 传 place="大三巴", place_type="景点"
+    （而不是 place=城市, place_type="城市"）确实会把氹仔酒店排除出候选。
+
+    没有排任何行程（比如用户还没问过内容推荐、直接先问订酒店）就返回 None，调用方退回
+    城市级搜索，不强求。
+    """
+    for day_date in sorted(trip_plan_obj.get("days", {})):
+        for stop in trip_plan_module.day_stops(trip_plan_obj["days"][day_date]):
+            if stop.get("place") and stop.get("lng") is not None and stop.get("lat") is not None:
+                return {"place": stop["place"], "lng": stop["lng"], "lat": stop["lat"]}
+    return None
+
+
+def _search_real_hotels(city: str, check_in: str | None, check_out: str | None, nights: int, category: str | None, user_message: str | None, anchor: dict | None = None) -> tuple[list[dict], str | None]:
+    """真查 hotel_tool（道旅 RollingGo），失败时优雅降级返回空列表 + 错误信息，不往上抛异常炸穿 orchestrate()。
+
+    anchor 给了（行程已经排出具体地点，{"place":,"lng":,"lat":}）就按这个地点搜
+    （place_type="景点"，真实验证过这个类型能让 RollingGo 按地点收窄结果，不是只在文字里
+    提一句），没给就退回城市级搜索（place_type="城市"）。
+
+    锚点搜索有个真实踩过的坑：地标不够出名时 RollingGo 可能整个匹配错地方（"中西药局旧址"
+    被匹配到美国圣路易斯去了）——查回来的酒店坐标用 anchor 里已经查好的真实坐标做一次合理性
+    校验（_ANCHOR_SANITY_KM 内），全部超出范围就当这次锚点匹配失败，退回城市级搜索重查一次，
+    不把跑偏的结果直接给用户。
+    """
     origin_query = user_message or (f"想在{city}订一间{category}酒店" if category else f"想在{city}订一间性价比高的酒店")
+    if anchor:
+        origin_query += f"，希望离「{anchor['place']}」附近近一点，方便行程"
+    place, place_type = (anchor["place"], "景点") if anchor else (city, "城市")
     try:
         hotels = hotel_tool.search_hotels(
-            place=city, place_type="城市", origin_query=origin_query,
+            place=place, place_type=place_type, origin_query=origin_query,
             check_in_date=check_in, stay_nights=nights, size=5,
         )
     except Exception as e:
         return [], str(e)
+
+    if anchor and hotels:
+        on_target = [
+            h for h in hotels
+            if h.get("lng") is not None and h.get("lat") is not None
+            and _haversine_km(anchor["lng"], anchor["lat"], h["lng"], h["lat"]) <= _ANCHOR_SANITY_KM
+        ]
+        if not on_target:
+            try:
+                hotels = hotel_tool.search_hotels(
+                    place=city, place_type="城市", origin_query=origin_query,
+                    check_in_date=check_in, stay_nights=nights, size=5,
+                )
+            except Exception as e:
+                return [], str(e)
 
     if not check_in:
         check_in = (date.today() + timedelta(days=1)).isoformat()
@@ -156,11 +222,16 @@ def run(
     再没有就兜底"澳门"（demo 默认城市，见 server.py 的 _DEMO_CITY）。
     user_message 传了会原样喂给 hotel_tool 当查询意图描述（比关键词拼出来的更准），
     orchestrator_agent.py 里 booking 意图命中时会把这轮用户消息传进来。
+
+    2026-09-15 起会先从 shared_state["trip_plan"] 里取一个已排行程的锚点地点
+    （_anchor_place_from_trip()），酒店搜索按这个地点收窄（见 _search_real_hotels()），
+    不再是不管行程位置、无差别搜整个城市。
     """
     city = location or shared_state.get("city") or "澳门"
     check_in, check_out, nights = _parse_date_range(date_range)
 
-    hotel_candidates, hotel_error = _search_real_hotels(city, check_in, check_out, nights, category, user_message)
+    anchor = _anchor_place_from_trip(shared_state.get("trip_plan", {}))
+    hotel_candidates, hotel_error = _search_real_hotels(city, check_in, check_out, nights, category, user_message, anchor)
 
     # 去程用入住日期，回程用离店日期——往返机票配对，不是只有单程
     depart_date = check_in or (date.today() + timedelta(days=1)).isoformat()

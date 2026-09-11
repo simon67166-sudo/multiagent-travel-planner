@@ -242,4 +242,60 @@ class NearbyTests(unittest.TestCase):
         picked = content_agent._pick_seeds_with_category_balance(posts, top_k=3)
         self.assertEqual(picked, posts[:3])
 
+    def test_anchor_place_from_trip_uses_earliest_day_first_geocoded_stop(self):
+        # 2026-09-15：酒店搜索要按已排行程的位置收窄，不能无差别搜整个城市——真实验证过
+        # 用地点当锚点（place_type="景点"）确实会把氹仔酒店排除出候选，只在文字里劝退
+        # 用户"别住氹仔"是不够的，因为真正能选的候选卡片没跟着收窄
+        import trip_plan
+        from agents import ota_hotel_agent
+        trip = trip_plan.new_trip_plan("test-anchor-place")
+        day2 = trip_plan.get_or_create_day(trip, "2026-09-16")
+        trip_plan.add_stop(day2, "n1", "attraction", "黑沙环", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.55, lat=22.20)
+        day1 = trip_plan.get_or_create_day(trip, "2026-09-15")
+        trip_plan.add_stop(day1, "n1", "attraction", "大三巴", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.54, lat=22.19)
+        anchor = ota_hotel_agent._anchor_place_from_trip(trip)
+        self.assertEqual(anchor, {"place": "大三巴", "lng": 113.54, "lat": 22.19})
+
+    def test_anchor_place_from_trip_returns_none_when_no_stops(self):
+        import trip_plan
+        from agents import ota_hotel_agent
+        trip = trip_plan.new_trip_plan("test-anchor-place-empty")
+        self.assertIsNone(ota_hotel_agent._anchor_place_from_trip(trip))
+        self.assertIsNone(ota_hotel_agent._anchor_place_from_trip({}))
+
+    def test_search_real_hotels_narrows_by_anchor_place(self):
+        from agents import ota_hotel_agent
+        anchor = {"place": "大三巴", "lng": 113.54, "lat": 22.19}
+        on_target_hotel = [{"name": "近旁酒店", "lng": 113.541, "lat": 22.191}]
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=on_target_hotel) as mocked:
+            ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=anchor)
+        self.assertEqual(mocked.call_args.kwargs["place"], "大三巴")
+        self.assertEqual(mocked.call_args.kwargs["place_type"], "景点")
+
+    def test_search_real_hotels_falls_back_to_city_without_anchor(self):
+        from agents import ota_hotel_agent
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=[]) as mocked:
+            ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=None)
+        self.assertEqual(mocked.call_args.kwargs["place"], "澳门")
+        self.assertEqual(mocked.call_args.kwargs["place_type"], "城市")
+
+    def test_search_real_hotels_retries_city_wide_when_anchor_match_is_way_off(self):
+        # 2026-09-15：真实踩过的坑——RollingGo 把"中西药局旧址"这种没那么出名的地标匹配到
+        # 美国圣路易斯去了（坐标直接跑去密苏里州）。锚点搜索结果离已知真实坐标太远时要整批
+        # 放弃，退回城市级搜索重查一次，不能把跑偏的结果直接返回给用户
+        from agents import ota_hotel_agent
+        anchor = {"place": "中西药局旧址", "lng": 113.54, "lat": 22.19}
+        far_away_hotel = [{"name": "圣路易斯威斯汀酒店", "lng": -90.195015, "lat": 38.623196}]
+        on_target_hotel = [{"name": "近旁酒店", "lng": 113.541, "lat": 22.191}]
+        with patch.object(
+            ota_hotel_agent.hotel_tool, "search_hotels", side_effect=[far_away_hotel, on_target_hotel]
+        ) as mocked:
+            candidates, error = ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=anchor)
+        self.assertIsNone(error)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["name"], "近旁酒店")
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(mocked.call_args_list[1].kwargs["place"], "澳门")
+        self.assertEqual(mocked.call_args_list[1].kwargs["place_type"], "城市")
+
 if __name__ == "__main__": unittest.main()
