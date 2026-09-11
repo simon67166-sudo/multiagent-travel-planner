@@ -43,20 +43,39 @@ def _estimate_transport(prev_place: str, place: str, city: str | None) -> str:
 
 
 def run(
-    shared_state: dict, places: list[str] | None, time_budget: str | None = None, city: str | None = None
+    shared_state: dict, places: list[str | dict] | None, time_budget: str | None = None, city: str | None = None
 ) -> dict:
     """
     city: 可选的城市提示，传了地理编码更准（比如"西湖"在多个城市都有同名地点）。
+
+    places 元素可以是纯地点名字字符串（老用法），也可以是带 lng/lat 的候选字典
+    （2026-09-15 起 server.py 的 attraction_picker 确认流程改传这种）——字典形式会
+    优先用坐标直查（_real_leg()，不重新地理编码），字符串形式还是走老的 _estimate_transport()
+    按名字查。同一次调用里两种形式可以混用（虽然实际调用方通常不会混）。
     """
     day_plan = trip_plan.get_or_create_day(shared_state["trip_plan"], _PLACEHOLDER_DAY)
 
     prev_id = day_plan["head_id"]
     while prev_id and day_plan["nodes"][prev_id]["next_id"]:
         prev_id = day_plan["nodes"][prev_id]["next_id"]
-    prev_place = day_plan["nodes"][prev_id]["place"] if prev_id else None
+    prev_node = day_plan["nodes"][prev_id] if prev_id else None
+    prev_point = {"place": prev_node["place"], "lng": prev_node.get("lng"), "lat": prev_node.get("lat")} if prev_node else None
 
-    for place in places or ["占位地点 A"]:
-        arrival_transport = _estimate_transport(prev_place, place, city) if prev_place else "首站"
+    for item in places or ["占位地点 A"]:
+        point = item if isinstance(item, dict) else {"place": item}
+        place = point.get("place") or point.get("name")
+
+        if prev_point is None:
+            arrival_transport = "首站"
+        elif point.get("lng") is not None and prev_point.get("lng") is not None:
+            leg = _real_leg(prev_point, point, city)
+            if leg:
+                mode_label = "步行" if leg["mode"] == "walking" else "驾车/打车"
+                arrival_transport = f"{mode_label}约 {leg['duration_min']} 分钟（约 {leg['distance_m'] / 1000:.1f} 公里）"
+            else:
+                arrival_transport = "待定（地图查询失败）"
+        else:
+            arrival_transport = _estimate_transport(prev_point["place"], place, city)
 
         node_id = f"{_PLACEHOLDER_DAY}-node-{len(day_plan['nodes']) + 1}"
         trip_plan.add_stop(
@@ -68,9 +87,11 @@ def run(
             arrival_time="待定",
             end_time="待定",
             after_id=prev_id,
+            lng=point.get("lng"),
+            lat=point.get("lat"),
         )
         prev_id = node_id
-        prev_place = place
+        prev_point = point
 
     return {"route": trip_plan.day_stops(day_plan)}
 

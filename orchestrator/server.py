@@ -154,7 +154,10 @@ def widget_response():
 
 def apply_selection(widget, selected, state):
     if widget == "attraction_picker":
-        places = [item.get("place") for item in selected if item.get("place")]
+        # 传完整候选字典（不只是 place 字符串）——content_agent.run() 早就给每个候选挂好
+        # lng/lat 了，route_agent.run() 现在会优先用这些坐标直查路线，不重新地理编码
+        # （地理编码对港澳场景不可靠，见 route_agent.py 里 _real_leg() 的说明）
+        places = [item for item in selected if item.get("place")]
         if places:
             route_agent.run(state, places=places, city=state.get("city", _DEMO_CITY))
     elif widget == "flight_picker":
