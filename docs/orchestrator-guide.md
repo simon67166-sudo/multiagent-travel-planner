@@ -148,22 +148,30 @@ orchestrator/
 
 | 函数 | 作用 |
 |---|---|
-| `build_trip_map_widget(trip_plan_obj, city=None)` | 地图组件：把每天的景点/餐饮节点标进地图（同一天同一个颜色，颜色按"第几天"从固定调色板分配，超过 8 天循环复用），并把当天节点依次连成一条**真实路线**（查真实路况，不是直线连线，颜色跟当天 markers 一致）；机票起降机场、酒店地址也各标一个点，用固定颜色（不参与按天上色，因为它们不属于"某一天"） |
+| `build_trip_map_widget(trip_plan_obj, city=None)` | 地图组件：把每天的景点/餐饮节点标进地图（同一天同一个颜色，颜色按"第几天"从固定调色板分配，超过 8 天循环复用），并把当天节点依次连成一条**真实路线**（查真实路况，不是直线连线，颜色跟当天 markers 一致）；机票起降机场、酒店地址也各标一个点，用固定颜色（不参与按天上色，因为它们不属于"某一天"）。多城市行程会按地理距离自动**分帧**（见下），不再是所有点挤在同一张地图里 |
 | `build_day_timeline_widget(trip_plan_obj)` | 每日行程时间线：把每天的节点按时间顺序整理成竖排列表，按天分模块，模块颜色跟 `build_trip_map_widget` 里同一天的颜色对齐，方便地图和列表对照着看 |
 | `build_booking_panel_widget(trip_plan_obj)` | 机票/酒店面板：原样呈现 `trip_plan` 里已经落地确认的 `flights`/`hotels` 记录——注意这跟 `widgets.py` 的 `build_flight_picker_widget`/`build_hotel_picker_widget`不是一回事，那两个是"聊天框里给用户挑的候选推荐"，这里是"已经确认、要显示在左侧行程里的记录" |
 
-`build_trip_map_widget` 返回结构：
+`build_trip_map_widget` 返回结构（**分帧版，2026-09-11 起替换了原来的扁平 `markers`/`routes` 结构**）：
 ```
 {"widget": "trip_map", "data": {
-  "markers": [{day, color, place, node_id, type, lng, lat, ...}],   # type: attraction|meal|airport|hotel
-  "routes": [{"day":, "color":, "coordinates": [[lng,lat], ...]}],
+  "frames": [
+    {"frame_id": "frame-1", "center": {"lng":, "lat":},
+     "markers": [{day, color, place, node_id, type, lng, lat, ...}],  # type: attraction|meal|airport|hotel
+     "routes": [{"day":, "color":, "coordinates": [[lng,lat], ...]}]},
+    ...
+  ],
+  "unclustered_airports": [{day, color, place, node_id, type: "airport", role, flight_no, status, lng, lat, ...}],
   "days_legend": [{"date":, "color":}],
   "geocode_failures": [{"place":, "reason":}],
   "route_failures": [{"day":, "from":, "to":, "reason":}],
 }}
 ```
+- **为什么要分帧**：早期版本是所有 marker 挤进同一张地图，跨城市行程（比如"杭州玩三天+机票飞北京"）一旦机票起降机场跟行程主城市离得远，地图会被迫缩到能同时装下两座城市的比例尺，近处的景点全部挤成一个点，什么都看不清。改成按地理距离把 marker 分组，每组（帧）各自算自己的地图范围/比例尺，前端各画一个独立的 `AMap.Map` 实例，近处的点就能放大到看得清的程度
+- **分帧算法**（`schedule_widgets.py` 里的 `_cluster_by_distance` + `_haversine_m`）：对当天的景点/餐饮/酒店 marker 用 haversine 距离做贪心单链聚类，阈值 `_FRAME_CLUSTER_THRESHOLD_M = 50_000`（50km）——两个点只要有一条 ≤50km 的链路就会被分进同一帧，超过阈值的自动分到不同帧
+- **机票起降机场不参与聚类本身**，而是聚类结束、每帧的中心点算出来之后，拿机场坐标跟每一帧的中心点比距离，落在 `_AIRPORT_ATTACH_THRESHOLD_M = 80_000`（80km）以内就并入最近的那一帧（进 `frames[i].markers`），否则单独放进 `unclustered_airports`（不画在任何一帧里，避免为了容纳一个远处的机场把某一帧的比例尺又拉爆）——这是用户明确要求的规则："起点和终点不算，直接忽略就行"
 - 景点/餐饮 marker 的 `day`/`color` 按天分配；机票（`type: "airport"`，额外带 `role: "depart"|"arrive"`、`flight_no`、`status`）和酒店（`type: "hotel"`，额外带 `name`/`check_in`/`check_out`）的 `day` 固定是 `None`，颜色分别固定为深灰蓝/棕色（`_AIRPORT_COLOR`/`_HOTEL_COLOR`），不占用按天调色板
-- `routes` 里的坐标是把 `map_tool.route_between()` 返回的多段 `polyline` 展平成一条连续的 `[lng, lat]` 序列，直接给前端画线；查询失败的那一段跳过并记进 `route_failures`，不影响其他天/其他段
+- 每帧内 `routes` 的坐标是把 `map_tool.route_between()` 返回的多段 `polyline` 展平成一条连续的 `[lng, lat]` 序列，直接给前端画线；一条路线按起点锚点归到最近的帧里；查询失败的那一段跳过并记进 `route_failures`，不影响其他天/其他段
 - **字段约定**：`flights` 的 `from_`/`to`、`hotels` 的 `address` 建议存能被地理编码识别的地名/地址（比如"杭州萧山国际机场"），不建议只存三字码（比如 `"HGH"`）——高德地理编码认不出机场三字码，会直接进 `geocode_failures`
 
 **现状**：三个 widget 已经接进 `server.py` 的 `GET /trip`，`web/index.html` 用高德 JS API 真的把地图画出来了（见 `server.py + web/index.html` 一节）；已经用真实 `AMAP_KEY` 端到端验证过，标点/连线/机票酒店坐标都是真实经纬度。
@@ -370,7 +378,9 @@ python orchestrator/server.py
 
 - 发消息 → 调 `/chat` → 显示文字回复 → 把返回的 `widgets` 数组按类型分发渲染（`post_list` 是横滑卡片；`attraction_picker`/`flight_picker`/`hotel_picker` 共用同一套"复选框 + 确认按钮"组件，`max_select` 决定最多能勾几个）→ 再调一次 `/trip` 刷新左侧日程
 - 三个"选择型" widget 点"确认选择"之后：把勾中的候选对象原样 `POST /widget-response`，成功后往聊天记录里加一条系统提示（"已确认：xxx"），再刷新一次左侧日程
-- 左侧地图用 `AMap.Map` 初始化一次（页面加载时），之后每次 `/trip` 刷新只 `map.clearMap()` 重画：景点/餐饮用 `AMap.CircleMarker` 按天上色，机票/酒店 marker 固定深灰蓝/棕色（颜色跟 `schedule_widgets.py` 里的常量对应，改了那边记得这边也要改），路线用 `AMap.Polyline` 按天上色，标记点击会弹 `AMap.InfoWindow` 显示地点名
+- 左侧地图**不再是页面加载时初始化一次的单个 `AMap.Map`**（2026-09-11 起改为分帧渲染，跟后端 `trip_map.data.frames` 的结构对应）：每次 `/trip` 刷新，`renderMap()` 先把上一轮所有帧的 `AMap.Map` 实例逐个 `destroy()`，再按 `frames` 数组动态生成对应数量的 `.map-frame` 容器（`#map-frames` 下面纵向排列，每帧一个独立的 220px 高地图 div + "第 N 组 · X 个地点" 标签），`drawFrameMap()` 给每帧各自 `new` 一个 `AMap.Map` 实例、只画这一帧自己的 `markers`/`routes`，各帧自动按自己的点位算合适的缩放级别（不用整条行程的极值），互不干扰
+  - 景点/餐饮用 `AMap.CircleMarker` 按天上色，机票/酒店 marker 固定深灰蓝/棕色（颜色跟 `schedule_widgets.py` 里的常量对应，改了那边记得这边也要改），路线用 `AMap.Polyline` 按天上色，标记点击会弹 `AMap.InfoWindow` 显示地点名（这部分单帧内部的画法逻辑跟改分帧之前一样，没变）
+  - `data.unclustered_airports`（离行程主体太远、没并进任何一帧的机场）渲染成 `#map-frames` 下方一行文字提示（"距离行程较远，未画在地图上：xxx"），不占用地图画布
 - 每日行程时间线现在读 `trip.day_timeline`（带颜色）而不是原始的 `trip.days`，模块颜色跟地图上同一天的颜色对得上
 
 **现状/限制**：
