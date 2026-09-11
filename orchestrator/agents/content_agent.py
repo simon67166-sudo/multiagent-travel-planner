@@ -44,6 +44,24 @@ def _extract_city(location_hint: str | None) -> str | None:
     return None
 
 
+def _dedupe_by_place(posts: list[dict]) -> list[dict]:
+    """同一个地点如果有好几条社区帖子都在夸，只留相似度最高的那条——posts 传进来时已经按
+    similarity_score 降序排好（store.query_similar_posts() 保证的），遇到的第一条就是最高分
+    那条，后面同地点的直接跳过。不去重的话，两条不同的人都写过"叠记咖喱美食"的帖子会各自占
+    一个种子名额，变成同一家店被推荐两次（真实测过会出现这种情况）。没有 place 字段的帖子
+    （理论上不该出现）原样保留，不参与去重。"""
+    seen: set[str] = set()
+    deduped = []
+    for post in posts:
+        place = post.get("place")
+        if place and place in seen:
+            continue
+        if place:
+            seen.add(place)
+        deduped.append(post)
+    return deduped
+
+
 def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) -> list[dict]:
     """
     统一的"周边探索"接口：查真实高德周边 POI + 社区口碑复核，返回排好序的候选列表。
@@ -167,8 +185,9 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int =
     # 具体偏好的 onboarding 人格，碰不到这个边界情况，但达人 Agent 本身不该对着任何输入都
     # 可能空手而归——过滤完一个不剩，就退回未过滤结果，好歹给点东西，不摆烂。
     fetched = store.query_similar_posts(persona_vector, top_k=top_k * 5, city=city)
-    filtered = [p for p in fetched if p.get("category") != "Tips"]
-    seed_posts = (filtered or fetched)[:top_k]
+    deduped = _dedupe_by_place(fetched)
+    filtered = [p for p in deduped if p.get("category") != "Tips"]
+    seed_posts = (filtered or deduped)[:top_k]
     seed_recommendations = [
         {
             "post_id": p.get("post_id"),

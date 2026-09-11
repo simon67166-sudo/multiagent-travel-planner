@@ -79,6 +79,20 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(leg["distance_m"], 300)
         route_mock.assert_called_once()
 
+    def test_content_agent_dedupes_seeds_by_place(self):
+        # 2026-09-15：修复"同一个地点的两条不同帖子都被选成种子"的 bug——真实测过会出现
+        # 两条不同的人写的"叠记咖喱美食"帖子同时被当成种子推荐给用户，同一家店等于推荐了两次
+        from agents import content_agent
+        posts = [
+            {"place": "叠记咖喱美食", "post_id": "p1", "similarity_score": 0.9, "category": "Food"},
+            {"place": "文记咖啡", "post_id": "p2", "similarity_score": 0.8, "category": "Food"},
+            {"place": "叠记咖喱美食", "post_id": "p3", "similarity_score": 0.7, "category": "Food"},
+        ]
+        deduped = content_agent._dedupe_by_place(posts)
+        places = [p["place"] for p in deduped]
+        self.assertEqual(places, ["叠记咖喱美食", "文记咖啡"])
+        self.assertEqual(deduped[0]["post_id"], "p1")  # 保留相似度更高的那条（p1 而不是 p3）
+
     def test_place_day_never_fakes_a_failed_route(self):
         # 原 test_missing_route_never_draws_fake_line 的等价替代：查路线失败时不能编造到达时间，
         # 要老实标"待定（地图查询失败）"，不能假装查到了什么
