@@ -17,10 +17,18 @@ class NearbyTests(unittest.TestCase):
             request=self.req(); request[field]=value
             with self.assertRaises(ValueError): validate_request(request)
 
-    def test_geometry_city_validation(self):
-        from nearby_sources import in_city
-        self.assertTrue(in_city("澳门",113.54,22.19))
-        self.assertFalse(in_city("香港",120.15,30.25))
+    def test_find_origin_scopes_by_city_via_amap(self):
+        # 城市范围校验现在完全交给高德的 city + citylimit 参数（不再有 Python 侧预存的经纬度边界），
+        # 这里验证 find_origin() 确实把这两个参数传给了 _amap()
+        import nearby_sources as sources
+        raw={"_fetched_at":"test","pois":[{"id":"poi1","name":"大三巴","location":"113.54,22.19"}]}
+        with patch.object(sources,"_amap",return_value=raw) as api:
+            origin=sources.find_origin("澳门","大三巴")
+        self.assertEqual(origin["name"],"大三巴")
+        called_endpoint,called_params=api.call_args[0]
+        self.assertEqual(called_endpoint,"place/text")
+        self.assertEqual(called_params["city"],"澳门")
+        self.assertEqual(called_params["citylimit"],"true")
 
     def test_plan_preserves_all_members_and_unknowns(self):
         import nearby_planner as planner

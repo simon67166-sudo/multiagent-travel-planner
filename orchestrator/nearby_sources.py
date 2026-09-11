@@ -14,8 +14,9 @@ import requests
 _LOCK = RLock()
 _CACHE = {}
 _LAST = 0.0
-CITY = {"澳门": {"bbox": (113.52,22.10,113.61,22.22)},
-        "香港": {"bbox": (113.83,22.14,114.45,22.58)}}
+# 演示范围只做这两个城市（demo 规模限定，不是地理事实），validate_request() 用来做白名单校验；
+# "这个城市是哪个范围"这件事交给高德自己的 city+citylimit 参数处理，不在这里预存经纬度边界
+CITY = ("澳门", "香港")
 
 def get_json(url, params=None, ttl=1800):
     global _LAST
@@ -38,10 +39,6 @@ def get_json(url, params=None, ttl=1800):
         _CACHE[key]=(time.monotonic(),data)
         return deepcopy(data)
 
-def in_city(city,lng,lat):
-    west,south,east,north=CITY[city]["bbox"]
-    return west <= lng <= east and south <= lat <= north
-
 def distance(a,b):
     lat1,lat2=map(math.radians,(a["lat"],b["lat"]))
     dlat=lat2-lat1; dlon=math.radians(b["lng"]-a["lng"])
@@ -61,9 +58,9 @@ def amap_poi(raw,stamp):
             "source":"高德 POI","source_url":"https://uri.amap.com/marker?"+urlencode({"position":raw["location"],"name":raw["name"]}),"fetched_at":stamp}
 
 def find_origin(city,query):
+    # 城市范围限定交给高德自己的 city + citylimit 参数，不在这边额外拿预存的经纬度边界二次校验
     data=_amap("place/text",{"keywords":query,"city":city,"citylimit":"true","offset":5})
     options=[amap_poi(p,data["_fetched_at"]) for p in data.get("pois",[]) if p.get("location")]
-    options=[p for p in options if in_city(city,p["lng"],p["lat"])]
     if not options: raise ValueError("找不到该城市内的位置，请输入更明确的地标或地址")
     return options[0]
 
