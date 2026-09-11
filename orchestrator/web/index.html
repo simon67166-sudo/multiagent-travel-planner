@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>Travel Guardian · 港澳附近游</title>
+<title>Travel Guardian · 旅程编排</title>
 <script>
   // 高德 JS API 2.0 要求先配安全密钥再加载 SDK；key/密钥本身不写死在这个文件里
   // （这个文件要提交进 git），由 server.py 在返回页面时把占位符换成 .env 里的真实值。
@@ -119,41 +119,13 @@
   #input-bar input { flex: 1; padding: 10px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
   #input-bar button { padding: 10px 20px; border: none; border-radius: 6px; background: #0b5d3b; color: #fff; font-size: 14px; cursor: pointer; }
   #input-bar button:disabled { background: #999; cursor: default; }
-  .nearby-card { background:white; border:1px solid #ddd; border-radius:10px; padding:14px; margin:12px 0; }
-  .nearby-card label { display:block; margin:8px 0; font-size:13px; }
-  .nearby-card input,.nearby-card select { width:100%; padding:7px; border:1px solid #ccc; border-radius:5px; }
-  .nearby-card button { padding:8px 12px; margin:5px 3px 5px 0; cursor:pointer; }
-  .nearby-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-  .member-row { display:grid; grid-template-columns:1fr 2fr auto; gap:4px; margin:6px 0; }
-  #nearby-map { height:300px; display:none; border-radius:10px; }
-  #nearby-output { font-size:13px; line-height:1.7; }
-  #nearby-output a { color:#0b5d3b; margin-right:10px; }
-  #nearby-output details { margin:8px 0; }
-  #nearby-status { font-size:12px; color:#735321; white-space:pre-wrap; }
   @media(max-width:800px) { body {display:block;height:auto;} #schedule {width:100%;max-width:none;} #chat {min-height:500px;} }
 </style>
 </head>
 <body>
 
 <div id="schedule">
-  <h2><span class="live-dot"></span>港澳附近游</h2>
-  <form id="nearby-form" class="nearby-card">
-    <div class="nearby-grid">
-      <label>城市<select id="nearby-city"><option>澳门</option><option>香港</option></select></label>
-      <label>起点地标<input id="nearby-location" value="大三巴" required maxlength="200"></label>
-      <label>日期<input id="nearby-date" type="date" required></label>
-      <label>出发时间<input id="nearby-time" type="time" value="10:00" required></label>
-      <label>游览小时<input id="nearby-hours" type="number" min="1" max="10" value="3" required></label>
-      <label>交通<select id="nearby-mode"><option value="walking">步行</option><option value="driving">驾车路线估算</option><option value="transit">公交（另查班次）</option></select></label>
-    </div>
-    <p>同行者与需求（可自由增减；未填代表未登记）</p>
-    <div id="nearby-members"></div>
-    <button id="add-member" type="button">＋新增同行者</button>
-    <button id="build-nearby" type="submit">生成附近游攻略</button>
-    <div id="nearby-status" role="status"></div>
-  </form>
-  <div id="nearby-map"></div>
-  <div id="nearby-output"></div>
+  <h2><span class="live-dot"></span>实时日程</h2>
   <div id="map-frames"></div>
   <div class="map-legend" id="map-legend"></div>
   <div class="map-unclustered" id="map-unclustered"></div>
@@ -163,12 +135,11 @@
 <div id="chat">
   <div id="messages"></div>
   <div id="input-bar">
-    <input id="input" type="text" placeholder="跟编排 Agent 说点什么…" />
+    <input id="input" type="text" placeholder="跟编排 Agent 说点什么…（比如"帮我推荐一个澳门3日游"、"从大三巴出发逛2小时"）" />
     <button id="send">发送</button>
   </div>
 </div>
 
-<script src="/nearby.js"></script>
 <script>
 const messagesEl = document.getElementById("messages");
 const inputEl = document.getElementById("input");
@@ -548,7 +519,6 @@ async function refreshSchedule() {
   const res = await fetch("/trip");
   const trip = await res.json();
   renderSchedule(trip);
-  if (trip.nearby_plan) renderNearby(trip.nearby_plan);
 }
 
 async function sendMessage() {
@@ -570,7 +540,6 @@ async function sendMessage() {
     pendingEl.classList.remove("pending");
     pendingEl.textContent = data.chat_reply || data.error || "（没有回复）";
     renderWidgets(data.widgets);
-    if (data.nearby_plan) renderNearby(data.nearby_plan);
     await refreshSchedule();
   } catch (err) {
     pendingEl.classList.remove("pending");
@@ -592,7 +561,6 @@ async function restoreSession() {
     const data = await res.json();
     for (const message of data.messages) addMessage(message.role, message.content);
     renderWidgets(data.widgets || []);
-    if (data.nearby_plan) restoreNearby(data.nearby_plan);
     await refreshSchedule();
   } catch (err) {
     addMessage("assistant", "载入失败，请重新整理页面：" + err);

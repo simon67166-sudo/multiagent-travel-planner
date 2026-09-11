@@ -67,12 +67,12 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("test hotel", json.dumps(self.b.get("/trip").json))
         self.assertIn("test hotel", json.dumps(self.a.get("/trip").json))
 
-    def test_nearby_endpoints_return_gone(self):
+    def test_nearby_endpoints_removed(self):
         # 2026-09-14：nearby 并入了达人 Agent（content_agent.run(mode="nearby") +
-        # route_agent.schedule()），走 POST /chat 就行，这三个独立端点明确下线（501），
-        # 不再维护 nearby_planner.py 那套独立请求解析/校验/排班逻辑
-        self.assertEqual(self.a.post("/nearby-plan", json={"city": "香港"}).status_code, 501)
-        self.assertEqual(self.a.post("/nearby-weather", json={}).status_code, 501)
+        # route_agent.schedule()），走 POST /chat 就行。这三个独立端点连同独立表单前端
+        # 一起整个删掉了（不是先前那版短暂过渡期的 501 占位），路由已经不存在，404
+        self.assertEqual(self.a.post("/nearby-plan", json={"city": "香港"}).status_code, 404)
+        self.assertEqual(self.a.post("/nearby-weather", json={}).status_code, 404)
 
     def test_index_still_loads(self):
         self.assertEqual(self.a.get("/").status_code, 200)

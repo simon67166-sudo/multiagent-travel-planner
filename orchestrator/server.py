@@ -131,27 +131,6 @@ def chat():
 def validation_error(error):
     return jsonify({"error": str(error)}), 400
 
-# 2026-09-14：nearby 并入了达人 Agent（见 agents/content_agent.py mode="nearby" +
-# agents/route_agent.py 的 schedule()），走 POST /chat 就行，不用再单独规划请求/查天气。
-# 这三个端点连同 nearby_planner.py 一起被这次重构吸收了，独立表单前端（web/nearby.js）
-# 这版还没跟着改，先保留端点但明确返回"已下线"，不让老前端代码发请求后卡死等结果；
-# 前端改造是下一步，不在这次范围内。
-@app.get("/nearby.js")
-def nearby_script():
-    return app.response_class(
-        "console.warn('nearby.js 已下线：附近游现在走 /chat 聊天，不用这个独立表单了');",
-        mimetype="text/javascript",
-    )
-
-@app.post("/nearby-plan")
-def nearby_plan():
-    return jsonify({"error": "附近游已经并入 /chat 对话流程，直接在聊天框里说起点和时长就行，不用这个接口了"}), 501
-
-@app.post("/nearby-weather")
-def nearby_weather():
-    return jsonify({"error": "附近游已经并入 /chat 对话流程，天气会跟着排班结果一起返回，不用这个接口了"}), 501
-
-
 @app.post("/widget-response")
 def widget_response():
     payload = request.get_json(silent=True)
