@@ -88,6 +88,15 @@ _OVERFETCH_MULTIPLIER = 3  # 要让加权真的能把本地人帖子挤进 top_k
 # 必须比 top_k 多查一些候选再重新排序截断，不然 Chroma 已经按原始距离截到 top_k 了，加权无从谈起
 
 
+def _restore_metadata(post_id: str, metadata: dict) -> dict:
+    """把 Chroma 存的 metadata 还原成对外的帖子字典：反序列化 images_json/tags_json，
+    补上 post_id。query_similar_posts()/find_posts_by_place() 共用，别写两遍。"""
+    metadata = dict(metadata)
+    images = json.loads(metadata.pop("images_json", "[]") or "[]")
+    tags = json.loads(metadata.pop("tags_json", "[]") or "[]")
+    return {"post_id": post_id, "images": images, "tags": tags, **metadata}
+
+
 def query_similar_posts(persona_vector: list[float], top_k: int = 5, city: str | None = None) -> list[dict]:
     """
     第一阶段：按人格向量相似度找候选帖子，返回时带 similarity_score 和还原出来的 images/tags 列表。
@@ -109,23 +118,34 @@ def query_similar_posts(persona_vector: list[float], top_k: int = 5, city: str |
     metadatas = result["metadatas"][0]
     distances = result["distances"][0]
     for post_id, metadata, distance in zip(ids, metadatas, distances):
-        metadata = dict(metadata)
-        images = json.loads(metadata.pop("images_json", "[]") or "[]")
-        tags = json.loads(metadata.pop("tags_json", "[]") or "[]")
+        post = _restore_metadata(post_id, metadata)
         similarity_score = 1 / (1 + distance)  # 距离转相似度，公式后面按需调整
-        if metadata.get("verified_local"):
+        if post.get("verified_local"):
             similarity_score *= _VERIFIED_LOCAL_BOOST
-        posts.append(
-            {
-                "post_id": post_id,
-                "similarity_score": similarity_score,
-                "images": images,
-                "tags": tags,
-                **metadata,
-            }
-        )
+        post["similarity_score"] = similarity_score
+        posts.append(post)
     posts.sort(key=lambda p: p["similarity_score"], reverse=True)
     return posts[:top_k]
+
+
+def find_posts_by_place(place: str) -> list[dict]:
+    """
+    按地点名字精确匹配查社区帖子（Chroma metadata 过滤，不是向量相似度检索）——给达人 Agent
+    的"口碑复核"用（content_agent._nearby_plan()：查真实高德 POI 之后，看看社区库里有没有人
+    评价过这个地点）。找不到返回空列表，是正常情况：229 条帖子覆盖的地点有限，真实 POI 的名字
+    （比如"义顺牛奶公司(新马路分店)"）跟帖子里手打的地点名字（"义顺牛奶公司"）也经常对不上，
+    命中率本来就不高，调用方不能假设"没查到=这个地方不好"。
+
+    每条额外带 persona_vector 字段（帖子当初存进去的人格向量本身，不是 metadata，要显式
+    include=["embeddings"] 才拿得到）——口碑复核要拿它跟当前用户的人格向量算余弦相似度。
+    """
+    result = _community_collection.get(where={"place": place}, include=["metadatas", "embeddings"])
+    posts = []
+    for post_id, metadata, embedding in zip(result["ids"], result["metadatas"], result["embeddings"]):
+        post = _restore_metadata(post_id, metadata)
+        post["persona_vector"] = list(embedding) if embedding is not None else None
+        posts.append(post)
+    return posts
 
 
 def delete_post(post_id: str) -> None:

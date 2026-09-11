@@ -193,6 +193,23 @@ def compute_persona_vector(persona: dict, scenario: str) -> list[float]:
     return vector
 
 
+def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
+    """
+    两个人格向量之间的余弦相似度，取值 -1~1（这里的向量分量都非负，所以实际范围是 0~1），
+    1 表示完全一致。给达人 Agent 的"口碑复核"用（content_agent._nearby_plan()）：拿当前用户
+    的人格向量，跟"评价过某个地点的帖子"的人格向量比对，判断这条口碑跟当前用户合不合拍。
+    维度对不上（比如新旧词表版本混用）直接返回 0.0，当作"不匹配"处理，不抛异常。
+    """
+    if len(vector_a) != len(vector_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vector_a, vector_b))
+    norm_a = sum(a * a for a in vector_a) ** 0.5
+    norm_b = sum(b * b for b in vector_b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def _budget_score_from_avg_cost(avg_cost: float | None) -> float:
     """人均消费换算成 budget_score，粗略线性映射，不是精确定价模型：0 元 -> 0，250 元及以上封顶 1.0。"""
     if avg_cost is None:

@@ -6,6 +6,7 @@
 """
 
 import json
+import re
 from copy import deepcopy
 import sys
 from pathlib import Path
@@ -19,7 +20,6 @@ import llm_tool
 import persona
 import trip_plan
 import widgets
-import nearby_planner
 from agents import content_agent, exception_agent, ota_hotel_agent, route_agent, restaurant_agent
 
 # 跟 content_agent._extract_city 同一个"先跑起来，以后再换实体识别"的子串匹配思路，
@@ -33,6 +33,19 @@ def _extract_city(text: str) -> str | None:
         if city in text:
             return city
     return None
+
+
+_DAY_COUNT_PATTERN = re.compile(r"(\d+)\s*[日天]")
+
+
+def _extract_day_count(text: str) -> int:
+    """从用户消息里粗略提取"几天"（"3日游"/"5天"这种），提取不到默认 1 天。跟 _extract_city
+    同一个"先跑起来，以后再换实体识别"的子串/正则匹配思路，不是精确 NLP——"周末两天一夜"
+    这种口语化表达抓不到，会话按 1 天算，用户可以再补一句"排 2 天"之类的话调整。"""
+    match = _DAY_COUNT_PATTERN.search(text)
+    if match:
+        return max(1, min(int(match.group(1)), 14))  # 封顶 14 天，避免离谱输入把行程排炸
+    return 1
 
 
 _REPLAN_FOLLOWUP = "接下来是要我帮你补一个新的活动填上这段时间，还是把这一天/整个行程重新排一遍？"
@@ -86,8 +99,10 @@ def new_shared_state(user_id: str, scenario: str = "vacation", onboarding_answer
 # 意图识别：决定这轮对话要调用哪些子 Agent
 # ---------------------------------------------------------------------------
 _INTENT_SYSTEM_PROMPT = """你是一个旅游助手的意图识别模块。根据用户消息，判断需要调用下面哪些能力：
-- nearby: 港澳真实附近游、旅游攻略、周边餐厅/景点、行程与交通天气（包含修改之前的附近游计划）。这类问题优先只选 nearby；用户明确要求模拟餐厅才选 restaurant。
-- content: 景点或社区攻略推荐（非餐厅演示）
+- nearby: 以某个地标/地址为起点，就近逛几个小时（"从大三巴出发逛3小时"这种短途场景）。
+  跟 content 共用同一个候选推荐能力，只是不做人格检索、直接查真实起点附近；用户明确要求
+  模拟餐厅才选 restaurant。
+- content: 景点或社区攻略推荐（非餐厅演示、非"以某地标为起点逛几小时"的短途场景）
 - restaurant: 餐厅、饮食、餐饮预算或餐厅排队需求，包括前文餐饮需求的修改、追问与回忆。此技能只提供澳门模拟餐厅；其他城市餐饮问题也交给它说明资料限制。
 - route: 需要规划路线/行程安排
 - booking: 需要查酒店/机票/门票预订信息
@@ -127,23 +142,37 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
     history = deepcopy(shared_state.get("messages", []))
     intents = classify_intent(user_message, history)
 
-    if "nearby" in intents:
-        output, shared_state = nearby_planner.from_chat(user_message, shared_state)
-        shared_state["messages"] = history + [{"role": "user", "content": user_message}, {"role": "assistant", "content": output["chat_reply"]}]
-        return output, shared_state
-
     results: dict[str, Any] = {}
     if "restaurant" in intents:
         results["restaurant"] = restaurant_agent.run(user_message, shared_state)
-    if "content" in intents and "restaurant" not in intents:
-        results["content"] = content_agent.run(shared_state, location_hint=user_message)
-    if "route" in intents:
-        # 路线只用内容模块提供的候选，避免加入虚构占位点
-        places = [r["place"] for r in results.get("content", {}).get("recommendations", []) if r.get("place")] or None
-        if places:
-            results["route"] = route_agent.run(shared_state, places=places, city=shared_state.get("city", "澳门"))
-        else:
-            results["route"] = {"route": [], "note": "请先选择真实景点；澳门模拟餐厅不会加入地图。"}
+    if "nearby" in intents:
+        results["content"] = content_agent.run(shared_state, location_hint=user_message, mode="nearby")
+    elif "content" in intents and "restaurant" not in intents:
+        results["content"] = content_agent.run(shared_state, location_hint=user_message, mode="trip")
+
+    # mode="nearby" 解析不出起点/游览时长，达人 Agent 会直接给一句追问，整轮到此为止——
+    # 跟以前 nearby_planner.from_chat() 解析失败时的短路行为一致，不硬着头皮跑完剩下的分发
+    clarification = results.get("content", {}).get("clarification_needed")
+    if clarification:
+        shared_state["messages"] = history + [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": clarification},
+        ]
+        return {"chat_reply": clarification, "community_panel": [], "map_panel": {}, "widgets": [], "restaurant_evidence": []}, shared_state
+
+    if ("route" in intents or "nearby" in intents) and results.get("content", {}).get("recommendations"):
+        # 排时间统一走 route_agent.schedule()：nearby 命中就用达人 Agent 给的真实起点单日排班，
+        # 否则是常规多日行程分配（见 route_agent.py "schedule() -- 统一排时间接口"一节）
+        nearby_params = results["content"].get("nearby_params")
+        results["route"] = route_agent.schedule(
+            shared_state,
+            results["content"]["recommendations"],
+            city=shared_state.get("city", "澳门"),
+            mode="nearby" if nearby_params else "trip",
+            time_budget_days=1 if nearby_params else _extract_day_count(user_message),
+            hours=nearby_params["hours"] if nearby_params else None,
+            origin=nearby_params["origin"] if nearby_params else None,
+        )
     if "booking" in intents:
         # location=None 让 ota_hotel_agent 自己从 shared_state["city"] 兜底；
         # user_message 传原话给 hotel_tool 当真实查询意图描述，比关键词拼出来的更准

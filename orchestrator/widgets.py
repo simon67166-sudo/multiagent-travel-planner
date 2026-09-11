@@ -56,7 +56,7 @@ def build_post_list_widget(candidates: list[dict], top_k: int = 3, use_llm_reran
     想要更智能的二次筛选/文案可以传 use_llm_rerank=True。
     """
     selected = (
-        _llm_select(candidates, "post_id", top_k, "选出最值得展示给用户的帖子")
+        _llm_select(candidates, "place", top_k, "选出最值得展示给用户的帖子")
         if use_llm_rerank
         else candidates[:top_k]
     )
@@ -69,9 +69,13 @@ def build_attraction_picker_widget(
     """
     景点选择插件：从候选里选出 pool_size 个放进"可选池"，前端展示给用户勾选最多 max_select 个。
     选择结果由前端回传给 server.py 的 POST /widget-response 接口，不在这个函数里处理。
+
+    用 "place" 当 _llm_select 的校验 key，不是 "post_id"——2026-09-14 起 content_agent.run()
+    的候选有两种来源（社区帖子带 post_id，高德 POI 不带），"place" 是两种来源都有的字段，
+    换成它才不会让 POI 来源的候选在 LLM 精选这一步被静默漏掉。
     """
     pool = (
-        _llm_select(candidates, "post_id", pool_size, "选出最值得推荐用户挑选的景点")
+        _llm_select(candidates, "place", pool_size, "选出最值得推荐用户挑选的景点")
         if use_llm_rerank
         else candidates[:pool_size]
     )

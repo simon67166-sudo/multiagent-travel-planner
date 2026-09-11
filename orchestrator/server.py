@@ -36,8 +36,6 @@ from openai import OpenAIError
 import main
 import schedule_widgets
 import trip_plan
-import nearby_planner
-from datetime import datetime, timedelta
 from agents import route_agent
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -91,8 +89,6 @@ def get_session():
                     for m in state.get("messages", [])
                     if m.get("role") in ("user", "assistant") and m.get("content") and not m.get("tool_calls")]
         result = {"messages": messages, "widgets": state.get("pending_widgets", [])}
-        if state.get("nearby_plan"):
-            result["nearby_plan"] = state["nearby_plan"]
         return jsonify(result)
 
 @app.get("/")
@@ -115,8 +111,6 @@ def get_trip():
     rendered["trip_map"] = schedule_widgets.build_trip_map_widget(trip, city=state.get("city", _DEMO_CITY))
     rendered["day_timeline"] = schedule_widgets.build_day_timeline_widget(trip)
     rendered["booking_panel"] = schedule_widgets.build_booking_panel_widget(trip)
-    if state.get("nearby_plan"):
-        rendered["nearby_plan"] = state["nearby_plan"]
     return jsonify(rendered)
 
 
@@ -137,33 +131,25 @@ def chat():
 def validation_error(error):
     return jsonify({"error": str(error)}), 400
 
+# 2026-09-14：nearby 并入了达人 Agent（见 agents/content_agent.py mode="nearby" +
+# agents/route_agent.py 的 schedule()），走 POST /chat 就行，不用再单独规划请求/查天气。
+# 这三个端点连同 nearby_planner.py 一起被这次重构吸收了，独立表单前端（web/nearby.js）
+# 这版还没跟着改，先保留端点但明确返回"已下线"，不让老前端代码发请求后卡死等结果；
+# 前端改造是下一步，不在这次范围内。
 @app.get("/nearby.js")
 def nearby_script():
-    return app.response_class((_WEB_DIR / "nearby.js").read_text(encoding="utf-8"), mimetype="text/javascript")
+    return app.response_class(
+        "console.warn('nearby.js 已下线：附近游现在走 /chat 聊天，不用这个独立表单了');",
+        mimetype="text/javascript",
+    )
 
 @app.post("/nearby-plan")
 def nearby_plan():
-    payload = request.get_json(silent=True)
-    with session_store.edit(g.session_id, new_state) as state:
-        plan = nearby_planner.build_plan(payload)
-        reply = nearby_planner.plan_reply(plan)
-        state["nearby_plan"] = plan
-        state["city"] = plan["request"]["city"]
-        state.setdefault("messages", []).extend([
-            {"role": "user", "content": "规划附近游：" + plan["request"].get("location", "")},
-            {"role": "assistant", "content": reply}])
-    return jsonify({"nearby_plan": plan, "chat_reply": reply})
+    return jsonify({"error": "附近游已经并入 /chat 对话流程，直接在聊天框里说起点和时长就行，不用这个接口了"}), 501
 
 @app.post("/nearby-weather")
 def nearby_weather():
-    with session_store.edit(g.session_id, new_state) as state:
-        plan = state.get("nearby_plan")
-        if not plan:
-            return jsonify({"error": "请先建立港澳附近游行程"}), 400
-        req = plan["request"]
-        start = datetime.fromisoformat(req["date"] + "T" + req["start_time"])
-        plan["weather"] = nearby_planner.sources.weather(req["city"], plan["origin"], start, start + timedelta(hours=req["hours"]))
-    return jsonify({"weather": plan["weather"]})
+    return jsonify({"error": "附近游已经并入 /chat 对话流程，天气会跟着排班结果一起返回，不用这个接口了"}), 501
 
 
 @app.post("/widget-response")

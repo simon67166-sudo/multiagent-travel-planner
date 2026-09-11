@@ -67,17 +67,12 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("test hotel", json.dumps(self.b.get("/trip").json))
         self.assertIn("test hotel", json.dumps(self.a.get("/trip").json))
 
-    def test_nearby_plan_persists_without_overwriting_legacy_trip(self):
-        plan={"request":{"city":"香港"},"stops":[],"weather":{},"reminders":[]}
-        with patch("nearby_planner.build_plan",return_value=plan), patch("nearby_planner.plan_reply",return_value="nearby plan"):
-            response=self.a.post("/nearby-plan",json={"city":"香港"})
-        self.assertEqual(response.status_code,200)
-        self.assertEqual(self.a.get("/session").json["nearby_plan"],plan)
-        self.assertNotIn("nearby_plan",self.b.get("/session").json)
-
-    def test_nearby_bad_request(self):
-        self.assertEqual(self.a.post("/nearby-plan",json={"city":"杭州"}).status_code,400)
-        self.assertEqual(self.a.post("/nearby-weather",json={}).status_code,400)
+    def test_nearby_endpoints_return_gone(self):
+        # 2026-09-14：nearby 并入了达人 Agent（content_agent.run(mode="nearby") +
+        # route_agent.schedule()），走 POST /chat 就行，这三个独立端点明确下线（501），
+        # 不再维护 nearby_planner.py 那套独立请求解析/校验/排班逻辑
+        self.assertEqual(self.a.post("/nearby-plan", json={"city": "香港"}).status_code, 501)
+        self.assertEqual(self.a.post("/nearby-weather", json={}).status_code, 501)
 
     def test_index_still_loads(self):
         self.assertEqual(self.a.get("/").status_code, 200)
