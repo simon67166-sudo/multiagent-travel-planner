@@ -8,9 +8,10 @@ OTA/酒店 Agent -- 查库存/比价。
 关闭自助注册、Travelpayouts 要联盟审核+实时数据要求 5 万月活、FlightAPI.io 只有 20 次免费调用），
 没有真正免费的个人开发者可用来源，也明确决定不用爬虫方案（绕开正常接口抓商业网站数据，大概率
 违反对方服务条款，demo 用途也不例外）。折中方案：`_generate_beijing_flights()` 按真实通航航司/
-真实航班号格式/真实大致飞行时长，循环排出北京→港澳每小时一班的示例数据（具体班次是编的，不代表
-真实存在的某趟航班），至少比之前"上海虹桥→杭州萧山"这种跟港澳 demo 完全对不上的老占位数据靠谱
-一些。等 RollingGo 的机票 MCP 恢复（見文末待接事项）再换成真实数据。
+真实航班号格式/真实大致飞行时长，循环排出北京↔港澳每小时一班的**去程+回程**示例数据（具体班次
+是编的，不代表真实存在的某趟航班），价格按城市+航班号+日期做确定性伪随机浮动（同一天同一趟查
+多次价格一致，换天会不一样），至少比之前"上海虹桥→杭州萧山"这种跟港澳 demo 完全对不上、价格
+写死的老占位数据靠谱一些。等 RollingGo 的机票 MCP 恢复（見文末待接事项）再换成真实数据。
 
 字段补全到"确认预订后能直接落地"需要的程度（机票带 flight_no/from_/to/depart_time/arrive_time，
 酒店带 address/check_in/check_out）——这样 server.py 的 POST /widget-response 收到用户选中的候选后，
@@ -18,6 +19,7 @@ OTA/酒店 Agent -- 查库存/比价。
 check_in/check_out，格式 "开始日期~结束日期"。
 """
 
+import random
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -34,7 +36,8 @@ _DEFAULT_STAY_NIGHTS = 2
 # 上海虹桥→杭州萧山那种跟港澳 demo 完全对不上的老数据。价格/余票/具体班次是演示用途虚构值，不是
 # 实时报价——数据来源：2026-09-13 查了北京首都/大兴机场到香港/澳门的真实通航航司（国航/国泰/港航/
 # 海航 飞香港，南航/国航/东航 飞澳门）和大致飞行时长，航班号按真实航司二字码编号段编的示例号，
-# 循环这几家航司排出每小时一班，不代表某一趟具体真实航班。
+# 循环这几家航司排出每小时一班，不代表某一趟具体真实航班。去程/回程都有：同一批航司往返对飞，
+# 回程航班号按真实惯例是去程号 +1（比如去程 CA111，回程 CA112）。
 _ROUTE_AIRLINES = {
     "香港": [
         ("中国国际航空", "CA", 111, "北京首都国际机场"),
@@ -49,26 +52,46 @@ _ROUTE_AIRLINES = {
     ],
 }
 _ROUTE_DURATION_MIN = {"香港": 205, "澳门": 210}  # 约3小时25/30分钟，取自公开航线平均飞行时长
+_DESTINATION_AIRPORT = {"香港": "香港国际机场", "澳门": "澳门国际机场"}
 _FLIGHT_START_HOUR, _FLIGHT_END_HOUR = 7, 21  # 07:00-21:00，每小时一班
 
 
-def _generate_beijing_flights(city: str) -> list[dict]:
-    """按 _ROUTE_AIRLINES 循环排班，每小时一班；不是真实时刻表，是贴近真实航线的演示数据。"""
+def _flight_price(seed_key: str, hour: int) -> int:
+    """演示用虚构价格：拿 seed_key（城市+航班号+日期拼出来的字符串）做确定性伪随机浮动——
+    同一天同一趟航班查多次价格是同一个数（不会一刷新就变，像真出 bug 一样），换一天/换航班
+    就会不一样；叠加早晚高峰固定溢价。不是真实定价逻辑，纯粹让 demo 数据别每次都长一个样。"""
+    base = 1280 + random.Random(seed_key).randint(-150, 350)
+    return base + (270 if hour in (7, 8, 19, 20) else 0)
+
+
+def _generate_beijing_flights(city: str, on_date: str, direction: str) -> list[dict]:
+    """按 _ROUTE_AIRLINES 循环排班，每小时一班。direction="depart" 是北京→city（去程），
+    "return" 是 city→北京（回程）。不是真实时刻表，是贴近真实航线的演示数据。"""
     airlines = _ROUTE_AIRLINES.get(city)
     if not airlines:
-        return [{"airline": "中国东方航空", "flight_no": "MU5137", "from_": "上海虹桥国际机场", "depart_time": "08:00", "arrive_time": "10:10", "price": 890}]
+        depart = direction == "depart"
+        return [{
+            "airline": "中国东方航空", "flight_no": "MU5137" if depart else "MU5138",
+            "from_": "上海虹桥国际机场" if depart else city, "to": city if depart else "上海虹桥国际机场",
+            "depart_time": "08:00", "arrive_time": "10:10", "price": 890,
+        }]
 
     duration = _ROUTE_DURATION_MIN.get(city, 210)
+    dest_airport = _DESTINATION_AIRPORT.get(city, city)
     routes = []
     for i, hour in enumerate(range(_FLIGHT_START_HOUR, _FLIGHT_END_HOUR + 1)):
-        name, code, base_no, airport = airlines[i % len(airlines)]
-        flight_no = f"{code}{base_no + (i // len(airlines)) * 2}"  # 同航司每循环一轮航班号 +2，仿真实编号习惯
+        name, code, base_no, bjs_airport = airlines[i % len(airlines)]
+        seq = base_no + (i // len(airlines)) * 2 + (1 if direction == "return" else 0)
+        flight_no = f"{code}{seq}"
         depart_time = f"{hour:02d}:00"
         arrive_total_min = hour * 60 + duration
         arrive_time = f"{(arrive_total_min // 60) % 24:02d}:{arrive_total_min % 60:02d}"
-        peak = hour in (7, 8, 19, 20)  # 早晚高峰价格略高，纯演示效果，不是真实定价逻辑
-        price = (1550 if peak else 1280) + (i % 3) * 60
-        routes.append({"airline": name, "flight_no": flight_no, "from_": airport, "depart_time": depart_time, "arrive_time": arrive_time, "price": price})
+        price = _flight_price(f"{city}-{flight_no}-{on_date}", hour)
+        from_airport, to_airport = (bjs_airport, city) if direction == "depart" else (dest_airport, bjs_airport)
+        routes.append({
+            "airline": name, "flight_no": flight_no, "from_": from_airport, "to": to_airport,
+            "depart_time": depart_time, "arrive_time": arrive_time, "price": price,
+        })
     return routes
 
 
@@ -139,15 +162,16 @@ def run(
 
     hotel_candidates, hotel_error = _search_real_hotels(city, check_in, check_out, nights, category, user_message)
 
-    flight_date = check_in or (date.today() + timedelta(days=1)).isoformat()
-    routes = _generate_beijing_flights(city)
+    # 去程用入住日期，回程用离店日期——往返机票配对，不是只有单程
+    depart_date = check_in or (date.today() + timedelta(days=1)).isoformat()
+    return_date = check_out or (datetime.fromisoformat(depart_date).date() + timedelta(days=nights)).isoformat()
     flight_candidates = [
         {
-            "name": f"{r['flight_no']} {r['from_']}→{city}",
+            "name": f"{r['flight_no']} {r['from_']}→{r['to']}",
             "flight_no": r["flight_no"],
             "from_": r["from_"],
-            "to": city,
-            "date": flight_date,
+            "to": r["to"],
+            "date": on_date,
             "depart_time": r["depart_time"],
             "arrive_time": r["arrive_time"],
             "status": "on_time",
@@ -156,7 +180,8 @@ def run(
             "rating": 4.6,
             "provider_type": "flight",
         }
-        for r in routes
+        for direction, on_date in (("depart", depart_date), ("return", return_date))
+        for r in _generate_beijing_flights(city, on_date, direction)
     ]
 
     result = {"candidates": flight_candidates + hotel_candidates}
