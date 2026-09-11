@@ -35,6 +35,29 @@ def _extract_city(text: str) -> str | None:
     return None
 
 
+_REPLAN_FOLLOWUP = "接下来是要我帮你补一个新的活动填上这段时间，还是把这一天/整个行程重新排一遍？"
+
+
+def _handle_cancel(shared_state: dict, user_message: str) -> dict:
+    """
+    cancel 意图命中时调用：用户这句话本身就是"确认要删"，不用再走 exception_agent 那套
+    "先提案、等确认"的流程——直接复用 exception_agent.run() 的子串匹配去定位行程里跟消息
+    对得上的地点名字，找到了就立刻调 exception_agent.apply_adjustment() 真删。
+
+    返回 {"cancelled": [真删掉的节点], "found": bool}，"found" 为 False 说明消息里没匹配到
+    行程里任何一个真实地点名字，调用方据此给用户一个诚实的"没找到"回复，不假装删了。
+    """
+    detection = exception_agent.run(shared_state, event_type="cancel_request", event_detail=user_message)
+    affected_places = detection["affected_locations"]
+    if not affected_places:
+        return {"cancelled": [], "found": False}
+
+    cancelled: list[dict] = []
+    for place in affected_places:
+        cancelled.extend(exception_agent.apply_adjustment(shared_state, place)["cancelled"])
+    return {"cancelled": cancelled, "found": bool(cancelled)}
+
+
 # ---------------------------------------------------------------------------
 # 共享状态：编排 Agent 维护，子 Agent 按需读写
 # ---------------------------------------------------------------------------
@@ -68,7 +91,8 @@ _INTENT_SYSTEM_PROMPT = """你是一个旅游助手的意图识别模块。根�
 - restaurant: 餐厅、饮食、餐饮预算或餐厅排队需求，包括前文餐饮需求的修改、追问与回忆。此技能只提供澳门模拟餐厅；其他城市餐饮问题也交给它说明资料限制。
 - route: 需要规划路线/行程安排
 - booking: 需要查酒店/机票/门票预订信息
-- exception: 用户在问天气/航班延误等突发情况的应对
+- exception: 用户在问天气/航班延误等突发情况的应对，还没确定要不要调整行程（只是了解情况）
+- cancel: 用户明确要求把行程里已经排好的某个地点/活动删掉、取消（不是在问外部情况，是直接下达删除指令，比如"把西湖那站删了"/"取消灵隐寺"）
 
 只输出 JSON 数组，元素是上面几个 key 里符合的（可以多选），不要输出其他任何文字。
 例：["content", "route"]
@@ -90,7 +114,7 @@ def classify_intent(user_message: str, history: list[dict] | None = None) -> lis
         intents = json.loads(clean)
         if not isinstance(intents, list):
             return []
-        return [key for key in ("nearby", "content", "restaurant", "route", "booking", "exception") if key in intents]
+        return [key for key in ("nearby", "content", "restaurant", "route", "booking", "exception", "cancel") if key in intents]
     except Exception:
         # 意图识别没解析出来就退化成"只聊天"，不调用任何子 Agent
         return []
@@ -133,8 +157,11 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
         city = _extract_city(user_message)
         if city:
             results["exception"]["weather_check"] = exception_agent.check_weather(shared_state, city)
+    if "cancel" in intents:
+        # 用户直接下达删除指令，这里是真执行（不是提案），见 _handle_cancel() 说明
+        results["cancel"] = _handle_cancel(shared_state, user_message)
 
-    # route_agent 更新行程；HTTP 层只在整轮成功后保存完整状态
+    # route_agent/cancel 都更新行程；HTTP 层只在整轮成功后保存完整状态
 
     # 展示插件：candidates 直接复用 content_agent 已经算好、排过序的真实推荐结果，
     # 插件只管挑/展示，不重新跑检索逻辑（详见 widgets.py 顶部的设计说明）。
@@ -164,6 +191,17 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
             weather_check = results["exception"].get("weather_check")
             if weather_check and weather_check.get("has_warning"):
                 reply += "\n" + weather_check["suggested_adjustment"]
+        if "booking" in results:
+            reply += "\n已附上查询候选卡片；尚未进行实际预订。"
+    elif "cancel" in results:
+        # cancel 是真执行动作，回复用固定模板拼，不交给 LLM 生成——确认文案跟实际有没有真删掉
+        # 必须完全对得上，不能有半点"是不是真删了"的不确定性
+        cancel_result = results["cancel"]
+        if cancel_result["found"]:
+            names = "、".join(c["place"] for c in cancel_result["cancelled"])
+            reply = f"已经把「{names}」从行程里删掉了。{_REPLAN_FOLLOWUP}"
+        else:
+            reply = "没有在你的行程里找到匹配的地点，可能已经不在行程里了，能再确认一下具体是哪一站吗？"
         if "booking" in results:
             reply += "\n已附上查询候选卡片；尚未进行实际预订。"
     else:
