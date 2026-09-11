@@ -138,6 +138,47 @@ def patch_stop(day_plan: dict, node_id: str, **fields: Any) -> None:
     day_plan["nodes"][node_id].update(fields)
 
 
+def cancel_stop_by_id(trip_plan: dict, node_id: str) -> dict | None:
+    """
+    按 node_id 取消日程里的一个节点，调用方不用先自己找是哪一天——遍历所有天定位到
+    node_id 所在的 day_plan 再删。找不到返回 None；找到了返回被删掉的节点内容
+    （多了 date/node_id 两个字段），方便调用方把"取消了什么"回复给用户。
+
+    给编排 Agent 用：异常应变 Agent 的提案（见 agents/exception_agent.py）只负责发现
+    "可能受影响的节点"，不直接执行；用户确认要取消之后，编排 Agent 拿着 node_id 调这个
+    函数才是真正的执行动作。
+    """
+    for day_date, day_plan in trip_plan["days"].items():
+        if node_id in day_plan["nodes"]:
+            removed = dict(day_plan["nodes"][node_id])
+            remove_stop(day_plan, node_id)
+            removed["date"] = day_date
+            removed["node_id"] = node_id
+            return removed
+    return None
+
+
+def cancel_stops_by_place(trip_plan: dict, place: str) -> list[dict]:
+    """
+    按地点名字（精确匹配 place 字段）取消日程里所有同名节点，可能跨天/命中多个，返回
+    被删掉的节点列表（每条带 date/node_id）。
+
+    给编排 Agent 用：exception_agent.run()/check_weather() 提案里的 affected_locations
+    是地点名字（不是 node_id），用户确认要取消之后，编排 Agent 拿着这些地点名字调这个
+    函数执行——跟 cancel_stop_by_id() 是同一类"确认后执行"接口，按场景选用哪个。
+    """
+    removed = []
+    for day_date, day_plan in trip_plan["days"].items():
+        matched_ids = [nid for nid, node in day_plan["nodes"].items() if node.get("place") == place]
+        for nid in matched_ids:
+            node = dict(day_plan["nodes"][nid])
+            remove_stop(day_plan, nid)
+            node["date"] = day_date
+            node["node_id"] = nid
+            removed.append(node)
+    return removed
+
+
 def day_stops(day_plan: dict) -> list[dict]:
     """把链表还原成有序数组，供渲染/地图面板使用。"""
     stops = []

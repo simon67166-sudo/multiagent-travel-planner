@@ -1,12 +1,16 @@
 """
-异常应变 Agent -- 提案制：两条独立路径都只评估、不执行，返回结果里 requires_confirmation
-恒为 True，谁都不直接碰 trip_plan。真正"用户确认后执行调整"的接口还没做（见
-docs/orchestrator-guide.md"待接事项"），编排 Agent 目前只负责把提案说给用户听。
+异常应变 Agent -- 提案制：run()/check_weather() 两条评估路径都只评估、不执行，返回结果里
+requires_confirmation 恒为 True，谁都不直接碰 trip_plan。apply_adjustment() 才是"用户确认后
+真正执行"的那一步（2026-09-14 补上，之前只有评估、没有执行）。
 
 1. run()：按地点名字匹配 trip_plan 里的行程节点（纯子串匹配，event_detail 是用户整句话，
    event_verified 恒为 False——纯粹是"消息里提到了这个地名"，没有验证过是不是真的发生了）
 2. check_weather()：真查 weather_tool.py（和风天气灾害预警），event_verified 恒为 True——
    跟 run() 的关键区别是这条数据来自真实 API，不是靠子串猜的，但一样不自动改行程
+3. apply_adjustment()：用户明确确认之后，编排 Agent 拿着 affected_locations 里的地点名字
+   调这个，才会真的从 trip_plan 里删掉对应节点——什么时候该调这个（怎么判断"用户确认了"）
+   还没接进 orchestrate()，见 docs/orchestrator-guide.md"待接事项"，这里只是先把执行接口
+   准备好
 
 模型档位：架构文档里说是"中等模型"，目前只有 llm_tool.MODEL_FULL/MODEL_LIGHT 两档，先待定。
 """
@@ -18,6 +22,7 @@ _ORCHESTRATOR_DIR = Path(__file__).resolve().parent.parent
 if str(_ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR_DIR))
 
+import trip_plan
 import weather_tool
 
 # 和风天气 severity 取值的严重程度排序，数字越大越严重
@@ -81,10 +86,22 @@ def check_weather(shared_state: dict, city: str) -> dict:
     }
 
 
+def apply_adjustment(shared_state: dict, place: str) -> dict:
+    """
+    用户确认之后真正执行：把行程里跟 place 同名的节点删掉（可能跨天/命中多个）。
+    place 通常就是 run()/check_weather() 提案里 affected_locations 的某一项——
+    提案阶段只是"发现了同名节点"，不删；这里才是真删。
+
+    返回 {"cancelled": [被删节点列表，每条带 date/node_id], "count": 数量}；
+    count=0 说明没找到匹配的节点（比如提案之后用户自己又改过行程），不算错误，
+    调用方（编排 Agent）可以据此告诉用户"没找到这个地点，可能已经不在行程里了"。
+    """
+    cancelled = trip_plan.cancel_stops_by_place(shared_state["trip_plan"], place)
+    return {"cancelled": cancelled, "count": len(cancelled)}
+
+
 if __name__ == "__main__":
     import json
-
-    import trip_plan
 
     demo_trip = trip_plan.new_trip_plan("exception-agent-demo-trip")
     demo_day = trip_plan.get_or_create_day(demo_trip, "day-1")
@@ -93,6 +110,11 @@ if __name__ == "__main__":
 
     result = run(demo_shared_state, event_type="closure", event_detail="西湖今天临时封闭了")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    print("--- apply_adjustment 自测：用户确认后真的把西湖删掉 ---")
+    apply_result = apply_adjustment(demo_shared_state, "西湖")
+    print(json.dumps(apply_result, ensure_ascii=False, indent=2))
+    print("确认行程里没有西湖了：", trip_plan.day_stops(demo_day))
 
     print("--- check_weather 自测（真实调用和风天气 API，用一个当前有真实预警的城市）---")
     weather_result = check_weather(demo_shared_state, "海口")

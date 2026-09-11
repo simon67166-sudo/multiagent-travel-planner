@@ -167,14 +167,19 @@ orchestrator/
 
 ## agents/exception_agent.py -- 异常应变 Agent
 
-**职责**：**提案制**（2026-09-11 合并 fellow 的 `codex/integrate-travel-guardian` 分支后定型）——两条路径都只评估、不执行，`requires_confirmation` 恒为 `True`，谁都不直接碰 `trip_plan`。真正"用户确认后执行调整"的接口还没做（见文末"待接事项"）。模型档位架构文档里写的是"中等模型"，目前只有 `MODEL_FULL`/`MODEL_LIGHT` 两档，先待定。
+**职责**：**提案制**（2026-09-11 合并 fellow 的 `codex/integrate-travel-guardian` 分支后定型）——`run()`/`check_weather()` 两条评估路径都只评估、不执行，`requires_confirmation` 恒为 `True`，谁都不直接碰 `trip_plan`；`apply_adjustment()`（2026-09-14 新增）才是"用户确认后真正执行"的那一步。模型档位架构文档里写的是"中等模型"，目前只有 `MODEL_FULL`/`MODEL_LIGHT` 两档，先待定。
 
 | 函数 | 作用 |
 |---|---|
 | `run(shared_state, event_type, event_detail=None)` | 按地点名字匹配 `trip_plan` 里的行程节点（纯子串匹配，`event_detail` 是用户整句话），命中就列进 `affected_locations`，**不删**。`event_verified` 恒为 `False`——纯粹是"消息里提到了这个地名"，没有验证过是不是真的发生了 |
 | `check_weather(shared_state, city)` | **真查** `weather_tool.py`（和风天气灾害预警），不依赖用户有没有主动提到天气——只要能确定城市就查真实数据。`event_verified` 恒为 `True`：跟 `run()` 的关键区别是这条数据来自真实 API，不是子串猜的，但一样不自动改行程 |
+| `apply_adjustment(shared_state, place)` | **真删**：按地点名字（精确匹配，通常就是前两个函数提案里 `affected_locations` 的某一项）从 `trip_plan` 里删掉对应节点，可能跨天/命中多个。返回 `{"cancelled": [...], "count": N}`，`count=0` 不算错误，可能是提案之后行程又被改过 |
 
-两个函数返回同一套契约：`has_warning`/`needs_replan`/`requires_confirmation`/`event_verified`/`suggested_adjustment`（`run()` 版本另外还有 `affected_locations`）。
+`run()`/`check_weather()` 返回同一套评估契约：`has_warning`/`needs_replan`/`requires_confirmation`/`event_verified`/`suggested_adjustment`（`run()` 版本另外还有 `affected_locations`）。`apply_adjustment()` 是单独一套"执行结果"契约，不跟评估契约混在一起。
+
+`apply_adjustment()` 底层调的是 `trip_plan.py` 新增的两个函数：`cancel_stop_by_id(trip_plan, node_id)`（按 node_id 精确删一个）和 `cancel_stops_by_place(trip_plan, place)`（按地点名字删，可能命中多个）——这两个是对 `trip_plan.remove_stop(day_plan, node_id)` 的封装，调用方不用自己先找是哪一天，直接传整个 `trip_plan` 和 node_id/地点名字就行。
+
+**这个函数目前没有被 `orchestrate()` 调用**——"怎么判断用户确认了、什么时候该调 `apply_adjustment()`"这个触发逻辑还没接（见文末"待接事项"），2026-09-14 这次只是先把"执行"这个接口本身准备好，方便编排 Agent 以后调用。
 
 `check_weather()` 的行为：
 - 有真实预警，`needs_replan` 会不会标 `True` 取决于预警等级（`severity`）够不够到 `severe`/`extreme`（常量 `_NEEDS_REPLAN_SEVERITY`）——但**不管等级多高都不会自动改 `trip_plan`**，这只是给编排 Agent 一个"要不要用更急迫的语气跟用户说"的信号，不是执行开关（2026-09-11 之前的版本在 `severe`/`extreme` 时会自动清空当天行程，合并 fellow 分支时改掉了，统一成提案制）
@@ -370,12 +375,14 @@ trip_plan = {
 | `add_flight` / `add_hotel` / `add_weather_alert` | 往对应列表追加一条记录 |
 | `get_or_create_day(trip_plan, date)` | 拿到某天的 `day_plan`，不存在就新建 |
 | `add_stop(day_plan, node_id, type_, place, arrival_transport, arrival_time, end_time, after_id=None, **extra)` | 插入一个节点，`after_id=None` 插到最前面，否则插到该节点后面 |
-| `remove_stop(day_plan, node_id)` | 删除节点，自动重连前后节点（异常应变 Agent 常用，比如景点临时关闭） |
+| `remove_stop(day_plan, node_id)` | 删除节点，自动重连前后节点。低层原语，调用方要先自己找到 `day_plan` |
+| `cancel_stop_by_id(trip_plan, node_id)` | 2026-09-14 新增：按 node_id 删节点，不用先自己找是哪一天——遍历 `trip_plan["days"]` 定位到再删，返回被删节点内容（带 `date`/`node_id`）或 `None` |
+| `cancel_stops_by_place(trip_plan, place)` | 2026-09-14 新增：按地点名字（精确匹配）删节点，可能跨天/命中多个，返回被删节点列表。这两个是 `remove_stop()` 的高层封装，给 `exception_agent.apply_adjustment()` 用，也是编排 Agent"确认后执行"时应该调的接口，不建议跳过封装直接调 `remove_stop()` |
 | `patch_stop(day_plan, node_id, **fields)` | 只改某个节点的部分字段，不动链表结构 |
 | `day_stops(day_plan)` | 把链表还原成有序数组，渲染/地图面板用 |
 | `render(trip_plan)` | 汇总成最终展示结构（`flights`/`hotels`/`weather_alerts`/`days`，每天的 `stops` 已经是有序数组） |
 
-**现状**：已经接进 `main.py` 的 `shared_state["trip_plan"]`，`agent_route` 会往里面加节点、`agent_exception` 会删节点/记天气异常。目前所有节点都写进同一个占位日期 `"day-1"`（`main.py` 里的 `_PLACEHOLDER_DAY`），还没做真正的多日期规划。
+**现状**：已经接进 `main.py` 的 `shared_state["trip_plan"]`，`route_agent` 会往里面加节点。`exception_agent` 现在是提案制，不会自己删节点——真要删得靠编排 Agent 调 `exception_agent.apply_adjustment()`（内部调 `cancel_stops_by_place()`），但这一步还没接进 `orchestrate()`（见"待接事项"）。目前所有节点都写进同一个占位日期 `"day-1"`（`main.py` 里的 `_PLACEHOLDER_DAY`），还没做真正的多日期规划。
 
 ---
 
@@ -475,6 +482,6 @@ python orchestrator/server.py
 8. 讨论过的其他 widget 想法还没做：反馈评分插件、异常变更确认插件、人格问卷引导插件
 9. ~~单会话全局 state~~ 已解决：合并 fellow 分支后改成 `session_store.py`（按浏览器 cookie 隔离，SQLite 存档），仍然是单进程本地 demo，没有登录/账号体系，但至少不同浏览器/不同人打开不会互相覆盖状态了
 10. 港澳达人数据库（229 条，见 `standardize_hk_macau_data.py` 一节）已经标准化+导入 Chroma，`verified_local` 优先加权、`city` 硬过滤（`content_agent._extract_city()` 子串匹配）都接上了并真实验证过（问香港只出香港、问澳门只出澳门）；但避坑类帖子的人格向量是中性默认值、`category`（饮食/景点/Tips）字段还没用来做精细过滤，这两个属于两阶段检索第二阶段（第4条）的范畴
-11. **`exception_agent` 提案制的"确认后执行"接口还没做**（2026-09-11 合并 fellow 分支时明确的缺口）：`run()`/`check_weather()` 现在都只返回评估结果，`requires_confirmation` 恒为 `True`，但没有任何代码在用户回复"确认"/"好的删掉"之后真的去调 `trip_plan.remove_stop()` 或把真实预警写进 `weather_alerts`。大概方向：`shared_state` 里加一个 `pending_proposal` 字段存最近一次未确认的提案，靠下一轮意图识别或简单的确认/取消关键词触发一个新的 `apply_adjustment()` 去执行
+11. **~~`exception_agent` 提案制的"确认后执行"接口还没做~~ 接口本身已解决（2026-09-14）**：新增 `exception_agent.apply_adjustment(shared_state, place)` + `trip_plan.cancel_stop_by_id()`/`cancel_stops_by_place()`，编排 Agent 拿着提案里的地点名字调这个就能真删节点，已用真实数据自测过。**但触发逻辑还没接**：`orchestrate()` 里没有任何代码会在用户回复"确认"/"好的删掉"之后去调 `apply_adjustment()`——还是原来那句话，`shared_state` 里加一个 `pending_proposal` 字段存最近一次未确认的提案，靠下一轮意图识别或简单的确认/取消关键词触发调用，这部分设计还没定，需要先讨论；也没有把真实预警写进 `weather_alerts` 这一步（提案制故意不在评估阶段写，见 `exception_agent.py` 一节，`apply_adjustment()` 目前也只删节点、不写 `weather_alerts`，要不要在确认执行时一并写，是留到接触发逻辑时一起定的点）
 12. ~~两套独立天气数据源~~ 已解决（2026-09-12）：`nearby_sources.weather()` 原来接的是 Open-Meteo，现在改成统一用 `weather_tool.get_hourly_forecast()`（和风天气逐小时预报，免费版最多查 240 小时=10 天），跟 `exception_agent.check_weather()` 用的灾害预警接口共用同一个 key/host。`nearby_sources.summarize_weather()` 的输入契约也跟着换了（从 Open-Meteo 那种 `{"hourly": {"time": [...], "temperature_2m": [...], ...}}` 嵌套结构，改成扁平的 `[{"time":, "temperature_c":, "rain_probability":, "condition_text":}, ...]` 列表），判断"是否有雷暴"从匹配 Open-Meteo 的数值天气码（`weather_code>=95`）改成直接检查和风天气返回的 `condition_text` 里有没有"雷"字，更直观也不用记一张码表。真实限制：预报范围从 Open-Meteo 的 16 天缩到了 10 天，超出范围会走"选定日期不在预报范围内"的降级提示，不会报错崩溃
 13. **`orchestrate()` 没有从用户消息里提取日期给 `ota_hotel_agent.run()`**（2026-09-13 接入真实酒店数据后端到端测试时发现，之前是假数据看不出这个问题）：不管用户说"9月20号"还是别的日期，`booking` 意图命中时传给 `run()` 的 `date_range` 永远是 `None`，酒店查询永远默认"明天起 2 晚"。真实测试里 LLM 最后组句时诚实地发现了这个落差并跟用户说明（防幻觉提示词生效了），但功能上确实没做到"按用户说的日期查"。修法待定，两个方向：简单加一段日期正则/关键词提取；或者扩展 `classify_intent` 顺带做结构化实体抽取（日期/星级/预算这些一起解决），需要先定思路
