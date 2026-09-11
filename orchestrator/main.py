@@ -15,11 +15,11 @@
 import json
 
 import persona
-import store
 import trip_plan
 from agents.orchestrator_agent import new_shared_state, orchestrate  # noqa: F401  (re-export 给 server.py 用)
 
 if __name__ == "__main__":
+    import store
     # 先造 demo 用户的 persona，再往社区库里塞一条"跟他很像的人"发的帖子，
     # 这样 content_agent 才有真实候选可查（不是空的）。
     onboarding_answers = {

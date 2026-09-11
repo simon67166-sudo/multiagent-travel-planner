@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 ~$数据库原始.xlsx
 .claude/settings.local.json
+
+# Local credentials and conversation state
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite*

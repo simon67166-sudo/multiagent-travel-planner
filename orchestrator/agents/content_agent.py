@@ -14,7 +14,6 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR_DIR))
 
 import persona
-import store
 
 # 港澳达人数据库目前只有这两个城市（见 import_hk_macau_data.py）；杭州那批老 demo 数据没有
 # city 字段，不在这个列表里也不受影响——_extract_city 匹配不到就返回 None，不做城市过滤。
@@ -40,6 +39,7 @@ def run(shared_state: dict, location_hint: str, top_k: int = 3) -> dict:
         字段的老数据）；
     (2) 留给"内容相关性排序"（两阶段检索第二阶段）用，那部分排序算法还没实现。
     """
+    import store
     vector = persona.compute_persona_vector(shared_state["persona"], shared_state["scenario"])
     city = _extract_city(location_hint)
     posts = store.query_similar_posts(vector, top_k=top_k, city=city)
@@ -71,6 +71,7 @@ def run(shared_state: dict, location_hint: str, top_k: int = 3) -> dict:
 
 
 if __name__ == "__main__":
+    import store
     import json
 
     demo_persona = persona.bootstrap_from_onboarding(

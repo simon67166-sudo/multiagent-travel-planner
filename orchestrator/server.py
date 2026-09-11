@@ -3,7 +3,7 @@
 给 web/index.html 这个前端页面调用（左：实时日程，右：聊天框）。
 
 范围说明：
-- 只做单会话的本地 demo（一个进程内全局 shared_state，没有登录/多用户/并发处理），
+- SQLite 保存独立浏览器会话；单进程本地 demo，尚未提供帐号登入或多进程并发控制，
   仅供本地开发/演示用，不要直接这样部署到公网。
 - 前端 -> 后端三个接口：
     GET  /trip           拿当前完整行程（含 schedule_widgets 的地图/时间线/机票酒店面板数据）
@@ -27,11 +27,17 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
+from uuid import uuid4
+import re
+from session_store import SessionStore
+from openai import OpenAIError
 
 import main
 import schedule_widgets
 import trip_plan
+import nearby_planner
+from datetime import datetime, timedelta
 from agents import route_agent
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -49,18 +55,53 @@ _DEMO_ONBOARDING_ANSWERS = {
     "taste": ["江浙菜"],
     "novelty_score": 0.3,
 }
-_DEMO_CITY = "杭州"
+_DEMO_CITY = "澳门"
 
-_state = main.new_shared_state(
-    "web-demo-user", scenario="vacation", onboarding_answers=_DEMO_ONBOARDING_ANSWERS
-)
+session_store = SessionStore()
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
+@app.before_request
+def identify_session():
+    candidate = request.cookies.get("travel_session", "")
+    g.session_id = candidate if re.fullmatch(r"[0-9a-f]{32}", candidate) else uuid4().hex
+
+@app.after_request
+def persist_session_cookie(response):
+    response.set_cookie("travel_session", g.session_id, max_age=30 * 86400,
+                        httponly=True, samesite="Lax", secure=request.is_secure)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+def new_state():
+    state = main.new_shared_state(g.session_id, scenario="vacation",
+                                  onboarding_answers=_DEMO_ONBOARDING_ANSWERS)
+    state["city"] = _DEMO_CITY
+    return state
+
+@app.errorhandler(RuntimeError)
+@app.errorhandler(OpenAIError)
+def model_error(error):
+    # 不把模型服务商的原始响应体/key/prompt 内容暴露给前端
+    return jsonify({"error": "模型或工具暂时无法完成，本轮未保存，请重试。"}), 502
+
+@app.get("/session")
+def get_session():
+    with session_store.edit(g.session_id, new_state) as state:
+        messages = [{"role": m["role"], "content": m["content"]}
+                    for m in state.get("messages", [])
+                    if m.get("role") in ("user", "assistant") and m.get("content") and not m.get("tool_calls")]
+        result = {"messages": messages, "widgets": state.get("pending_widgets", [])}
+        if state.get("nearby_plan"):
+            result["nearby_plan"] = state["nearby_plan"]
+        return jsonify(result)
 
 @app.get("/")
 def index():
     html = (_WEB_DIR / "index.html").read_text(encoding="utf-8")
     # 高德 JS API key 不写进 index.html 明文（那个文件是要提交进 git 的），
     # 用占位符 + 服务端渲染时注入，key 本身留在 .env 里（已 gitignore）。
+    if not os.environ.get("AMAP_JS_KEY"):
+        html = html.replace('<script src="https://webapi.amap.com/maps?v=2.0&key=__AMAP_JS_KEY__"></script>', "")
     html = html.replace("__AMAP_JS_KEY__", os.environ.get("AMAP_JS_KEY", ""))
     html = html.replace("__AMAP_JS_SECURITY_CODE__", os.environ.get("AMAP_JS_SECURITY_CODE", ""))
     return html
@@ -68,44 +109,93 @@ def index():
 
 @app.get("/trip")
 def get_trip():
-    trip = _state["trip_plan"]
+    state = session_store.load(g.session_id) or new_state()
+    trip = state["trip_plan"]
     rendered = trip_plan.render(trip)
-    rendered["trip_map"] = schedule_widgets.build_trip_map_widget(trip, city=_DEMO_CITY)
+    rendered["trip_map"] = schedule_widgets.build_trip_map_widget(trip, city=state.get("city", _DEMO_CITY))
     rendered["day_timeline"] = schedule_widgets.build_day_timeline_widget(trip)
     rendered["booking_panel"] = schedule_widgets.build_booking_panel_widget(trip)
+    if state.get("nearby_plan"):
+        rendered["nearby_plan"] = state["nearby_plan"]
     return jsonify(rendered)
 
 
 @app.post("/chat")
 def chat():
-    payload = request.get_json(force=True, silent=True) or {}
-    message = (payload.get("message") or "").strip()
-    if not message:
-        return jsonify({"error": "message 不能为空"}), 400
-
-    output, _ = main.orchestrate(message, _state)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("message"), str):
+        return jsonify({"error": "message 必须是文字"}), 400
+    message = payload["message"].strip()
+    if not message or len(message) > 8000:
+        return jsonify({"error": "message 长度必须是 1 到 8000 字"}), 400
+    with session_store.edit(g.session_id, new_state) as state:
+        output, _ = main.orchestrate(message, state)
     return jsonify(output)
+
+
+@app.errorhandler(ValueError)
+def validation_error(error):
+    return jsonify({"error": str(error)}), 400
+
+@app.get("/nearby.js")
+def nearby_script():
+    return app.response_class((_WEB_DIR / "nearby.js").read_text(encoding="utf-8"), mimetype="text/javascript")
+
+@app.post("/nearby-plan")
+def nearby_plan():
+    payload = request.get_json(silent=True)
+    with session_store.edit(g.session_id, new_state) as state:
+        plan = nearby_planner.build_plan(payload)
+        reply = nearby_planner.plan_reply(plan)
+        state["nearby_plan"] = plan
+        state["city"] = plan["request"]["city"]
+        state.setdefault("messages", []).extend([
+            {"role": "user", "content": "规划附近游：" + plan["request"].get("location", "")},
+            {"role": "assistant", "content": reply}])
+    return jsonify({"nearby_plan": plan, "chat_reply": reply})
+
+@app.post("/nearby-weather")
+def nearby_weather():
+    with session_store.edit(g.session_id, new_state) as state:
+        plan = state.get("nearby_plan")
+        if not plan:
+            return jsonify({"error": "请先建立港澳附近游行程"}), 400
+        req = plan["request"]
+        start = datetime.fromisoformat(req["date"] + "T" + req["start_time"])
+        plan["weather"] = nearby_planner.sources.weather(req["city"], plan["origin"], start, start + timedelta(hours=req["hours"]))
+    return jsonify({"weather": plan["weather"]})
 
 
 @app.post("/widget-response")
 def widget_response():
-    """
-    请求体：{"widget": "attraction_picker"|"flight_picker"|"hotel_picker", "selected": [...]}
-    selected 里的对象原样是前端从对应 widget 的 options 里拿到的候选（不是前端自己编的），
-    这样后端不用重新校验内容真实性——跟 widgets.py 里"LLM 只能选真实 ID"是同一个防幻觉思路。
-    """
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "请提供 JSON 物件"}), 400
     widget = payload.get("widget")
-    selected = payload.get("selected") or []
+    selected = payload.get("selected")
+    if not isinstance(widget, str) or not isinstance(selected, list) or not selected or not all(isinstance(item, dict) for item in selected):
+        return jsonify({"error": "无效的选择资料"}), 400
+    with session_store.edit(g.session_id, new_state) as state:
+        offered = next((w for w in state.get("pending_widgets", []) if w.get("widget") == widget), None)
+        if not offered or len(selected) > offered["data"].get("max_select", 1):
+            return jsonify({"error": "卡片已失效或超出选择数量"}), 400
+        options = offered["data"].get("options", [])
+        if any(item not in options for item in selected) or any(item in selected[:i] for i, item in enumerate(selected)):
+            return jsonify({"error": "选项不在本次候选清单"}), 400
+        apply_selection(widget, selected, state)
+        state["pending_widgets"] = [w for w in state["pending_widgets"] if w.get("widget") != widget]
+    return jsonify({"status": "ok"})
 
+
+def apply_selection(widget, selected, state):
     if widget == "attraction_picker":
         places = [item.get("place") for item in selected if item.get("place")]
         if places:
-            route_agent.run(_state, places=places, city=_DEMO_CITY)
+            route_agent.run(state, places=places, city=state.get("city", _DEMO_CITY))
     elif widget == "flight_picker":
         for item in selected:
             trip_plan.add_flight(
-                _state["trip_plan"],
+                state["trip_plan"],
                 {
                     "flight_no": item.get("flight_no"),
                     "from_": item.get("from_"),
@@ -118,7 +208,7 @@ def widget_response():
     elif widget == "hotel_picker":
         for item in selected:
             trip_plan.add_hotel(
-                _state["trip_plan"],
+                state["trip_plan"],
                 {
                     "name": item.get("name"),
                     "address": item.get("address"),
@@ -129,9 +219,7 @@ def widget_response():
                 },
             )
     else:
-        return jsonify({"error": f"未知的 widget 类型: {widget}"}), 400
-
-    return jsonify({"status": "ok"})
+        raise RuntimeError("Unsupported widget")
 
 
 if __name__ == "__main__":
