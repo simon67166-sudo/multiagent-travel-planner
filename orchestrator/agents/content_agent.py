@@ -16,14 +16,33 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
 import persona
 import store
 
+# 港澳达人数据库目前只有这两个城市（见 import_hk_macau_data.py）；杭州那批老 demo 数据没有
+# city 字段，不在这个列表里也不受影响——_extract_city 匹配不到就返回 None，不做城市过滤。
+_KNOWN_CITIES = ("澳门", "香港")
+
+
+def _extract_city(location_hint: str | None) -> str | None:
+    """从用户消息原文里粗略提取城市名（子串匹配），匹配不到就返回 None（不做城市过滤）。
+    跟 exception_agent.py 的子串匹配是同一个"先跑起来，以后再换实体识别"的思路，不是精确 NLP。
+    """
+    if not location_hint:
+        return None
+    for city in _KNOWN_CITIES:
+        if city in location_hint:
+            return city
+    return None
+
 
 def run(shared_state: dict, location_hint: str, top_k: int = 3) -> dict:
     """
-    location_hint 目前没用上——它是留给"内容相关性排序"（两阶段检索第二阶段）的输入，
-    那部分排序算法还没实现，先按人格相似度原样返回。
+    location_hint：用户这轮消息原文，两个用途——
+    (1) 粗略提取城市名做硬过滤（子串匹配"澳门"/"香港"，匹配不到就不过滤，兼容没有 city
+        字段的老数据）；
+    (2) 留给"内容相关性排序"（两阶段检索第二阶段）用，那部分排序算法还没实现。
     """
     vector = persona.compute_persona_vector(shared_state["persona"], shared_state["scenario"])
-    posts = store.query_similar_posts(vector, top_k=top_k)
+    city = _extract_city(location_hint)
+    posts = store.query_similar_posts(vector, top_k=top_k, city=city)
     return {
         "recommendations": [
             {

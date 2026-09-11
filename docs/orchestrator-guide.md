@@ -92,7 +92,7 @@ orchestrator/
 
 **职责**：两阶段检索第一阶段。模型档位 `MODEL_FULL`（UGC 语义提炼），目前还没实际调用 LLM（纯向量检索）。
 
-`run(shared_state, location_hint, top_k=3)`：算 persona 向量 → `store.query_similar_posts()` 查候选。`location_hint` 留给"内容相关性排序"（两阶段检索第二阶段）用，那部分还没实现。
+`run(shared_state, location_hint, top_k=3)`：算 persona 向量 → `store.query_similar_posts()` 查候选。`location_hint` 现在有两个用途：(1) `_extract_city()` 从消息原文里子串匹配"澳门"/"香港"（词表 `_KNOWN_CITIES`），匹配上了就把 `city` 传给 `query_similar_posts()` 做硬过滤，不然"查香港"会混进澳门结果——纯人格相似度检索不区分城市，得靠这个过滤兜底；(2) 留给"内容相关性排序"（两阶段检索第二阶段）用，那部分还没实现。匹配不到已知城市（比如老的杭州 demo 数据、或者压根没提城市）就不过滤，跟以前行为一样。跟 `exception_agent.py` 的子串匹配是同一个"先跑起来，以后再换实体识别"的思路。
 
 返回的 `recommendations` 每条现在除了原有字段，还带港澳数据库的字段：`city`/`category`/`post_type`/`address`/`tags`/`verified_local`（杭州那批老 demo 数据没有这些，会是 `None`/空列表/`False`，不影响原有字段读取）。
 
@@ -191,7 +191,7 @@ orchestrator/
 | `save_image(post_id, filename, image_bytes)` | 写一张图，返回存进 `content["images"]` 的相对路径 |
 | `resolve_image_path(相对路径)` | 相对路径转本地绝对路径，读图用 |
 | `add_post(post_id, persona_vector, content)` | 存一条帖子。`content` 字段见下表 |
-| `query_similar_posts(persona_vector, top_k=5)` | 两阶段检索第一阶段：按人格向量相似度找候选帖子，返回时带 `similarity_score`；`verified_local=True` 的帖子会被优先加权（见下面说明） |
+| `query_similar_posts(persona_vector, top_k=5, city=None)` | 两阶段检索第一阶段：按人格向量相似度找候选帖子，返回时带 `similarity_score`；`verified_local=True` 的帖子会被优先加权（见下面说明）；传了 `city` 会在 Chroma 查询阶段就用 `where={"city": city}` 精确过滤，不是"先按相似度截 top_k 再筛掉不match的"（那样可能筛到结果不够甚至是空的） |
 | `delete_post(post_id)` | 删帖 |
 | `log_history(user_id, trip_id, record)` | 追加一条行程反馈记录 |
 | `get_history(user_id=None)` | 读历史记录，不传 `user_id` 读全部 |
@@ -392,4 +392,4 @@ python orchestrator/server.py
 7. 三个高德 key 已经申请配置好并真实验证过（西湖→灵隐寺路线、机场/酒店坐标都是真实高德数据）
 8. 讨论过的其他 widget 想法还没做：反馈评分插件、异常变更确认插件、人格问卷引导插件
 9. 单会话全局 state（`server.py` 里的 `_state`），没有登录/多用户/并发处理，真要多人同时用需要重新设计状态管理
-10. 港澳达人数据库（229 条，见 `standardize_hk_macau_data.py` 一节）已经标准化+导入 Chroma，`verified_local` 优先加权也接上了，但避坑类帖子的人格向量是中性默认值、`content_agent` 的 `category` 字段还没用来做精细过滤，这两个都属于两阶段检索第二阶段（第4条）的范畴
+10. 港澳达人数据库（229 条，见 `standardize_hk_macau_data.py` 一节）已经标准化+导入 Chroma，`verified_local` 优先加权、`city` 硬过滤（`content_agent._extract_city()` 子串匹配）都接上了并真实验证过（问香港只出香港、问澳门只出澳门）；但避坑类帖子的人格向量是中性默认值、`category`（饮食/景点/Tips）字段还没用来做精细过滤，这两个属于两阶段检索第二阶段（第4条）的范畴

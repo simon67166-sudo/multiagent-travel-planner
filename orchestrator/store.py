@@ -88,17 +88,22 @@ _OVERFETCH_MULTIPLIER = 3  # 要让加权真的能把本地人帖子挤进 top_k
 # 必须比 top_k 多查一些候选再重新排序截断，不然 Chroma 已经按原始距离截到 top_k 了，加权无从谈起
 
 
-def query_similar_posts(persona_vector: list[float], top_k: int = 5) -> list[dict]:
+def query_similar_posts(persona_vector: list[float], top_k: int = 5, city: str | None = None) -> list[dict]:
     """
     第一阶段：按人格向量相似度找候选帖子，返回时带 similarity_score 和还原出来的 images/tags 列表。
     第二阶段的内容相关性排序留给调用方（比如达人 Agent 自己）在这个候选集里再做。
+
+    city: 传了就只在这个城市的帖子里找（Chroma metadata 精确匹配的硬过滤，在查询阶段就生效，
+    不是"先按相似度截 top_k 再过滤掉不match的"——那样会导致过滤完结果不够甚至是空的）。
+    不传（默认）就跟以前一样不限城市——兼容没有 city 字段的老数据（比如杭州 demo 帖子）。
 
     verified_local=True 的帖子（本地人认证来源，见 import_hk_macau_data.py）会被优先加权：
     先多捞 top_k * _OVERFETCH_MULTIPLIER 个候选，按加权后的分数重新排序再截到 top_k，
     这样加权才真的能影响"谁能进 top_k"，不是只在最终结果里调换个先后顺序。
     """
     fetch_n = top_k * _OVERFETCH_MULTIPLIER
-    result = _community_collection.query(query_embeddings=[persona_vector], n_results=fetch_n)
+    where = {"city": city} if city else None
+    result = _community_collection.query(query_embeddings=[persona_vector], n_results=fetch_n, where=where)
     posts = []
     ids = result["ids"][0]
     metadatas = result["metadatas"][0]

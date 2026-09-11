@@ -5,3 +5,4 @@ orchestrator/data/
 __pycache__/
 *.pyc
 ~$数据库原始.xlsx
+.claude/settings.local.json
