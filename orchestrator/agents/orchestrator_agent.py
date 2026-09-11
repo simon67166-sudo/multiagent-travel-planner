@@ -121,7 +121,9 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
         else:
             results["route"] = {"route": [], "note": "请先选择真实景点；澳门模拟餐厅不会加入地图。"}
     if "booking" in intents:
-        results["booking"] = ota_hotel_agent.run(shared_state, location=None)
+        # location=None 让 ota_hotel_agent 自己从 shared_state["city"] 兜底；
+        # user_message 传原话给 hotel_tool 当真实查询意图描述，比关键词拼出来的更准
+        results["booking"] = ota_hotel_agent.run(shared_state, location=None, user_message=user_message)
     if "exception" in intents:
         # 只产生未验证的调整提案，不修改行程（提案制，剥夺删除权）
         results["exception"] = exception_agent.run(shared_state, event_type="unknown", event_detail=user_message)

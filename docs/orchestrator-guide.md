@@ -43,11 +43,12 @@ orchestrator/
   llm_tool.py                     # 通用 LLM 调用工具，跟"编排"本身无关，谁都能 import
   map_tool.py                     # 通用地图工具（高德地图 API）：地理编码 + 路径规划
   weather_tool.py                  # 通用天气工具（和风天气 API）：灾害预警查询，给异常应变 Agent 用
+  hotel_tool.py                    # 通用酒店工具（道旅 RollingGo）：真实酒店搜索 + 房型报价，给 OTA/酒店 Agent 用
   agents/
     orchestrator_agent.py         # 编排 Agent：new_shared_state + classify_intent + orchestrate
     content_agent.py              # 达人/内容 Agent
     route_agent.py                # 行程/路线 Agent
-    ota_hotel_agent.py            # OTA/酒店 Agent（还是纯占位）
+    ota_hotel_agent.py            # OTA/酒店 Agent（酒店真数据，机票还是纯占位）
     exception_agent.py            # 异常应变 Agent（提案制，见对应一节）
     restaurant_agent.py           # 餐厅技能（fellow 分支合并进来）：澳门模拟餐厅演示，带界数工具调用循环
   widgets.py                      # 展示插件：右侧聊天框里的富交互小组件，跟 Agent 逻辑解耦
@@ -107,6 +108,21 @@ orchestrator/
 - 2026-09-11 用真实预警数据验证过：查询当时有台风影响的海南（海口）能查到 2 条真实的雷电/大风黄色预警，字段解析正常；查没有预警的城市（香港/澳门）返回空列表，也验证过降级路径
 - 2026-09-12 `get_hourly_forecast()` 真实数据验证过：`nearby_planner.build_plan()` 端到端跑通，拿到真实的澳门逐小时气温/降雨概率，`nearby_sources.weather()` 从这批数据里算出的时段摘要字段跟前端 `nearby.js` 的渲染契约对得上
 
+## hotel_tool.py -- 通用酒店工具（道旅 RollingGo）
+
+**职责**：真实酒店搜索 + 房型报价，给 `ota_hotel_agent.py` 用，2026-09-13 接入。跟 `map_tool.py`/`weather_tool.py` 一样是通用基础设施。
+
+| 函数 | 作用 |
+|---|---|
+| `search_hotels(place, place_type, origin_query, check_in_date=None, stay_nights=1, star_min=None, size=5)` | 搜酒店候选，返回列表，每条带 `hotel_id`/`name`/`address`/`star_rating`/`price_per_night`/`lat`/`lng`/`image_url`/`booking_url`/`amenities`/`tags` |
+| `get_hotel_detail(hotel_id, check_in_date, check_out_date, adult_count=2, room_count=1)` | 查某个酒店的具体房型报价，返回房型列表，带 `room_name`/`price_per_night`/`bed_type`/`meal`/`cancelable`/`cancel_policy` |
+
+- **数据源**：道旅（DIDA Travel，官方宣传"全球第三大酒旅 B2B 公司"）的 RollingGo 免费开放接口，200 万+真实酒店库存，个人/企业开发者均可免费申请、目前阶段无调用上限（官方说明是"目前阶段"，不保证长期不变）。去 https://travelportal-partner-center.dida.com/register?lang=zh 注册，0 等待即时拿到 key。**这一步是用户自己注册的，不是我能代办的事**（涉及个人账号信息）。
+- **协议是 MCP，不是普通 REST**：服务本质是个 Model Context Protocol server（`https://mcp.rollinggo.cn/mcp`），但直接用 `requests` 发 JSON-RPC 2.0 请求过去就行，不用接一整套 MCP 客户端框架——`method` 固定 `"tools/call"`，`params.name` 是工具名，`params.arguments` 是工具参数。**真正的业务数据包了两层**：`response["result"]["content"][0]["text"]` 是一段 JSON 字符串，要再 `json.loads()` 一次才能拿到真正的酒店数据（第一次接的时候没注意到这层，拿到的一直是"文本"外壳，调试了一下才发现）。请求头必须带 `Accept: application/json, text/event-stream`，缺了服务端直接 400。
+- **`search_hotels()` 返回的 `price_per_night` 是估算值**：源接口 `searchHotels` 只返回整个入住期间的总价（`lowestPrice`），本模块按 `stay_nights` 算术平均换算成"每晚"，不是真的按天查一次；想要某个具体房型精确到每晚多少钱、取消政策，要再调一次 `get_hotel_detail()`（目前 `ota_hotel_agent.py` 没有自动调这一步，只在候选列表阶段用估算价）。
+- **只做只读查询，不碰下单/支付**：官方还有一个走 OAuth 登录 + 人工二次确认的命令行工具（`rgh` 系列，能真实下单付款），调研这个数据源的时候顺带发现的，明确决定不接进这种自动跑的后端 Agent 流程——那类操作必须是用户本人在自己的终端里主动触发，不适合塞进 `orchestrate()` 这种自动化链路。
+- 2026-09-13 真实数据验证过：搜"大三巴附近四星酒店"拿到 5 家真实澳门酒店（假日酒店/华都酒店等），真实价格/地址/坐标/图片/设施；`getHotelDetail` 查到真实房型（假日高级房/高级双床房等）、真实每晚价格、真实取消政策。
+
 ## agents/orchestrator_agent.py -- 编排 Agent
 
 **职责**：星型架构的中枢。接收用户消息 → 意图识别 → 决定调用哪几个子 Agent/workflow → 汇总结果 → 生成回复。对应 [agent-interfaces.md 第三节](./agent-interfaces.md) 的节点拓扑，只是从 Dify 可视化节点换成了 Python 函数。模型档位用 `MODEL_FULL`（全系统推理最重）。
@@ -141,9 +157,13 @@ orchestrator/
 
 ## agents/ota_hotel_agent.py -- OTA/酒店 Agent
 
-**职责**：查库存/比价。模型档位 `MODEL_LIGHT`。**还是纯占位假数据**，没有真实的比价/查库存来源可接——但字段已经补全到"用户选中后能直接落地"的程度：机票候选带 `flight_no`/`from_`/`to`/`depart_time`/`arrive_time`/`status`，酒店候选带 `address`/`check_in`/`check_out`（`check_in`/`check_out` 会用 `date_range` 参数填，格式 `"开始日期~结束日期"`，没传就给占位日期）。这样 `POST /widget-response`（见 `server.py` 一节）收到用户选中的候选后，能直接拿这些字段调 `trip_plan.add_flight()`/`add_hotel()`，不用现造字段。
+**职责**：查库存/比价。模型档位 `MODEL_LIGHT`。**酒店这半边 2026-09-13 起接了真实数据**（`hotel_tool.py`，道旅 RollingGo），**机票这半边还是纯占位假数据**——机票比价没有免费的个人开发者可用来源（携程/去哪儿这类都是企业商家合作性质，不对个人开发者开放，调研过没有绕开的办法）。字段补全到"用户选中后能直接落地"的程度：机票候选带 `flight_no`/`from_`/`to`/`depart_time`/`arrive_time`/`status`，酒店候选带 `address`/`check_in`/`check_out`（`check_in`/`check_out` 会用 `date_range` 参数填，格式 `"开始日期~结束日期"`，没传就默认"明天起 2 晚"）。这样 `POST /widget-response`（见 `server.py` 一节）收到用户选中的候选后，能直接拿这些字段调 `trip_plan.add_flight()`/`add_hotel()`，不用现造字段。
 
-`orchestrate()` 里 `booking` 意图命中时会把这里返回的 `candidates` 分别喂给 `widgets.build_flight_picker_widget()`/`widgets.build_hotel_picker_widget()`（按 `candidates` 里的 `provider_type` 字段分流，见下面 `widgets.py` 一节），现在假数据一条机票一条酒店都有，两个 widget 都能出内容。
+`run(shared_state, location, date_range=None, category=None, user_message=None)`：`location` 没传就从 `shared_state["city"]` 兜底（再没有就是 demo 默认"澳门"），`user_message` 传了会原样喂给 `hotel_tool.search_hotels()` 当查询意图描述（比拼关键词更准，`orchestrator_agent.py` 的 `booking` 分发会把这轮用户原话传进来）；真查失败（key 没配/网络问题）优雅降级成空酒店列表 + `hotel_query_error` 字段，不会抛异常炸穿 `orchestrate()`。
+
+`orchestrate()` 里 `booking` 意图命中时会把这里返回的 `candidates` 分别喂给 `widgets.build_flight_picker_widget()`/`widgets.build_hotel_picker_widget()`（按 `candidates` 里的 `provider_type` 字段分流，见下面 `widgets.py` 一节），机票假数据、酒店真数据混在同一个候选列表里，两个 widget 都能出内容。
+
+**已知缺口（2026-09-13 真实端到端测试时发现）**：`orchestrate()` 目前没有从用户消息里提取日期，`date_range` 从来没被传给 `run()`，酒店查询永远用默认的"明天起 2 晚"。真实数据接上之后这个问题第一次变得可见——之前反正是假数据，日期对不对不影响观感；测试时问"9月20-22号"的酒店，LLM 最后收尾组句时诚实地发现拿到的是默认日期的价格，主动跟用户说明了"这不是你问的那两天的价格"（防幻觉提示词生效的证据，没有硬装作数据对得上），但功能上确实没做到"按用户说的日期查"。修法待定：可以简单加一段日期正则提取，也可以扩展 `classify_intent` 顺便做实体抽取，需要先决定思路。
 
 ## agents/exception_agent.py -- 异常应变 Agent
 
@@ -445,7 +465,7 @@ python orchestrator/server.py
 
 `main.py`/`server.py` 已经把所有 Agent + 两套 widgets 串成一条完整链路：跑 `python orchestrator/main.py` 能看到一次"推荐→规划路线→异常应变→重新渲染行程"的端到端流程；跑 `python orchestrator/server.py` 打开网页，能看到"聊天推荐→勾选景点/机票/酒店→确认→左侧地图/时间线/机票酒店面板更新"这条更完整的闭环真的在跑（已端到端联调验证过）。还剩这几处没做，都不阻塞基本演示：
 
-1. `ota_hotel_agent` 还是纯占位假数据（固定一条机票一条酒店），没有真实比价/查库存来源可接
+1. ~~`ota_hotel_agent` 还是纯占位假数据~~ 酒店这半边已解决（2026-09-13）：接了 `hotel_tool.py`（道旅 RollingGo，真实酒店库存/价格）；机票还是纯占位假数据，没有真实比价来源可接（调研过携程/去哪儿都是企业商家合作性质，个人开发者拿不到免费 key）
 2. `route_agent` 目前所有节点都写进同一个占位日期 `_PLACEHOLDER_DAY = "day-1"`，没有真正的多日期规划——这意味着"按天上色"这个视觉设计在真实多日行程里还体现不出来（永远只有一种颜色）；交通方式/耗时已经接了高德地图 API 真实计算，但到达/结束的具体钟点时间还是占位文字 `"待定"`
 3. `exception_agent` 用整句用户消息去子串匹配地点名字，很粗糙（比如"西湖"两个字出现在消息里就命中），真实版本应该先做实体识别抽出具体地点
 4. 两阶段检索第二阶段（候选集内部按内容相关性排序）还没实现，`content_agent` 里 `location_hint` 参数目前没用上
@@ -457,3 +477,4 @@ python orchestrator/server.py
 10. 港澳达人数据库（229 条，见 `standardize_hk_macau_data.py` 一节）已经标准化+导入 Chroma，`verified_local` 优先加权、`city` 硬过滤（`content_agent._extract_city()` 子串匹配）都接上了并真实验证过（问香港只出香港、问澳门只出澳门）；但避坑类帖子的人格向量是中性默认值、`category`（饮食/景点/Tips）字段还没用来做精细过滤，这两个属于两阶段检索第二阶段（第4条）的范畴
 11. **`exception_agent` 提案制的"确认后执行"接口还没做**（2026-09-11 合并 fellow 分支时明确的缺口）：`run()`/`check_weather()` 现在都只返回评估结果，`requires_confirmation` 恒为 `True`，但没有任何代码在用户回复"确认"/"好的删掉"之后真的去调 `trip_plan.remove_stop()` 或把真实预警写进 `weather_alerts`。大概方向：`shared_state` 里加一个 `pending_proposal` 字段存最近一次未确认的提案，靠下一轮意图识别或简单的确认/取消关键词触发一个新的 `apply_adjustment()` 去执行
 12. ~~两套独立天气数据源~~ 已解决（2026-09-12）：`nearby_sources.weather()` 原来接的是 Open-Meteo，现在改成统一用 `weather_tool.get_hourly_forecast()`（和风天气逐小时预报，免费版最多查 240 小时=10 天），跟 `exception_agent.check_weather()` 用的灾害预警接口共用同一个 key/host。`nearby_sources.summarize_weather()` 的输入契约也跟着换了（从 Open-Meteo 那种 `{"hourly": {"time": [...], "temperature_2m": [...], ...}}` 嵌套结构，改成扁平的 `[{"time":, "temperature_c":, "rain_probability":, "condition_text":}, ...]` 列表），判断"是否有雷暴"从匹配 Open-Meteo 的数值天气码（`weather_code>=95`）改成直接检查和风天气返回的 `condition_text` 里有没有"雷"字，更直观也不用记一张码表。真实限制：预报范围从 Open-Meteo 的 16 天缩到了 10 天，超出范围会走"选定日期不在预报范围内"的降级提示，不会报错崩溃
+13. **`orchestrate()` 没有从用户消息里提取日期给 `ota_hotel_agent.run()`**（2026-09-13 接入真实酒店数据后端到端测试时发现，之前是假数据看不出这个问题）：不管用户说"9月20号"还是别的日期，`booking` 意图命中时传给 `run()` 的 `date_range` 永远是 `None`，酒店查询永远默认"明天起 2 晚"。真实测试里 LLM 最后组句时诚实地发现了这个落差并跟用户说明（防幻觉提示词生效了），但功能上确实没做到"按用户说的日期查"。修法待定，两个方向：简单加一段日期正则/关键词提取；或者扩展 `classify_intent` 顺带做结构化实体抽取（日期/星级/预算这些一起解决），需要先定思路
