@@ -1,6 +1,7 @@
-"""港澳附近游数据源 -- 只用高德（POI 搜索/周边地点/路线），天气仍用 Open-Meteo
-（高德天气 API 只有城市级别的逐日预报，没有这个功能需要的按出游时段的小时级预报）。
-带缓存 + 限速，避免公共接口被打爆。"""
+"""港澳附近游数据源 -- POI 搜索/周边地点/路线用高德，天气用和风天气逐小时预报
+（weather_tool.py，2026-09-12 起统一天气来源，之前是接的 Open-Meteo，跟
+exception_agent.check_weather() 用的灾害预警不是同一套数据源，两条链路徒增维护成本）。
+高德/和风天气之外的地图数据源带缓存 + 限速，避免公共接口被打爆。"""
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -13,8 +14,8 @@ import requests
 _LOCK = RLock()
 _CACHE = {}
 _LAST = 0.0
-CITY = {"澳门": {"center": (113.5439,22.1987), "bbox": (113.52,22.10,113.61,22.22)},
-        "香港": {"center": (114.17,22.30), "bbox": (113.83,22.14,114.45,22.58)}}
+CITY = {"澳门": {"bbox": (113.52,22.10,113.61,22.22)},
+        "香港": {"bbox": (113.83,22.14,114.45,22.58)}}
 
 def get_json(url, params=None, ttl=1800):
     global _LAST
@@ -94,28 +95,30 @@ def route(a,b,mode="walking"):
         result["steps"]=["路线服务暂时不可用；请开启导航确认，未画出推测路线。"]
     return result
 
-def summarize_weather(raw,start,end):
-    hourly=raw.get("hourly",{}); times=hourly.get("time",[])
-    indices=[i for i,t in enumerate(times) if start.replace(minute=0)<=datetime.fromisoformat(t)<end]
-    if not indices: return {"available":False,"reminders":["选定日期不在目前预报范围内，请于出发前再查。"]}
-    def values(key): return [hourly.get(key,[])[i] for i in indices if i<len(hourly.get(key,[])) and hourly[key][i] is not None]
-    temps=values("temperature_2m"); rain=values("precipitation_probability"); codes=values("weather_code")
+def summarize_weather(hours,start,end):
+    start_key=start.strftime("%Y-%m-%dT%H:%M"); end_key=end.strftime("%Y-%m-%dT%H:%M")
+    window=[h for h in hours if start_key<=h["time"]<end_key]
+    if not window: return {"available":False,"reminders":["选定日期不在目前预报范围内（和风天气免费版最多查 10 天），请于出发前再查。"]}
+    def values(key): return [h[key] for h in window if h.get(key) is not None]
+    temps=values("temperature_c"); rain=values("rain_probability")
+    thunder=any("雷" in (h.get("condition_text") or "") for h in window)
     reminders=[]
-    if rain and max(rain)>=60: reminders.append("预报降雨机率较高，带雨具并预留室内备选；行程尚未自动更改。")
+    if rain and max(rain)>=0.6: reminders.append("预报降雨机率较高，带雨具并预留室内备选；行程尚未自动更改。")
     if temps and max(temps)>=32: reminders.append("预报气温偏高，安排饮水及室内休息。")
-    if any(c>=95 for c in codes): reminders.append("预报时段可能有雷暴，出发前查阅官方警告，避免曝露的户外活动。")
+    if thunder: reminders.append("预报时段可能有雷暴，出发前查阅官方警告，避免曝露的户外活动。")
     return {"available":True,"temperature_min":min(temps) if temps else None,"temperature_max":max(temps) if temps else None,
-            "max_rain_probability":max(rain) if rain else None,"reminders":reminders or ["预报可能更新，出发前请再次确认天气。"]}
+            "max_rain_probability":round(max(rain)*100) if rain else None,"reminders":reminders or ["预报可能更新，出发前请再次确认天气。"]}
 
 def weather(city,origin,start,end):
-    # origin 现在永远是高德 GCJ02 坐标，不能直接喂给 Open-Meteo（它要 WGS84），
-    # 用城市中心点的固定 WGS84 坐标查天气，跟 GCJ-02 地图坐标分开，不混用坐标系。
-    lng,lat=CITY[city]["center"]
+    # 直接用 origin 的高德坐标查（GCJ02），和风天气接口对坐标系不敏感，不用再像以前
+    # 接 Open-Meteo 时那样额外维护一份城市中心点 WGS84 坐标。
+    import weather_tool
+    hours_ahead=max(1,min(240,math.ceil((end-datetime.now()).total_seconds()/3600)+1))
     try:
-        raw=get_json("https://api.open-meteo.com/v1/forecast",{"longitude":lng,"latitude":lat,"hourly":"temperature_2m,precipitation_probability,weather_code","forecast_days":16,"timezone":"Asia/Macau"},ttl=600)
-        result=summarize_weather(raw,start,end); result["fetched_at"]=raw["_fetched_at"]
-    except RuntimeError:
+        hours=weather_tool.get_hourly_forecast(origin["lng"],origin["lat"],hours=hours_ahead)
+        result=summarize_weather(hours,start,end); result["fetched_at"]=datetime.now(timezone.utc).isoformat()
+    except (RuntimeError,ValueError):
         result={"available":False,"reminders":["天气查询失败，目前没有可用预报。"]}
-    result.update(source="Open-Meteo 数值预报（非官方警告）",source_url="https://open-meteo.com/",forecast_for=start.isoformat(),
+    result.update(source="和风天气逐小时预报",source_url="https://www.qweather.com/",forecast_for=start.isoformat(),
                   official_url="https://www.hko.gov.hk/tc/" if city=="香港" else "https://www.smg.gov.mo/")
     return result

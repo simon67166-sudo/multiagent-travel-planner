@@ -47,8 +47,10 @@ class NearbyTests(unittest.TestCase):
 
     def test_weather_matches_trip_hours(self):
         from nearby_sources import summarize_weather
-        raw={"hourly":{"time":["2026-09-10T10:00","2026-09-10T11:00","2026-09-11T10:00"],"temperature_2m":[31,33,20],"precipitation_probability":[20,80,0],"weather_code":[1,95,0]}}
-        summary=summarize_weather(raw,datetime(2026,9,10,10),datetime(2026,9,10,12))
+        hours=[{"time":"2026-09-10T10:00","temperature_c":31,"rain_probability":0.2,"condition_text":"多云"},
+               {"time":"2026-09-10T11:00","temperature_c":33,"rain_probability":0.8,"condition_text":"雷阵雨"},
+               {"time":"2026-09-11T10:00","temperature_c":20,"rain_probability":0,"condition_text":"晴"}]
+        summary=summarize_weather(hours,datetime(2026,9,10,10),datetime(2026,9,10,12))
         self.assertEqual(summary["max_rain_probability"],80)
         self.assertTrue(summary["reminders"])
         self.assertEqual(summary["temperature_max"],33)

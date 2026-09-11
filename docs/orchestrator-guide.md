@@ -53,7 +53,7 @@ orchestrator/
   widgets.py                      # 展示插件：右侧聊天框里的富交互小组件，跟 Agent 逻辑解耦
   schedule_widgets.py             # 左侧日程面板展示组件（地图+连线、每日时间线、机票酒店面板），跟 widgets.py 同一个分离思路
   nearby_planner.py               # 港澳附近游确定性 workflow（fellow 分支合并进来，见对应一节）
-  nearby_sources.py               # 附近游用的数据源：高德 POI/路线 + Open-Meteo 天气
+  nearby_sources.py               # 附近游用的数据源：高德 POI/路线 + 和风天气逐小时预报
   restaurant_tools.py             # restaurant_agent 的工具调用实现（虚构澳门餐厅数据 + 校验规则）
   session_store.py                # 按浏览器 session 存整份 shared_state（SQLite），替换掉原来的单进程全局 state
   standardize_hk_macau_data.py    # 把组员整理的港澳达人数据 Excel 转成标准化 JSON（见文末专门一节）
@@ -94,16 +94,18 @@ orchestrator/
 
 ## weather_tool.py -- 通用天气工具（和风天气）
 
-**职责**：灾害预警查询，给异常应变 Agent 判断"这个城市现在是不是真的有极端天气"用，跟 `map_tool.py` 一样是通用基础设施。
+**职责**：和风天气的两块能力——灾害预警（给异常应变 Agent 判断"这个城市现在是不是真的有极端天气"）、逐小时预报（给港澳附近游 workflow 算"这个时段要不要带伞"）。跟 `map_tool.py` 一样是通用基础设施。
 
 | 函数 | 作用 |
 |---|---|
 | `get_active_warnings(location, city=None)` | 查某个地名当前生效的灾害预警，返回列表，每条 `{"headline", "event_type", "severity", "description", "effective_time", "expire_time"}`；没有预警返回空列表（正常情况，不是错误） |
+| `get_hourly_forecast(lng, lat, hours=240)` | 查某个坐标未来最多 240 小时（10 天，免费版上限）的逐小时预报，返回列表，每条 `{"time", "temperature_c", "rain_probability", "condition_text"}`；直接传经纬度（不查地名），`nearby_sources.py` 已经有 POI 坐标就不用再地理编码一次 |
 
-- `severity` 取值：`unknown`/`minor`/`moderate`/`severe`/`extreme`，越靠后越严重——`exception_agent.check_weather()` 用这个字段决定要不要自动清空行程
-- 接口本身按经纬度查（`/weatheralert/v1/current/{lat}/{lon}`），不需要先转和风天气自己的 LocationID，所以直接复用 `map_tool.geocode()` 拿坐标，少一次网络调用
+- `severity` 取值：`unknown`/`minor`/`moderate`/`severe`/`extreme`，越靠后越严重——`exception_agent.check_weather()` 用这个字段决定 `needs_replan` 要不要标 `True`（只是提示信号，不会自动改行程，见 `exception_agent.py` 一节）
+- `get_active_warnings()` 按经纬度查（`/weatheralert/v1/current/{lat}/{lon}`），不需要先转和风天气自己的 LocationID，所以直接复用 `map_tool.geocode()` 拿坐标，少一次网络调用；`get_hourly_forecast()`（`/weather/v1/hourly/{lat}/{lon}`）同理，且额外传了 `localTime=true`，返回的 `time` 字段直接是当地时间字符串（不带时区偏移），不用再手动转时区
 - **和风天气新账号是"一账号一专属域名"**：2023 年后注册的 key 用公共的 `devapi.qweather.com`/`geoapi.qweather.com` 会直接 404，必须去控制台"项目管理"页面找到这个 key 专属的 API Host（形如 `xxxxxxxxxx.re.qweatherapi.com`），配进 `.env` 的 `QWEATHER_API_HOST`（见"环境准备"一节）——这是接入过程里踩的第一个坑，实测过公共域名连 key 是否有效都判断不出来，报错也不明显（直接 404 空 body，不是 JSON 格式的错误信息）
-- 2026-09-11 用真实预警数据验证过：查询当时有台风影响的海南（海口）能查到 2 条真实的雷电/大风黄色预警，字段解析正常；查没有预警的城市（香港）返回空列表，也验证过降级路径
+- 2026-09-11 用真实预警数据验证过：查询当时有台风影响的海南（海口）能查到 2 条真实的雷电/大风黄色预警，字段解析正常；查没有预警的城市（香港/澳门）返回空列表，也验证过降级路径
+- 2026-09-12 `get_hourly_forecast()` 真实数据验证过：`nearby_planner.build_plan()` 端到端跑通，拿到真实的澳门逐小时气温/降雨概率，`nearby_sources.weather()` 从这批数据里算出的时段摘要字段跟前端 `nearby.js` 的渲染契约对得上
 
 ## agents/orchestrator_agent.py -- 编排 Agent
 
@@ -454,4 +456,4 @@ python orchestrator/server.py
 9. ~~单会话全局 state~~ 已解决：合并 fellow 分支后改成 `session_store.py`（按浏览器 cookie 隔离，SQLite 存档），仍然是单进程本地 demo，没有登录/账号体系，但至少不同浏览器/不同人打开不会互相覆盖状态了
 10. 港澳达人数据库（229 条，见 `standardize_hk_macau_data.py` 一节）已经标准化+导入 Chroma，`verified_local` 优先加权、`city` 硬过滤（`content_agent._extract_city()` 子串匹配）都接上了并真实验证过（问香港只出香港、问澳门只出澳门）；但避坑类帖子的人格向量是中性默认值、`category`（饮食/景点/Tips）字段还没用来做精细过滤，这两个属于两阶段检索第二阶段（第4条）的范畴
 11. **`exception_agent` 提案制的"确认后执行"接口还没做**（2026-09-11 合并 fellow 分支时明确的缺口）：`run()`/`check_weather()` 现在都只返回评估结果，`requires_confirmation` 恒为 `True`，但没有任何代码在用户回复"确认"/"好的删掉"之后真的去调 `trip_plan.remove_stop()` 或把真实预警写进 `weather_alerts`。大概方向：`shared_state` 里加一个 `pending_proposal` 字段存最近一次未确认的提案，靠下一轮意图识别或简单的确认/取消关键词触发一个新的 `apply_adjustment()` 去执行
-12. `nearby_planner.py`（港澳附近游）自己接了一套 Open-Meteo 天气查询（`nearby_sources.weather()`），跟 `exception_agent.check_weather()`/`weather_tool.py`（和风天气）是两条独立的天气数据链路，分别服务"规划时看要不要带伞"和"行程中途查有没有真实灾害预警"两个不同场景，没有互相调用；如果以后要统一成一套天气来源，这是需要重新设计的点
+12. ~~两套独立天气数据源~~ 已解决（2026-09-12）：`nearby_sources.weather()` 原来接的是 Open-Meteo，现在改成统一用 `weather_tool.get_hourly_forecast()`（和风天气逐小时预报，免费版最多查 240 小时=10 天），跟 `exception_agent.check_weather()` 用的灾害预警接口共用同一个 key/host。`nearby_sources.summarize_weather()` 的输入契约也跟着换了（从 Open-Meteo 那种 `{"hourly": {"time": [...], "temperature_2m": [...], ...}}` 嵌套结构，改成扁平的 `[{"time":, "temperature_c":, "rain_probability":, "condition_text":}, ...]` 列表），判断"是否有雷暴"从匹配 Open-Meteo 的数值天气码（`weather_code>=95`）改成直接检查和风天气返回的 `condition_text` 里有没有"雷"字，更直观也不用记一张码表。真实限制：预报范围从 Open-Meteo 的 16 天缩到了 10 天，超出范围会走"选定日期不在预报范围内"的降级提示，不会报错崩溃

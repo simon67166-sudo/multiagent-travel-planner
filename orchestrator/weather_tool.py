@@ -78,7 +78,38 @@ def get_active_warnings(location: str, city: str | None = None) -> list[dict]:
     ]
 
 
+def get_hourly_forecast(lng: float, lat: float, hours: int = 240) -> list[dict]:
+    """
+    查某个坐标未来最多 240 小时（10 天，和风天气免费版上限）的逐小时天气预报，返回列表，每条：
+    {"time", "temperature_c", "rain_probability", "condition_text"}
+    - time：本地时间字符串 "YYYY-MM-DDTHH:MM"（不带时区偏移），方便跟别处用
+      datetime.fromisoformat() 拼出来的 naive 本地时间直接做字符串比较/排序
+    - rain_probability：0~1 的小数（跟和风天气原始字段一致，不是百分比）
+
+    直接传经纬度，不查地名——调用方（比如 nearby_sources.py）通常已经有 POI 坐标了，
+    不用再多一次地理编码；坐标系不敏感（不像某些天气源强制要求 WGS84）。
+    """
+    resp = requests.get(
+        f"{_base_url()}/weather/v1/hourly/{lat}/{lng}",
+        params={"key": _get_key(), "hours": min(240, hours), "localTime": "true"},
+        timeout=15,
+    )
+    data = resp.json()
+    if "hours" not in data:
+        raise ValueError(f"逐小时天气查询失败: ({lng}, {lat}) -> {data}")
+    return [
+        {
+            "time": h["forecastTime"][:16],
+            "temperature_c": (h.get("temperature") or {}).get("value"),
+            "rain_probability": (h.get("precipitation") or {}).get("probability"),
+            "condition_text": (h.get("condition") or {}).get("text"),
+        }
+        for h in data.get("hours", [])
+    ]
+
+
 if __name__ == "__main__":
     import json
 
     print(json.dumps(get_active_warnings("香港"), ensure_ascii=False, indent=2))
+    print(json.dumps(get_hourly_forecast(113.5439, 22.1987, hours=6), ensure_ascii=False, indent=2))
