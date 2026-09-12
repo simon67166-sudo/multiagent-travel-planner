@@ -140,6 +140,7 @@ def new_shared_state(user_id: str, scenario: str = "vacation", onboarding_answer
         "trip_plan": trip_plan.new_trip_plan(trip_id=f"trip-{user_id}"),
         "trip_preferences": trip_preferences.TripPreferences().to_dict(),
         "pending_trip_request": None,  # 问完偏好之前，用户真正想说的那句话暂存在这里
+        "trip_preferences_city": None,  # trip_preferences 是为哪个城市答的——换城市要重新问，见 orchestrate()
         "last_content_candidates": [],  # 达人 Agent 最近一次给出的全量候选池，attraction_picker 确认时要用
         "last_trip_day_count": 1,  # 同上，达人 Agent 提取到的天数，attraction_picker 确认时一次性排够这么多天
     }
@@ -203,15 +204,28 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
             prefs.flight_priority = answered["flight_priority"]
         prefs.apply_defaults()
         shared_state["trip_preferences"] = prefs.to_dict()
+        shared_state["trip_preferences_city"] = shared_state.pop("pending_trip_city", None)
         user_message = shared_state.pop("pending_trip_request")
 
     intents = classify_intent(user_message, history)
+
+    # 2026-09-17 用户指出：酒店/机票偏好是"这一趟去哪儿"的定制，不是绑在人身上的人格变量——
+    # "去福州可能更想吃，去香港可能更想打卡，去岘港可能想度假，每次都不一样"，问过一次就
+    # 全程不再问对不上这个事实。这次请求提取到的城市跟 trip_preferences 上次是为哪个城市
+    # 答的不一样，就当作全新一趟行程，两个字段都重新问（不是只问缺的那部分——上次答案是
+    # 为另一个城市答的，沿用没有意义）。提取不到城市（这句话没提、shared_state 里也没有）
+    # 就不重置，避免无谓打断——只有能明确判断"换了个目的地"才重新问。
+    requested_city = _extract_city(user_message) or shared_state.get("city")
+    if requested_city and requested_city != shared_state.get("trip_preferences_city"):
+        prefs = trip_preferences.TripPreferences()
 
     if "content" in intents and "nearby" not in intents and not prefs.is_complete():
         # mode="trip"（常规推荐）开始搜索之前先确认偏好；mode="nearby"（"从大三巴出发逛
         # 3小时"这种直接行动请求）不需要，跟它不走 attraction_picker 确认流程是同一个道理
         question = _build_preference_question(prefs.missing_fields())
         shared_state["pending_trip_request"] = user_message
+        shared_state["pending_trip_city"] = requested_city
+        shared_state["trip_preferences"] = prefs.to_dict()
         shared_state["messages"] = history + [
             {"role": "user", "content": user_message},
             {"role": "assistant", "content": question},

@@ -222,5 +222,36 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIsNone(state.get("pending_trip_request"))
         self.assertTrue(trip_preferences.TripPreferences.from_dict(state["trip_preferences"]).is_complete())
 
+    def test_trip_preferences_reasked_when_destination_city_changes(self):
+        # 2026-09-17：用户指出酒店/机票偏好是"这一趟去哪儿"的定制，不是绑在人身上的人格
+        # 变量——"去福州可能更想吃，去香港可能更想打卡，去岘港可能想度假，每次都不一样"。
+        # 第一轮在澳门问完、答完；第二轮换成香港，该被当成全新一趟行程重新问一次，不能
+        # 沿用澳门那次的答案
+        from agents import orchestrator_agent as agent
+        import trip_preferences
+        state = agent.new_shared_state("city-change-test-user")
+
+        with patch.object(agent, "classify_intent", return_value=["content"]):
+            agent.orchestrate("推荐一个3天的澳门行程", state)
+        with patch.object(agent, "classify_intent", return_value=["content"]), \
+             patch.object(agent, "_parse_preference_answer", return_value={"hotel_preference": "度假酒店", "flight_priority": "省钱"}), \
+             patch.object(agent.content_agent, "run", return_value={"recommendations": [], "nearby_params": None, "clarification_needed": None}), \
+             patch.object(agent.llm_tool, "call_llm", return_value="收到"):
+            agent.orchestrate("周边方便，省钱", state)
+        macau_prefs = trip_preferences.TripPreferences.from_dict(state["trip_preferences"])
+        self.assertTrue(macau_prefs.is_complete())
+        self.assertEqual(macau_prefs.hotel_preference, "度假酒店")
+        self.assertEqual(state["trip_preferences_city"], "澳门")
+
+        # 换成香港——该重新触发确认，不是直接沿用澳门那次"度假酒店/省钱"的答案
+        with patch.object(agent, "classify_intent", return_value=["content"]), \
+             patch.object(agent.content_agent, "run") as content_mock:
+            output, state = agent.orchestrate("推荐一个香港的行程", state)
+        content_mock.assert_not_called()
+        self.assertIn("酒店", output["chat_reply"])
+        self.assertFalse(trip_preferences.TripPreferences.from_dict(state["trip_preferences"]).is_complete())
+        self.assertEqual(state["pending_trip_request"], "推荐一个香港的行程")
+        self.assertEqual(state["pending_trip_city"], "香港")
+
 if __name__ == "__main__":
     unittest.main()
