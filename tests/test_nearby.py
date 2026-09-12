@@ -94,6 +94,19 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(places, ["叠记咖喱美食", "文记咖啡"])
         self.assertEqual(deduped[0]["post_id"], "p1")  # 保留相似度更高的那条（p1 而不是 p3）
 
+    def test_nearby_plan_caps_results_per_call(self):
+        # 2026-09-17：周边 POI 扩展没有截断时，一次 nearby() 请求就能回几十条，run() 里
+        # mode="trip" 场景对每个种子都各自调一次 _nearby_plan()，汇总去重后是几百条量级——
+        # 参考已删除的 fellow 分支 nearby_planner.py 的 pool=ranked[:8] 做法，这里改成按
+        # recommendation_score 排序后直接截断，验证确实生效且没有把顺序打乱
+        from agents import content_agent
+        pois = [{"id": f"poi{i}", "name": f"地点{i}", "lng": 113.54, "lat": 22.19,
+                 "category": "景点", "address": "test"} for i in range(20)]
+        with patch.object(content_agent.nearby_sources, "nearby", return_value=pois), \
+             patch.object(content_agent.store, "find_posts_by_place", return_value=[]):
+            results = content_agent._nearby_plan({"lng": 113.54, "lat": 22.19, "name": "起点", "id": None}, "澳门", None)
+        self.assertEqual(len(results), content_agent._NEARBY_PER_CALL_CAP)
+
     def test_place_day_never_fakes_a_failed_route(self):
         # 原 test_missing_route_never_draws_fake_line 的等价替代：查路线失败时不能编造到达时间，
         # 要老实标"待定（地图查询失败）"，不能假装查到了什么

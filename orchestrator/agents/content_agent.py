@@ -32,6 +32,7 @@ import store
 
 _KNOWN_CITIES = ("澳门", "香港")
 _NEARBY_RADIUS_M = 1500  # 跟 nearby_sources.nearby() 默认半径一致，显式写出来方便以后调
+_NEARBY_PER_CALL_CAP = 8  # 每次 _nearby_plan() 调用最多留几个候选，见该函数文档字符串
 
 
 def _extract_city(location_hint: str | None) -> str | None:
@@ -93,9 +94,11 @@ def _pick_seeds_with_quotas(posts: list[dict], day_count: int) -> list[dict]:
     return sight + breakfast + lunch_dinner
 
 
-def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) -> list[dict]:
+def _nearby_plan(
+    origin: dict, city: str, persona_vector: list[float] | None, limit: int = _NEARBY_PER_CALL_CAP
+) -> list[dict]:
     """
-    统一的"周边探索"接口：查真实高德周边 POI + 社区口碑复核，返回排好序的候选列表。
+    统一的"周边探索"接口：查真实高德周边 POI + 社区口碑复核，返回排好序、已截断的候选列表。
     origin: {"lng":, "lat":, "name":, "id":}——3 日游场景是某个种子景点/帖子地点，周边游
       场景是用户给的起点。"id" 只用来给 nearby_sources.nearby() 排除起点自身，没有真实
       POI id 就传 None（geocode 出来的坐标没有 AMap POI id，属于正常情况）。
@@ -107,6 +110,16 @@ def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) ->
     地点匹配是精确字符串匹配（POI 名字 vs 帖子 place 字段），命中率本来就不高，是已知局限，
     符合项目一贯"先跑起来，以后再换更精细的匹配"的做法。
     查询失败（key 没配/网络问题）优雅降级成空列表，不抛异常炸穿调用方。
+
+    limit：截断保留几个（默认 8）——原型 nearby_planner.py（fellow 分支，已删除，重构成
+    这一版之前的实现）的做法是先用一次 LLM 调用把候选"从资料中选出最多 6 个地点"，再
+    `pool = ranked[:8]` 硬截断成 8 个，之后才走贪心排线路。当时那个设计没有现成的排序分数，
+    所以要靠一次额外 LLM 调用做筛选；现在 recommendation_score/persona_match_score 已经是
+    结构化排序依据（口碑复核算出来的），直接按这个分数截断效果等价，还省了一次 LLM 调用——
+    单次 nearby() 请求（AMap 同城 POI 检索，radius=1500m，多个 type code 一起查）经常一次
+    就回几十条，run() 里 mode="trip" 场景对每个种子都各自调一次这个函数（3 天行程能有十几个
+    种子），不截断的话汇总去重完still是几百条量级（真实测过 290 条），既拖慢下游两轮
+    _classify_categories() 的 LLM 调用，也让 route_agent 排程序 JSON payload 臃肿。
     """
     try:
         pois = nearby_sources.nearby(city, origin, radius=_NEARBY_RADIUS_M)
@@ -145,7 +158,7 @@ def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) ->
 
     # 有人格匹配分的排最前（分数越高越前）；有评价但算不出匹配分的其次；完全没评价的排最后但仍保留
     results.sort(key=lambda r: (r["persona_match_score"] is None, -(r["persona_match_score"] or 0)))
-    return results
+    return results[:limit]
 
 
 _CATEGORY_FIX_PROMPT = """你是达人 Agent 的分类质检员。下面是一批候选地点（JSON 数组，每项：
