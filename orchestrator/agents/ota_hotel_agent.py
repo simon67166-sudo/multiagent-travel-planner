@@ -189,12 +189,19 @@ def _existing_hotel_distance_check(trip_plan_obj: dict) -> str | None:
     return f"已预订的酒店「{hotel.get('name')}」离 {names} 这天的行程终点比较远，往返需要多预留交通时间。"
 
 
-def _search_real_hotels(city: str, check_in: str | None, check_out: str | None, nights: int, category: str | None, user_message: str | None, anchor: dict | None = None) -> tuple[list[dict], str | None]:
+def _search_real_hotels(
+    city: str, check_in: str | None, check_out: str | None, nights: int, category: str | None,
+    user_message: str | None, anchor: dict | None = None, star_min: float | None = None,
+) -> tuple[list[dict], str | None]:
     """真查 hotel_tool（道旅 RollingGo），失败时优雅降级返回空列表 + 错误信息，不往上抛异常炸穿 orchestrate()。
 
     anchor 给了（行程已经排出具体地点，{"place":,"lng":,"lat":}）就按这个地点搜
     （place_type="景点"，真实验证过这个类型能让 RollingGo 按地点收窄结果，不是只在文字里
     提一句），没给就退回城市级搜索（place_type="城市"）。
+
+    star_min 透传给 hotel_tool.search_hotels()（那边接口本来就有这个参数，之前没接上）——
+    trip_preferences.py 的 hotel_preference="度假酒店" 场景会传一个较高的星级门槛，偏向
+    更好的酒店，不是随便哪家都行。
 
     锚点搜索有个真实踩过的坑：地标不够出名时 RollingGo 可能整个匹配错地方（"中西药局旧址"
     被匹配到美国圣路易斯去了）——查回来的酒店坐标用 anchor 里已经查好的真实坐标做一次合理性
@@ -208,7 +215,7 @@ def _search_real_hotels(city: str, check_in: str | None, check_out: str | None, 
     try:
         hotels = hotel_tool.search_hotels(
             place=place, place_type=place_type, origin_query=origin_query,
-            check_in_date=check_in, stay_nights=nights, size=5,
+            check_in_date=check_in, stay_nights=nights, size=5, star_min=star_min,
         )
     except Exception as e:
         return [], str(e)
@@ -280,14 +287,24 @@ def run(
     决定，不该每次 booking 意图命中都重新搜一遍候选去"暗示"换酒店；改成调
     _existing_hotel_distance_check() 检查现有酒店离行程够不够近，有问题只在结果里带一句
     提醒（result["hotel_distance_reminder"]），不自动推荐替代方案。
+
+    trip_preferences.py 的 hotel_preference="度假酒店" 时（用户想单独挑一家好酒店当度假
+    体验，不介意离行程远）不走锚点收窄，搜城市级候选、且提高星级门槛；"周边"/没问过（默认）
+    时维持锚点收窄的行为不变。
     """
     city = location or shared_state.get("city") or "澳门"
     check_in, check_out, nights = _parse_date_range(date_range)
     trip_plan_obj = shared_state.get("trip_plan", {})
+    hotel_preference = shared_state.get("trip_preferences", {}).get("hotel_preference")
 
     hotel_distance_reminder = _existing_hotel_distance_check(trip_plan_obj)
     if trip_plan_obj.get("hotels"):
         hotel_candidates, hotel_error = [], None
+    elif hotel_preference == "度假酒店":
+        resort_query = user_message or f"想在{city}找一家适合度假体验的高品质酒店"
+        hotel_candidates, hotel_error = _search_real_hotels(
+            city, check_in, check_out, nights, category, resort_query, anchor=None, star_min=4.0
+        )
     else:
         anchor = _anchor_place_from_trip(trip_plan_obj)
         hotel_candidates, hotel_error = _search_real_hotels(city, check_in, check_out, nights, category, user_message, anchor)
@@ -313,6 +330,12 @@ def run(
         for direction, on_date in (("depart", depart_date), ("return", return_date))
         for r in _generate_beijing_flights(city, on_date, direction)
     ]
+
+    # flight_priority="省钱" 时按价格升序排一下——机票是假数据（见文件顶部说明），排序是
+    # 目前唯一能真实影响的地方，不假装能筛真实时刻/舱位。"折衷"/"极致体验" 维持原有的
+    # 按时段排列，不特殊处理（假数据里没有能区分"体验"好坏的字段，不硬凑）。
+    if shared_state.get("trip_preferences", {}).get("flight_priority") == "省钱":
+        flight_candidates.sort(key=lambda f: f["price"])
 
     result = {"candidates": flight_candidates + hotel_candidates}
     if hotel_error:

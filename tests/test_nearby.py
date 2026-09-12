@@ -401,4 +401,63 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(mocked.call_args_list[1].kwargs["place"], "澳门")
         self.assertEqual(mocked.call_args_list[1].kwargs["place_type"], "城市")
 
+    def test_search_real_hotels_forwards_star_min(self):
+        # 2026-09-16：star_min 是 hotel_tool.search_hotels() 本来就有的参数，之前
+        # _search_real_hotels() 没接上——trip_preferences.py 的"度假酒店"场景要用它
+        # 提高星级门槛
+        from agents import ota_hotel_agent
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=[]) as mocked:
+            ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=None, star_min=4.0)
+        self.assertEqual(mocked.call_args.kwargs["star_min"], 4.0)
+
+    def test_run_hotel_preference_resort_skips_anchor_and_raises_star_min(self):
+        # 2026-09-16：hotel_preference="度假酒店" 时不走锚点收窄（用户不介意离行程远，
+        # 想单独挑一家好酒店），提高星级门槛偏向更好的酒店
+        import trip_plan
+        from agents import ota_hotel_agent
+        trip = trip_plan.new_trip_plan("test-hotel-preference-resort")
+        day1 = trip_plan.get_or_create_day(trip, "2026-09-15")
+        trip_plan.add_stop(day1, "n1", "attraction", "大三巴", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.54, lat=22.19)
+        state = {"trip_plan": trip, "city": "澳门", "trip_preferences": {"hotel_preference": "度假酒店", "flight_priority": "折衷"}}
+        with patch.object(ota_hotel_agent, "_search_real_hotels", return_value=([], None)) as search_mock, \
+             patch.object(ota_hotel_agent, "_anchor_place_from_trip") as anchor_mock:
+            ota_hotel_agent.run(state, location=None, date_range="2026-09-20~2026-09-22")
+        anchor_mock.assert_not_called()  # 不该去算锚点，压根用不上
+        self.assertIsNone(search_mock.call_args.kwargs["anchor"])
+        self.assertEqual(search_mock.call_args.kwargs["star_min"], 4.0)
+
+    def test_run_sorts_flights_by_price_when_saving_money(self):
+        from agents import ota_hotel_agent
+        state = {"trip_plan": {"days": {}, "hotels": []}, "city": "澳门", "trip_preferences": {"hotel_preference": "周边", "flight_priority": "省钱"}}
+        with patch.object(ota_hotel_agent, "_search_real_hotels", return_value=([], None)):
+            result = ota_hotel_agent.run(state, location=None, date_range="2026-09-20~2026-09-22")
+        flight_prices = [c["price"] for c in result["candidates"] if c.get("provider_type") == "flight"]
+        self.assertEqual(flight_prices, sorted(flight_prices))
+
+    def test_trip_preferences_missing_fields_and_defaults(self):
+        import trip_preferences
+        prefs = trip_preferences.TripPreferences()
+        self.assertEqual(set(prefs.missing_fields()), {"hotel_preference", "flight_priority"})
+        self.assertFalse(prefs.is_complete())
+        prefs.hotel_preference = "度假酒店"
+        self.assertEqual(prefs.missing_fields(), ["flight_priority"])
+        prefs.apply_defaults()
+        self.assertTrue(prefs.is_complete())
+        self.assertEqual(prefs.flight_priority, "折衷")  # 应用默认值，酒店偏好保留原值不覆盖
+        self.assertEqual(prefs.hotel_preference, "度假酒店")
+
+    def test_trip_preferences_from_dict_rejects_invalid_values(self):
+        import trip_preferences
+        restored = trip_preferences.TripPreferences.from_dict({"hotel_preference": "不存在的值", "flight_priority": "省钱"})
+        self.assertIsNone(restored.hotel_preference)  # 非法值当没填
+        self.assertEqual(restored.flight_priority, "省钱")
+        self.assertEqual(trip_preferences.TripPreferences.from_dict(None).to_dict(), {"hotel_preference": None, "flight_priority": None})
+
+    def test_build_preference_question_lists_only_missing_fields(self):
+        from agents import orchestrator_agent as agent
+        question = agent._build_preference_question(["hotel_preference"])
+        self.assertIn("酒店", question)
+        self.assertNotIn("机票", question)
+        self.assertIn("继续", question)  # 提示可以跳过
+
 if __name__ == "__main__": unittest.main()

@@ -106,5 +106,32 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIn("previous preference", json.dumps(classify.call_args_list[0].args[0]))
         schedule.assert_not_called()
 
+    def test_content_intent_gates_on_trip_preferences_then_resumes_original_message(self):
+        # 2026-09-16：常规推荐（mode="trip"）开始搜索前先确认酒店/机票偏好（persona 系统
+        # 已经覆盖的"节奏"/"模式"不重复问）。第一轮应该只问问题、不调 content_agent；
+        # 第二轮（哪怕用户直接说"继续"）应该用第一轮暂存的原始请求继续走正常流程
+        from agents import orchestrator_agent as agent
+        import trip_preferences
+        state = agent.new_shared_state("preference-gate-test-user")
+
+        with patch.object(agent, "classify_intent", return_value=["content"]), \
+             patch.object(agent.content_agent, "run") as content_mock:
+            output, state = agent.orchestrate("推荐一个3天的行程", state)
+        content_mock.assert_not_called()
+        self.assertIn("酒店", output["chat_reply"])
+        self.assertEqual(state["pending_trip_request"], "推荐一个3天的行程")
+        self.assertFalse(trip_preferences.TripPreferences.from_dict(state["trip_preferences"]).is_complete())
+
+        fake_content_result = {"recommendations": [], "nearby_params": None, "clarification_needed": None}
+        with patch.object(agent, "classify_intent", return_value=["content"]), \
+             patch.object(agent, "_parse_preference_answer", return_value={}), \
+             patch.object(agent.content_agent, "run", return_value=fake_content_result) as content_mock, \
+             patch.object(agent.llm_tool, "call_llm", return_value="收到"):
+            agent.orchestrate("继续", state)
+        content_mock.assert_called_once()
+        self.assertEqual(content_mock.call_args.kwargs["location_hint"], "推荐一个3天的行程")
+        self.assertIsNone(state.get("pending_trip_request"))
+        self.assertTrue(trip_preferences.TripPreferences.from_dict(state["trip_preferences"]).is_complete())
+
 if __name__ == "__main__":
     unittest.main()

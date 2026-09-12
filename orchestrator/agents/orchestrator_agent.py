@@ -18,6 +18,7 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
 import llm_tool
 import persona
 import trip_plan
+import trip_preferences
 import widgets
 from agents import content_agent, exception_agent, ota_hotel_agent, route_agent, restaurant_agent
 
@@ -35,6 +36,55 @@ def _extract_city(text: str) -> str | None:
 
 
 _REPLAN_FOLLOWUP = "接下来是要我帮你补一个新的活动填上这段时间，还是把这一天/整个行程重新排一遍？"
+
+# 行程偏好确认：常规推荐（mode="trip"）开始搜索之前，先确认 persona 系统没有覆盖的两个
+# 新维度（酒店偏好、机票优先级）——"旅行节奏"/"旅行模式"已经是 persona 的 pace_score/
+# scenario/interest_theme，不在这里重复问，见 trip_preferences.py 顶部说明。
+_PREFERENCE_QUESTIONS = {
+    "hotel_preference": "酒店想住在行程周边图方便，还是单独选一家好酒店当度假体验？",
+    "flight_priority": "机票更在意省钱，还是时间，还是想要更好的体验？",
+}
+
+_PREFERENCE_PARSE_PROMPT = """你是旅行助手的偏好解析模块。用户刚才被问了这些问题：
+{questions}
+请解析用户下面这句回答，判断出对应字段的值：
+- hotel_preference: "周边"（想住在行程附近，图方便）或 "度假酒店"（想单独挑一家好酒店，
+  不介意离行程远，追求度假体验）
+- flight_priority: "省钱"（预算优先，时间不敏感）、"折衷"（价格时间都要考虑）、
+  "极致体验"（不太在意价格，想要更好的时段/服务）
+用户如果说"继续"/"随便"/"都可以"这类话，或者没有对某个字段明确表态，那个字段就不用输出。
+只输出 JSON，格式 {{"hotel_preference": "...", "flight_priority": "..."}}，只包含用户
+明确表达了倾向的字段，没提到的字段不要出现在 JSON 里；一个都没提到就输出 {{}}。不要输出
+其他任何文字。"""
+
+
+def _build_preference_question(missing_fields: list[str]) -> str:
+    """固定拼接，不需要 LLM——只有两句候选文案，直接列出还缺的那几条就够了。"""
+    numbered = "\n".join(f"{i + 1}. {_PREFERENCE_QUESTIONS[f]}" for i, f in enumerate(missing_fields))
+    return f"在开始搜索前，想先确认几点：\n{numbered}\n（不回答也可以直接说\"继续\"，我按默认值处理）"
+
+
+def _parse_preference_answer(user_message: str, missing_fields: list[str]) -> dict:
+    """解析用户对追问的自由文本回答，返回 {"hotel_preference": ...}/{"flight_priority": ...}
+    的部分或全部字段——用户没提到的字段不会出现在返回值里，调用方用
+    TripPreferences.apply_defaults() 兜底，不强求一次问全。LLM 调用/解析失败就返回空 dict，
+    不能让追问这一步卡住整个对话。"""
+    questions_text = "\n".join(_PREFERENCE_QUESTIONS[f] for f in missing_fields)
+    try:
+        raw = llm_tool.call_llm(
+            [
+                {"role": "system", "content": _PREFERENCE_PARSE_PROMPT.format(questions=questions_text)},
+                {"role": "user", "content": user_message},
+            ],
+            model=llm_tool.MODEL_LIGHT,
+        )
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = "\n".join(clean.splitlines()[1:-1])
+        parsed = json.loads(clean)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 
 
 def _trim_recommendations_for_reply(recommendations: list[dict]) -> list[dict]:
@@ -88,6 +138,8 @@ def new_shared_state(user_id: str, scenario: str = "vacation", onboarding_answer
         "scenario": scenario,
         "persona": persona_obj,
         "trip_plan": trip_plan.new_trip_plan(trip_id=f"trip-{user_id}"),
+        "trip_preferences": trip_preferences.TripPreferences().to_dict(),
+        "pending_trip_request": None,  # 问完偏好之前，用户真正想说的那句话暂存在这里
     }
 
 
@@ -136,7 +188,33 @@ def classify_intent(user_message: str, history: list[dict] | None = None) -> lis
 # ---------------------------------------------------------------------------
 def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
     history = deepcopy(shared_state.get("messages", []))
+    prefs = trip_preferences.TripPreferences.from_dict(shared_state.get("trip_preferences"))
+
+    if shared_state.get("pending_trip_request"):
+        # 上一轮问了偏好（_build_preference_question()），这轮是用户的回答——解析、填
+        # 字段，没提到/解析不出来的字段用默认值兜底（不会一直追问），然后把暂存的原始
+        # 请求接回来，当作这轮真正收到的消息继续走正常流程（重新分类意图、正常分发）
+        answered = _parse_preference_answer(user_message, prefs.missing_fields())
+        if answered.get("hotel_preference") in trip_preferences.HOTEL_PREFERENCES:
+            prefs.hotel_preference = answered["hotel_preference"]
+        if answered.get("flight_priority") in trip_preferences.FLIGHT_PRIORITIES:
+            prefs.flight_priority = answered["flight_priority"]
+        prefs.apply_defaults()
+        shared_state["trip_preferences"] = prefs.to_dict()
+        user_message = shared_state.pop("pending_trip_request")
+
     intents = classify_intent(user_message, history)
+
+    if "content" in intents and "nearby" not in intents and not prefs.is_complete():
+        # mode="trip"（常规推荐）开始搜索之前先确认偏好；mode="nearby"（"从大三巴出发逛
+        # 3小时"这种直接行动请求）不需要，跟它不走 attraction_picker 确认流程是同一个道理
+        question = _build_preference_question(prefs.missing_fields())
+        shared_state["pending_trip_request"] = user_message
+        shared_state["messages"] = history + [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": question},
+        ]
+        return {"chat_reply": question, "community_panel": [], "map_panel": {}, "widgets": [], "restaurant_evidence": []}, shared_state
 
     results: dict[str, Any] = {}
     if "restaurant" in intents:
