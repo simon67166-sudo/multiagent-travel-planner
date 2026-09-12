@@ -52,13 +52,76 @@ _SLOT_TEMPLATE = [
     {"slot_id": "breakfast", "pool": "breakfast", "start": "08:00", "end": "09:00", "required": True},
     {"slot_id": "morning", "pool": "attraction", "start": "09:15", "end": "12:00", "required": True},
     {"slot_id": "lunch", "pool": "lunch_dinner", "start": "12:00", "end": "13:30", "required": True},
-    {"slot_id": "afternoon", "pool": "attraction", "start": "14:00", "end": "17:30", "required": False},
+    # 2026-09-17 起 required=True：候选配额是按"景点≥2×天数"筛的（content_agent.py），
+    # 排班这边如果只有"上午"是必选锚点，"下午"排出来的候选 anchor=False，会被
+    # _llm_review_day() 当成可拿掉的加塞项——候选池明明够，排出来了却可能被复核悄悄砍掉，
+    # 变回每天只保底 1 个景点，跟配额保证的"至少2个"对不上。"下午"改必选之后，只要
+    # pick_one() 真排出来了就不会被复核拿掉，"至少2个"才是硬保证而不是走运
+    {"slot_id": "afternoon", "pool": "attraction", "start": "14:00", "end": "17:30", "required": True},
     {"slot_id": "dinner", "pool": "lunch_dinner", "start": "18:00", "end": "19:30", "required": True},
     {"slot_id": "evening", "pool": "attraction", "start": "19:30", "end": "21:30", "required": False},
 ]
 _INSERT_PROXIMITY_M = 800  # 景点槽位排完主候选后，加塞候选必须在这个距离内（比 _nearby_plan() 的 1500m 搜索半径更严格，避免"顺路"变成"绕路"）
 _MIN_LEFTOVER_MINUTES_FOR_INSERT = 45  # 这个槽位至少还剩这么多分钟才考虑加塞
 _SLOT_FILL_MAX_ATTEMPTS = 3  # 一个槽位最多试几个候选就放弃，避免候选池很大时挨个试到底
+
+# 机票落地/起飞时间嵌入排班（2026-09-17，用户提出）：抵达当天/离开当天不能套用一天完整的
+# 时段骨架——落地当天赶不上早餐/上午景点，离开当天下午/晚上可能已经在去机场路上。
+_ARRIVAL_BUFFER_MIN = 120  # 落地后预留过关取行李通勤时间，这之前的槽位这天排不进去
+_DEPARTURE_BUFFER_MIN = 180  # 起飞前预留去机场值机安检时间，这之后的槽位这天排不进去
+
+
+def _flight_arrival_and_departure(trip_plan_obj: dict, city: str | None) -> tuple[str | None, str | None]:
+    """从 trip_plan.flights 里找"抵达本次目的地城市"的到达时间、"离开本次目的地城市"的
+    起飞时间——demo 机票数据（ota_hotel_agent._generate_beijing_flights()）没有专门的
+    direction 字段，用 to_==city（飞到这个城市）/from_==city（从这个城市飞走）判断方向，
+    够用不追求精确。没订机票，或者存的机票 from_/to 跟这次城市对不上（比如手误/演示数据
+    不完整）就返回 (None, None)，调用方不受约束，不强求。"""
+    arrival_time = departure_time = None
+    if not city:
+        return None, None
+    for f in trip_plan_obj.get("flights", []):
+        if f.get("to") == city and f.get("arrive_time"):
+            arrival_time = f["arrive_time"]
+        if f.get("from_") == city and f.get("depart_time"):
+            departure_time = f["depart_time"]
+    return arrival_time, departure_time
+
+
+def _clip_slot_template(slot_template: list[dict], min_start: datetime | None = None, max_end: datetime | None = None) -> list[dict]:
+    """把槽位窗口本身裁短，而不是整槽保留/丢弃——落地 10:10、留 2 小时缓冲到 12:10，
+    "午餐"槽位名义上 12:00 开始，但窗口到 13:30，裁完变成 12:10-13:30 还能用，不会因为
+    名义开始时间比这天能动的时间早 10 分钟就整个作废。裁完 start>=end（这个槽位窗口被
+    完全吃掉）就丢弃这条。"""
+    result = []
+    for slot in slot_template:
+        start = datetime.strptime(slot["start"], "%H:%M")
+        end = datetime.strptime(slot["end"], "%H:%M")
+        if min_start is not None:
+            start = max(start, min_start)
+        if max_end is not None:
+            end = min(end, max_end)
+        if start >= end:
+            continue
+        result.append({**slot, "start": start.strftime("%H:%M"), "end": end.strftime("%H:%M")})
+    return result
+
+
+def _day_slot_templates(time_budget_days: int, arrival_time: str | None, departure_time: str | None) -> list[list[dict]]:
+    """给每一天算一份实际能用的槽位模板——中间的天用完整 _SLOT_TEMPLATE，第 1 天（如果有
+    抵达时间）把槽位窗口裁到不早于"到达时间+_ARRIVAL_BUFFER_MIN"，最后 1 天（如果有起飞
+    时间）裁到不晚于"起飞时间-_DEPARTURE_BUFFER_MIN"。只有 1 天且这天既是抵达日又是离开日
+    时，两个裁剪会叠加（窗口可能被完全吃掉，比如当天来回——现实里这种行程本来就没法安排
+    景点，砍空是合理结果，不是 bug）。"""
+    templates = [list(_SLOT_TEMPLATE) for _ in range(time_budget_days)]
+    if arrival_time:
+        min_start = datetime.strptime(arrival_time, "%H:%M") + timedelta(minutes=_ARRIVAL_BUFFER_MIN)
+        templates[0] = _clip_slot_template(templates[0], min_start=min_start)
+    if departure_time:
+        last = time_budget_days - 1
+        max_end = datetime.strptime(departure_time, "%H:%M") - timedelta(minutes=_DEPARTURE_BUFFER_MIN)
+        templates[last] = _clip_slot_template(templates[last], max_end=max_end)
+    return templates
 
 
 def _distance_m(a: dict, b: dict) -> float:
@@ -193,11 +256,120 @@ def _place_day(day_plan: dict, ordered_stops: list[dict], start_point: dict | No
     return unscheduled, current_point
 
 
+_ATTRACTIONS_PER_DAY_CLUSTER = 4  # 上午/下午/晚上 3 个景点槽位 + 1 个给"加塞"留的余量
+_BREAKFAST_PER_DAY_CLUSTER = 1
+_LUNCH_DINNER_PER_DAY_CLUSTER = 2  # 午餐 + 晚餐
+
+
+def _centroid(points: list[dict]) -> dict | None:
+    """一组候选坐标的几何重心，points 为空或都没坐标就返回 None（调用方拿到 None 要有兜底，
+    不能直接拿去算距离）。"""
+    coords = [(p["lng"], p["lat"]) for p in points if p.get("lng") is not None and p.get("lat") is not None]
+    if not coords:
+        return None
+    return {"lng": sum(c[0] for c in coords) / len(coords), "lat": sum(c[1] for c in coords) / len(coords)}
+
+
+def _greedy_geo_cluster(
+    pool: list[dict], day_capacities: list[int], priority_places: set | frozenset = frozenset()
+) -> tuple[list[list[dict]], list[dict]]:
+    """把候选贪心聚成跟 day_capacities 等长的组，第 i 组最多 day_capacities[i] 个（抵达/离开
+    当天航班时间挤占了槽位，那天的容量比平时天数小，见 _day_slot_templates()），让同一天的
+    候选尽量扎堆在同一片区域，不是天南地北乱跳——用户反馈"排路线也该把离得比较近或者顺路的
+    排一天"的三步法里第一、二步（先挑排名靠前的，再按距离聚类）：每组先从还没分组的候选里
+    挑 recommendation_score 最高的当"种子"，再从剩下的里挑离种子最近的几个凑够容量，同一个
+    候选只属于一天。
+
+    priority_places 命中的候选（用户在 attraction_picker 里勾选的）优先当种子——保证它们
+    尽早占到坑位，不会因为分数一般，正常排队排到后面时容量已经被别的候选占满。就算这样还是
+    没分到任何一天（比如所有天的容量加起来都不够），最后会尝试硬塞进离它最近、已经有候选的
+    那一天，哪怕因此超出这天原定的容量——用户明确选的地点不能因为排班算法的配额算不过来就
+    悄无声息地消失在 unscheduled 里，这跟"抵达/离开当天该冲掉哪个候选"是同一件事的两面：
+    冲掉的如果是用户勾选的，就该想办法挪到别的天，而不是直接放弃。
+
+    返回 (每天一组的候选列表, 真的没地方放的剩余候选)——剩余的会被调用方并入 unscheduled，
+    跟"过滤完退回未过滤结果"是同一个"尽力而为不强求"的哲学。"""
+    remaining = list(pool)
+    clusters: list[list[dict]] = [[] for _ in day_capacities]
+
+    def pick_seed(candidates: list[dict]) -> dict:
+        priority_candidates = [c for c in candidates if c.get("place") in priority_places]
+        pool_for_seed = priority_candidates or candidates
+        return max(pool_for_seed, key=lambda c: c.get("recommendation_score") or 0)
+
+    for day_idx, capacity in enumerate(day_capacities):
+        if capacity <= 0 or not remaining:
+            continue
+        seed = pick_seed(remaining)
+        remaining.remove(seed)
+        group = [seed]
+        remaining.sort(key=lambda c: _distance_m(seed, c))
+        while len(group) < capacity and remaining:
+            group.append(remaining.pop(0))
+        clusters[day_idx] = group
+
+    stranded_priority = [c for c in remaining if c.get("place") in priority_places]
+    for item in stranded_priority:
+        days_with_members = [i for i, group in enumerate(clusters) if group]
+        if not days_with_members:
+            break
+        target = min(days_with_members, key=lambda i: min(_distance_m(m, item) for m in clusters[i]))
+        clusters[target].append(item)
+        remaining.remove(item)
+
+    return clusters, remaining
+
+
+def _assign_by_proximity(
+    pool: list[dict], centroids: list[dict | None], day_capacities: list[int],
+    priority_places: set | frozenset = frozenset(),
+) -> tuple[list[list[dict]], list[dict]]:
+    """把候选按"离哪天的地理重心最近"分给对应的天，第 i 天最多 day_capacities[i] 个——
+    早餐/午晚餐该配到跟当天景点顺路的那一片，不是自己单独按分数瞎排，不然行程会变成
+    "早餐在城北、景点在城南"这种来回跳。同一个候选只分给一天，剩下没分完的（比如总量超过
+    容量总和）并入 unscheduled，思路跟 _greedy_geo_cluster() 一致。
+
+    priority_places 命中的候选一样有兜底：正常按容量分完之后，还有没分到任何一天的优先
+    候选，就尝试塞进离它最近、且已经有候选（centroid 有意义）的那一天，避免用户勾选的
+    早餐/午晚餐候选因为容量不够/抵达当天没了早餐槽位就直接消失。"""
+    remaining = list(pool)
+    assigned: list[list[dict]] = []
+    for day_idx, centroid in enumerate(centroids):
+        capacity = day_capacities[day_idx]
+        if centroid is None or not remaining or capacity <= 0:
+            assigned.append([])
+            continue
+        remaining.sort(key=lambda c: _distance_m(centroid, c))
+        assigned.append(remaining[:capacity])
+        del remaining[:capacity]
+
+    stranded_priority = [c for c in remaining if c.get("place") in priority_places]
+    for item in stranded_priority:
+        days_with_centroid = [i for i, c in enumerate(centroids) if c is not None]
+        if not days_with_centroid:
+            break
+        target = min(days_with_centroid, key=lambda i: _distance_m(centroids[i], item))
+        assigned[target].append(item)
+        remaining.remove(item)
+    return assigned, remaining
+
+
 def _fill_day_skeleton(
-    attraction_pool: list[dict], breakfast_pool: list[dict], lunch_dinner_pool: list[dict], city: str | None
+    attraction_pool: list[dict], breakfast_pool: list[dict], lunch_dinner_pool: list[dict], city: str | None,
+    priority_places: set | frozenset = frozenset(),
+    slot_template: list[dict] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
-    """mode="trip" 专用：按 _SLOT_TEMPLATE 顺序把候选池里的候选排进当天的时段骨架，先在内存
+    """mode="trip" 专用：按 slot_template 顺序把候选池里的候选排进当天的时段骨架，先在内存
     里排好（还没调 trip_plan.add_stop()，等 _llm_review_day() 复核完再真正落地）。
+
+    slot_template 默认是完整的 _SLOT_TEMPLATE；抵达/离开当天航班时间挤占槽位时，调用方
+    （schedule()）会传一份砍过的子集进来（见 _day_slot_templates()）——这天能用的槽位少了，
+    但槽位内排班逻辑不用跟着改，直接用传进来的模板顺序走就行。传空列表（这天完全没有可用
+    槽位，比如当天来回）直接原样退回三个候选池，不排任何东西，不报错。
+
+    priority_places 非空时（"place" 字段命中的候选），槽位内排在同池子其它候选前面优先
+    尝试，命中的排完/没法排进当前槽位（比如时段塞不下）就轮到后面按距离排的其它候选——
+    不是"只排这些"，只是"优先试这些"，跟 schedule() 文档里说的"优先不是唯一"是同一件事。
 
     返回 (这一天预排好的有序节点列表, 用剩的 attraction_pool, 用剩的 breakfast_pool, 用剩的
     lunch_dinner_pool)——三个池子要把这天用掉的候选摘除，好让下一天继续从剩下的候选里选，
@@ -211,13 +383,16 @@ def _fill_day_skeleton(
     提前结束就提前开始下一段——刻意模拟真实旅游的节奏感（吃完午饭到下午景点开门之间留出
     休息/自由活动时间），不是 bug。
     """
+    slot_template = _SLOT_TEMPLATE if slot_template is None else slot_template
     attraction_pool = list(attraction_pool)
     breakfast_pool = list(breakfast_pool)
     lunch_dinner_pool = list(lunch_dinner_pool)
+    if not slot_template:
+        return [], attraction_pool, breakfast_pool, lunch_dinner_pool
     pools = {"attraction": attraction_pool, "breakfast": breakfast_pool, "lunch_dinner": lunch_dinner_pool}
     day_stops: list[dict] = []
     current_point: dict | None = None
-    cursor = datetime.strptime(_SLOT_TEMPLATE[0]["start"], "%H:%M")
+    cursor = datetime.strptime(slot_template[0]["start"], "%H:%M")
     stops_today = 0
 
     def pick_one(pool: list[dict], slot_end: datetime, ordered_candidates: list[dict]) -> dict | None:
@@ -246,14 +421,17 @@ def _fill_day_skeleton(
             return {**candidate, "arrival_time": arrival, "end_time": finish, "arrival_transport": transport_label}
         return None
 
-    for slot in _SLOT_TEMPLATE:
+    for slot in slot_template:
         if stops_today >= _MAX_STOPS_PER_DAY:
             break
         slot_start = datetime.strptime(slot["start"], "%H:%M")
         slot_end = datetime.strptime(slot["end"], "%H:%M")
         cursor = max(cursor, slot_start)
         pool = pools[slot["pool"]]
-        ordered = sorted(pool, key=lambda c: _distance_m(current_point, c)) if current_point else list(pool)
+        ordered = sorted(
+            pool,
+            key=lambda c: (c.get("place") not in priority_places, _distance_m(current_point, c) if current_point else 0),
+        )
         picked = pick_one(pool, slot_end, ordered)
         if picked is None:
             continue
@@ -337,6 +515,7 @@ def schedule(
     time_budget_days: int = 1,
     hours: float | None = None,
     origin: dict | None = None,
+    priority_places: set | frozenset | None = None,
 ) -> dict:
     """
     统一排时间接口，给编排 Agent 调用：拿达人 Agent（content_agent.run()）给的候选列表，
@@ -357,8 +536,12 @@ def schedule(
     不硬凑坐标。天气只查最后排到的那个点附近未来 24 小时（避免每天/每站都查一次天气
     浪费调用次数），调 weather_tool.get_hourly_forecast()。
 
-    返回 {"days": {day_key: [...该天已排好的节点，day_stops() 格式]},
-      "weather_reminders": [...], "unscheduled": [...没能排进任何一天的候选]}
+    priority_places（mode="trip" 才有意义）：候选的 "place" 字段集合，槽位内排在其他候选
+    前面优先尝试——server.py 的 attraction_picker 确认走的就是这条路径：用户在候选池里勾选
+    的那几个不该是排班时唯一能看到的候选（那样一来其它槽位——早餐/午晚餐/用户没勾的景点——
+    完全没有候选可用，只能空着），route_agent 该看到达人 Agent 给的全量候选池，用户勾选的
+    只是"优先"，不是"唯一"。跟 _llm_review_day() 的 recommendation_score 复核是两回事：
+    这个只管填槽位时先试谁，复核管的是排完之后要不要拿掉。
     """
     geocoded = [c for c in candidates if c.get("lng") is not None and c.get("lat") is not None]
     unscheduled: list[dict] = [c for c in candidates if c not in geocoded]
@@ -382,19 +565,58 @@ def schedule(
         unscheduled.extend(leftover)
         unscheduled.extend(day_unscheduled)
     else:
-        # 时段骨架排班（2026-09-15 起，2026-09-16 加早餐槽位）：早餐 + 上午/下午/晚上景点
-        # 槽位 + 午餐/晚餐槽位，见 _SLOT_TEMPLATE。景点/早餐/午晚餐候选池三分，槽位类型
-        # 天然保证类别配比，槽位时间窗口天然限制单段能跳多远——不再是"一天11小时预算"
-        # 这种粗粒度贪心。
+        # 时段骨架排班（2026-09-15 起，2026-09-16 加早餐槽位，2026-09-17 加地理聚类分天 +
+        # 机票落地/起飞时间约束）：三步法（用户提出）——① 候选按 recommendation_score 排名
+        # ② 按地理距离聚类分成 time_budget_days 组，让同一天的候选尽量扎堆在同一片区域，不是
+        # 天南地北乱跳（_greedy_geo_cluster()/_assign_by_proximity()）③ 每天的这一组候选再走
+        # 槽位+加塞排班（_fill_day_skeleton()，这部分逻辑不变，只是喂给它的候选池从"全行程
+        # 共享的大池子"换成了"这一天自己的聚类小池子"）。
+        #
+        # 抵达/离开当天的槽位模板会被砍掉一部分（_day_slot_templates()，落地后/起飞前留出
+        # 通勤缓冲），聚类这一步要提前知道每天实际还剩多少景点/早餐/午晚餐槽位
+        # （day_slot_templates 算出来的容量），不能还按平时的固定量分——不然抵达当天分到的
+        # 景点比排得下的还多，多出来的会被 _fill_day_skeleton() 因为槽位不够而打回
+        # unscheduled，明明是用户勾选的候选也会一起被打回去。
+        arrival_time, departure_time = _flight_arrival_and_departure(trip, city)
+        day_slot_templates = _day_slot_templates(time_budget_days, arrival_time, departure_time)
+        attraction_capacity = [
+            sum(1 for s in tmpl if s["pool"] == "attraction") + (1 if any(s["pool"] == "attraction" for s in tmpl) else 0)
+            for tmpl in day_slot_templates
+        ]
+        breakfast_capacity = [
+            _BREAKFAST_PER_DAY_CLUSTER if any(s["slot_id"] == "breakfast" for s in tmpl) else 0
+            for tmpl in day_slot_templates
+        ]
+        lunch_dinner_capacity = [sum(1 for s in tmpl if s["slot_id"] in ("lunch", "dinner")) for tmpl in day_slot_templates]
+
         attraction_pool = [c for c in geocoded if _pool_for_candidate(c) == "attraction"]
         breakfast_pool = [c for c in geocoded if _pool_for_candidate(c) == "breakfast"]
         lunch_dinner_pool = [c for c in geocoded if _pool_for_candidate(c) == "lunch_dinner"]
+
+        priority = priority_places or frozenset()
+        attraction_clusters, attraction_leftover = _greedy_geo_cluster(attraction_pool, attraction_capacity, priority)
+        # 景点聚类的重心当"这天大概在哪一片区域"的参考点，早餐/午晚餐按这个重心就近分天，
+        # 保证"顺路"；某天完全没景点（比如景点候选本来就不够分）就退回全行程候选的整体重心，
+        # 不然那天的早餐/午晚餐无处可分、干脆空着——空着比"瞎凑一个"更糟，全行程重心好歹是
+        # 有意义的参考点
+        overall_centroid = _centroid(geocoded)
+        centroids = [_centroid(cluster) or overall_centroid for cluster in attraction_clusters]
+        breakfast_by_day, breakfast_leftover = _assign_by_proximity(breakfast_pool, centroids, breakfast_capacity, priority)
+        lunch_dinner_by_day, lunch_dinner_leftover = _assign_by_proximity(lunch_dinner_pool, centroids, lunch_dinner_capacity, priority)
+
         for day_offset in range(time_budget_days):
-            if not attraction_pool and not breakfast_pool and not lunch_dinner_pool:
-                break
-            day_stops, attraction_pool, breakfast_pool, lunch_dinner_pool = _fill_day_skeleton(
-                attraction_pool, breakfast_pool, lunch_dinner_pool, city
+            day_attraction_pool = attraction_clusters[day_offset]
+            day_breakfast_pool = breakfast_by_day[day_offset]
+            day_lunch_dinner_pool = lunch_dinner_by_day[day_offset]
+            if not day_attraction_pool and not day_breakfast_pool and not day_lunch_dinner_pool:
+                continue
+            day_stops, leftover_attraction, leftover_breakfast, leftover_lunch_dinner = _fill_day_skeleton(
+                day_attraction_pool, day_breakfast_pool, day_lunch_dinner_pool, city,
+                priority_places=priority, slot_template=day_slot_templates[day_offset],
             )
+            unscheduled.extend(leftover_attraction)
+            unscheduled.extend(leftover_breakfast)
+            unscheduled.extend(leftover_lunch_dinner)
             if not day_stops:
                 continue
             drop = _llm_review_day(day_stops)
@@ -419,9 +641,9 @@ def schedule(
                 prev_id = node_id
                 last_point = stop
             result_days[day_key] = trip_plan.day_stops(day_plan)
-        unscheduled.extend(attraction_pool)
-        unscheduled.extend(breakfast_pool)
-        unscheduled.extend(lunch_dinner_pool)
+        unscheduled.extend(attraction_leftover)
+        unscheduled.extend(breakfast_leftover)
+        unscheduled.extend(lunch_dinner_leftover)
 
     weather_reminders: list[str] = []
     if last_point is not None:

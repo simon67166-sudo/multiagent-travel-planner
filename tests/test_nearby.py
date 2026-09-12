@@ -144,6 +144,135 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(route_agent._pool_for_candidate({"category": "餐饮服务;中餐厅;江浙菜"}), "lunch_dinner")
         self.assertEqual(route_agent._pool_for_candidate({}), "attraction")
 
+    def test_greedy_geo_cluster_groups_nearby_candidates_together(self):
+        # 2026-09-17：用户反馈"排路线也该把离得比较近或者顺路的排一天"——聚类应该把地理上
+        # 扎堆的候选分到同一天，不是城中/路环这种隔得很远的候选混在一天
+        from agents import route_agent
+        cluster_a = [
+            {"place": "A1", "lng": 113.54, "lat": 22.19, "recommendation_score": 0.9},
+            {"place": "A2", "lng": 113.541, "lat": 22.191, "recommendation_score": 0.8},
+        ]
+        cluster_b = [
+            {"place": "B1", "lng": 113.60, "lat": 22.10, "recommendation_score": 0.85},
+            {"place": "B2", "lng": 113.601, "lat": 22.101, "recommendation_score": 0.7},
+        ]
+        clusters, leftover = route_agent._greedy_geo_cluster(cluster_a + cluster_b, day_capacities=[2, 2])
+        self.assertEqual(leftover, [])
+        places_per_day = [{c["place"] for c in day} for day in clusters]
+        self.assertIn({"A1", "A2"}, places_per_day)
+        self.assertIn({"B1", "B2"}, places_per_day)
+
+    def test_assign_by_proximity_matches_nearest_centroid(self):
+        from agents import route_agent
+        pool = [
+            {"place": "早餐甲", "lng": 113.54, "lat": 22.19},
+            {"place": "早餐乙", "lng": 113.60, "lat": 22.10},
+        ]
+        centroids = [{"lng": 113.541, "lat": 22.191}, {"lng": 113.601, "lat": 22.101}]
+        assigned, leftover = route_agent._assign_by_proximity(pool, centroids, day_capacities=[1, 1])
+        self.assertEqual(assigned[0][0]["place"], "早餐甲")
+        self.assertEqual(assigned[1][0]["place"], "早餐乙")
+        self.assertEqual(leftover, [])
+
+    def test_greedy_geo_cluster_rescues_stranded_priority_pick(self):
+        # 2026-09-17：用户指出"经过用户选择的景点如果被冲掉了需要排到别的时间，根据距离看看
+        # 放在哪一天最合适"——容量不够导致用户勾选的候选没能在正常分组阶段占到坑位时，
+        # 兜底逻辑要把它硬塞进离它最近、已经有候选的那一天，不能就这么消失在 leftover 里
+        from agents import route_agent
+        pool = [
+            {"place": "普通景点1", "lng": 113.54, "lat": 22.19, "recommendation_score": 0.9},
+            {"place": "普通景点2", "lng": 113.541, "lat": 22.191, "recommendation_score": 0.85},
+            {"place": "用户勾选但分数很低", "lng": 113.542, "lat": 22.192, "recommendation_score": 0.1},
+        ]
+        # day_capacities=[2] 只有一天、容量2、总共3个候选——装不下全部3个，但用户勾选的那个
+        # 因为 priority_places 会被优先当种子占坑，不会因为分数太低正常排队排不上号；容量
+        # 有限，被挤掉的是普通候选里的一个，不是用户勾选的那个
+        clusters, leftover = route_agent._greedy_geo_cluster(pool, day_capacities=[2], priority_places={"用户勾选但分数很低"})
+        self.assertEqual(len(leftover), 1)
+        self.assertNotIn("用户勾选但分数很低", {c["place"] for c in leftover})
+        self.assertIn("用户勾选但分数很低", {c["place"] for c in clusters[0]})
+
+    def test_flight_arrival_and_departure_reads_trip_plan_flights(self):
+        from agents import route_agent
+        trip = {"flights": [
+            {"from_": "北京首都国际机场", "to": "澳门", "depart_time": "08:00", "arrive_time": "10:10"},
+            {"from_": "澳门", "to": "北京首都国际机场", "depart_time": "18:00", "arrive_time": "20:30"},
+        ]}
+        arrival, departure = route_agent._flight_arrival_and_departure(trip, "澳门")
+        self.assertEqual(arrival, "10:10")
+        self.assertEqual(departure, "18:00")
+        self.assertEqual(route_agent._flight_arrival_and_departure({"flights": []}, "澳门"), (None, None))
+
+    def test_day_slot_templates_trims_arrival_and_departure_day(self):
+        # 落地当天（抵达10:10 + 2小时缓冲=12:10）该砍掉早餐/上午景点这些太早的槽位，"午餐"
+        # 名义上12:00开始但窗口到13:30，裁剪之后变成12:10-13:30还留得住，不整槽丢弃；
+        # 离开当天（起飞18:00 - 3小时缓冲=15:00）该砍掉晚餐/晚上景点这些太晚的槽位，"下午"
+        # 名义窗口14:00-17:30裁剪成14:00-15:00还剩1小时，同样不整槽丢弃；中间天不受影响
+        from agents import route_agent
+        templates = route_agent._day_slot_templates(3, arrival_time="10:10", departure_time="18:00")
+        self.assertEqual({s["slot_id"] for s in templates[0]}, {"lunch", "afternoon", "dinner", "evening"})
+        lunch_day0 = next(s for s in templates[0] if s["slot_id"] == "lunch")
+        self.assertEqual(lunch_day0["start"], "12:10")
+        self.assertEqual({s["slot_id"] for s in templates[1]}, {s["slot_id"] for s in route_agent._SLOT_TEMPLATE})
+        self.assertEqual({s["slot_id"] for s in templates[2]}, {"breakfast", "morning", "lunch", "afternoon"})
+        afternoon_day2 = next(s for s in templates[2] if s["slot_id"] == "afternoon")
+        self.assertEqual(afternoon_day2["end"], "15:00")
+
+    def test_schedule_shrinks_arrival_day_and_rescues_bumped_priority_pick(self):
+        # 端到端验证：已订机票 20:00 才到澳门，落地当天（20:00+2小时缓冲=22:00）连晚上
+        # 景点槽位都赶不上，等于这天景点容量变成 0——用户勾选的候选在这天完全没有槽位可用，
+        # 不该消失，该被挪到第2天
+        from agents import route_agent
+        import trip_plan as tp
+        trip = tp.new_trip_plan("flight-aware-test")
+        tp.add_flight(trip, {"from_": "北京首都国际机场", "to": "澳门", "depart_time": "16:00", "arrive_time": "20:00"})
+        state = {"trip_plan": trip}
+        candidates = [
+            {"place": "用户勾选的景点", "category": "景点", "lng": 113.54, "lat": 22.19, "recommendation_score": 0.9},
+            {"place": "备用景点", "category": "景点", "lng": 113.541, "lat": 22.191, "recommendation_score": 0.8},
+        ]
+        fake_leg = {"mode": "walking", "duration_min": 5, "distance_m": 300}
+        with patch.object(route_agent, "_real_leg", return_value=fake_leg), \
+             patch.object(route_agent.llm_tool, "call_llm", return_value="[]"), \
+             patch.object(route_agent.weather_tool, "get_hourly_forecast", return_value=[]):
+            route_agent.schedule(
+                state, candidates, city="澳门", mode="trip", time_budget_days=2,
+                priority_places={"用户勾选的景点"},
+            )
+        day1_places = {s["place"] for s in tp.day_stops(trip["days"].get("day-1", {"head_id": None, "nodes": {}}))}
+        day2_places = {s["place"] for s in tp.day_stops(trip["days"].get("day-2", {"head_id": None, "nodes": {}}))}
+        self.assertNotIn("用户勾选的景点", day1_places)  # 落地当天景点容量是 0，排不进去
+        self.assertIn("用户勾选的景点", day2_places)  # 应该被挪到第2天，不是直接消失
+
+    def test_schedule_trip_mode_clusters_nearby_candidates_onto_same_day(self):
+        # 集成验证：两组分得很开的景点候选，排 2 天的行程时该各自成组，不会城中/路环拆开
+        # 混进同一天——这是三步法（排名→聚类→槽位填充）真正接起来之后的端到端效果。
+        # 每组给够 _ATTRACTIONS_PER_DAY_CLUSTER（4）个，不然第一天的聚类额度用不完会
+        # 顺手跨区域多拿一个，那是"总量本来就不够分"时的合理退化，不是这条测试要验的东西
+        from agents import route_agent
+        import trip_plan as tp
+        candidates = [
+            {"place": f"城中景点{i}", "category": "景点", "lng": 113.54 + i * 0.001, "lat": 22.19 + i * 0.001, "recommendation_score": 0.9 - i * 0.01}
+            for i in range(4)
+        ] + [
+            {"place": f"路环景点{i}", "category": "景点", "lng": 113.60 + i * 0.001, "lat": 22.10 + i * 0.001, "recommendation_score": 0.85 - i * 0.01}
+            for i in range(4)
+        ]
+        state = {"trip_plan": tp.new_trip_plan("cluster-test")}
+        fake_leg = {"mode": "walking", "duration_min": 5, "distance_m": 300}
+        with patch.object(route_agent, "_real_leg", return_value=fake_leg), \
+             patch.object(route_agent.llm_tool, "call_llm", return_value="[]"), \
+             patch.object(route_agent.weather_tool, "get_hourly_forecast", return_value=[]):
+            route_agent.schedule(state, candidates, city="澳门", mode="trip", time_budget_days=2)
+        day1_places = {s["place"] for s in tp.day_stops(state["trip_plan"]["days"]["day-1"])}
+        day2_places = {s["place"] for s in tp.day_stops(state["trip_plan"]["days"]["day-2"])}
+        chengzhong = {f"城中景点{i}" for i in range(4)}
+        louhuan = {f"路环景点{i}" for i in range(4)}
+        # 每天真实排进 _SLOT_TEMPLATE 的景点槽位就 3 个（上午/下午/晚上，晚上非必选），核心是
+        # 不能一天里同时出现两组地名——那才是"没顺路、瞎跳"的信号
+        self.assertFalse(day1_places & chengzhong and day1_places & louhuan)
+        self.assertFalse(day2_places & chengzhong and day2_places & louhuan)
+
     def test_fill_day_skeleton_respects_slot_windows_and_fills_anchors(self):
         from agents import route_agent
         attraction_pool = [
@@ -171,6 +300,23 @@ class NearbyTests(unittest.TestCase):
             self.assertLessEqual(stop["end_time"].strftime("%H:%M"), slot_end_by_id[stop["slot_id"]])
         self.assertEqual(len(day_stops) + len(left_attraction) + len(left_breakfast) + len(left_lunch_dinner), 5)
 
+    def test_fill_day_skeleton_prioritizes_user_picked_over_nearer_candidate(self):
+        # 2026-09-17：用户在 attraction_picker 里勾的候选该被优先排进去，哪怕同池子里有
+        # 离上一站更近的候选——"优先"体现在槽位内候选试探顺序上，不是"只用这几个"
+        from agents import route_agent
+        breakfast_pool = [{"place": "早餐店", "category": "早餐", "lng": 113.539, "lat": 22.189}]
+        attraction_pool = [
+            {"place": "近但没被选中的景点", "category": "景点", "lng": 113.540, "lat": 22.190},
+            {"place": "用户勾选的景点", "category": "景点", "lng": 113.60, "lat": 22.25},
+        ]
+        fake_leg = {"mode": "walking", "duration_min": 5, "distance_m": 300}
+        with patch.object(route_agent, "_real_leg", return_value=fake_leg):
+            day_stops, *_ = route_agent._fill_day_skeleton(
+                attraction_pool, breakfast_pool, [], "澳门", priority_places={"用户勾选的景点"}
+            )
+        morning_stop = next(s for s in day_stops if s["slot_id"] == "morning")
+        self.assertEqual(morning_stop["place"], "用户勾选的景点")
+
     def test_fill_day_skeleton_inserts_nearby_attraction(self):
         # "加塞"：景点槽位排完主候选后，槽位还剩足够时间、附近有很近的同角色候选就再排一个
         from agents import route_agent
@@ -184,6 +330,22 @@ class NearbyTests(unittest.TestCase):
         morning_stops = [s for s in day_stops if s["slot_id"] == "morning"]
         self.assertEqual(len(morning_stops), 2)
         self.assertFalse(morning_stops[1]["anchor"])  # 加塞的不是锚点，_llm_review_day() 可以拿掉
+
+    def test_fill_day_skeleton_afternoon_attraction_is_a_required_anchor(self):
+        # 2026-09-17：候选配额是按"景点≥2×天数"筛的（content_agent.py），但排班这边如果只有
+        # "上午"是必选锚点，"下午"排出来的候选 anchor=False，会被 _llm_review_day() 当成可
+        # 拿掉的加塞项误删——候选池明明够、也真排出来了，复核一过又变回每天只保底1个景点。
+        # "下午"改成必选锚点之后，只要 pick_one() 真排出来了，anchor 就必须是 True
+        from agents import route_agent
+        attraction_pool = [
+            {"place": "上午景点", "category": "景点", "lng": 113.54, "lat": 22.19},
+            {"place": "下午景点", "category": "景点", "lng": 113.55, "lat": 22.20},
+        ]
+        fake_leg = {"mode": "walking", "duration_min": 5, "distance_m": 300}
+        with patch.object(route_agent, "_real_leg", return_value=fake_leg):
+            day_stops, *_ = route_agent._fill_day_skeleton(attraction_pool, [], [], "澳门")
+        afternoon_stop = next(s for s in day_stops if s["slot_id"] == "afternoon")
+        self.assertTrue(afternoon_stop["anchor"])
 
     def test_llm_review_day_removes_flagged_non_anchor_indices(self):
         from agents import route_agent
@@ -297,6 +459,19 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(content_agent._extract_day_count("5日游怎么安排"), 5)
         self.assertEqual(content_agent._extract_day_count("推荐一下怎么玩"), 1)  # 提取不到默认1天
         self.assertEqual(content_agent._extract_day_count("来个99天的旅行"), 14)  # 封顶14天
+
+    def test_extract_day_count_falls_back_to_date_range(self):
+        # 2026-09-17 真实测试发现："我想在9.15号到9.18从北京去澳门玩"没有"N天"字样，
+        # day_count 悄悄退到默认值 1，连带把候选 fetch 数量/硬性类别配额都缩没了，社区库里
+        # 本来就有限的几条"景点"帖子排名不够靠前直接被挤出候选池，最后排出来的候选全是
+        # 餐饮——不是排班逻辑的锅，是天数提取漏判了日期区间这种没有显式"N天"的表达。
+        # 用户随后又指出：9.15到9.18是4天（15/16/17/18号都要算），不是日期差算出来的3——
+        # 日期差是"晚数"，天数要在这基础上 +1
+        from agents import content_agent
+        self.assertEqual(content_agent._extract_day_count("我想在9.15号到9.18从北京去澳门玩，帮我看看怎么玩呗"), 4)
+        self.assertEqual(content_agent._extract_day_count("9月15日到9月18日去澳门"), 4)  # "15日"不能被误判成15天
+        self.assertEqual(content_agent._extract_day_count("9/15-9/18去香港"), 4)
+        self.assertEqual(content_agent._extract_day_count("推荐一个3天的行程，9.1到9.5出发"), 3)  # 显式天数优先于日期区间
 
     def test_days_last_stops_takes_final_geocoded_node_per_day(self):
         # 2026-09-15：晚上回酒店睡觉，"最后一站"比"第一站"更直接影响住宿体验，酒店锚点/

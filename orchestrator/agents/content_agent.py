@@ -19,6 +19,7 @@ route_agent.schedule() 的事）。
 import json
 import re
 import sys
+from datetime import date
 from pathlib import Path
 
 _ORCHESTRATOR_DIR = Path(__file__).resolve().parent.parent
@@ -46,17 +47,47 @@ def _extract_city(location_hint: str | None) -> str | None:
     return None
 
 
-_DAY_COUNT_PATTERN = re.compile(r"(\d+)\s*[日天]")
+_DAY_COUNT_PATTERN = re.compile(r"(\d+)\s*(?:天|日游)")
+# 只认"N天"/"N日游"，不认光秃秃的"N日"——中文日期从来是"M月D日"/"D号"，不会说"M月D天"，
+# 唯独"日"这个字既能表示"天数"（"5日游"）又能表示"日期"（"9月15日"），真实测试就踩过这个
+# 坑："9月15日到9月18日"里的"15日"被当成"提取到了15天"，比日期区间兜底更早匹配上，
+# 直接把 day_count 算成 14（封顶值）——要求"日"后面紧跟"游"字才算数，日期用法就不会再
+# 误命中这条规则，能安全地交给下面的 _DATE_RANGE_PATTERN 兜底
+# "9.15号到9.18"/"9月15日到9月18日"/"9/15-9/18" 这种日期区间，没有显式"N天"字样时的兜底——
+# 2026-09-17 真实测试发现"我想在9.15号到9.18从北京去澳门玩"（没说"3天"）会被
+# _DAY_COUNT_PATTERN 漏掉，day_count 悄悄退到默认值 1，连带把 fetch 数量/硬性类别配额都
+# 缩没了，社区库里本来就有限的几条"景点"帖子排名不够靠前就直接被挤出候选池，最后排出来的
+# 候选全是餐饮，一个景点都没有——不是排班逻辑的锅，是这里漏判了
+_DATE_RANGE_PATTERN = re.compile(r"(\d{1,2})[月./](\d{1,2})[日号]?\s*[到至\-~～]\s*(\d{1,2})[月./](\d{1,2})[日号]?")
 
 
 def _extract_day_count(text: str | None) -> int:
-    """从用户消息里粗略提取"几天"（"3日游"/"5天"这种），提取不到默认 1 天，封顶 14 天——
-    跟 orchestrator_agent.py 之前删掉的同名函数逻辑一样（那边删掉是因为不再用来触发自动
-    排班，这里搬回来是另一个用途：决定这次该按几天的量去捞候选/配硬性类别配额，见
-    _pick_seeds_with_quotas()）。跟排时间的触发点（用户从候选卡片选完确认）完全无关，
-    两者管的是不同的事。"""
-    match = _DAY_COUNT_PATTERN.search(text or "")
-    return max(1, min(int(match.group(1)), 14)) if match else 1
+    """从用户消息里粗略提取"几天"，提取不到默认 1 天，封顶 14 天——跟 orchestrator_agent.py
+    之前删掉的同名函数逻辑一样（那边删掉是因为不再用来触发自动排班，这里搬回来是另一个
+    用途：决定这次该按几天的量去捞候选/配硬性类别配额，见 _pick_seeds_with_quotas()）。
+    跟排时间的触发点（用户从候选卡片选完确认）完全无关，两者管的是不同的事。
+
+    两级提取，显式"N天"/"N日"优先：① "3日游"/"5天"这种显式天数直接读数字；② 没有显式天数
+    才退回日期区间兜底（"9.15号到9.18"这种），按公历日期差算天数（同年同月粗算，不处理
+    跨年/大小月边界之外的极端情况，够用为止）。两种都提取不到才是真的默认 1 天。
+
+    2026-09-17 用户指出："9.15到9.18"是4天（15/16/17/18号，通常说"4天3晚"），不是3天——
+    日期差（18-15=3）算的是晚数，天数要在这基础上 +1（首尾两天都要算进去）。"""
+    if not text:
+        return 1
+    match = _DAY_COUNT_PATTERN.search(text)
+    if match:
+        return max(1, min(int(match.group(1)), 14))
+    range_match = _DATE_RANGE_PATTERN.search(text)
+    if range_match:
+        month1, day1, month2, day2 = (int(g) for g in range_match.groups())
+        try:
+            day_diff = (date(2000, month2, day2) - date(2000, month1, day1)).days
+        except ValueError:
+            day_diff = 0
+        if day_diff > 0:
+            return max(1, min(day_diff + 1, 14))
+    return 1
 
 
 def _dedupe_by_place(posts: list[dict]) -> list[dict]:
@@ -280,7 +311,12 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip") -> dict:
 
     返回 {"recommendations": [...候选，city/category(景点|早餐|午晚餐)/place/
       source(社区帖子|高德POI)/recommendation_score...], "nearby_params":
-      {"origin":{lng,lat,name}, "hours":int} | None, "clarification_needed": str | None}
+      {"origin":{lng,lat,name}, "hours":int} | None, "clarification_needed": str | None,
+      "day_count": int}——day_count 是从 location_hint 提取到的天数（mode="nearby"
+      固定给 1，"周边逛几小时"这种场景本来就不是多天行程，_extract_day_count() 没意义）。
+      2026-09-17 起编排 Agent 把这个值存进 shared_state，attraction_picker 确认时一次性
+      排够这么多天（route_agent.schedule(time_budget_days=day_count)），不用每天单独
+      确认一轮才能凑够多天行程。
     """
     persona_vector = persona.compute_persona_vector(shared_state["persona"], shared_state["scenario"])
     city = _extract_city(location_hint) or shared_state.get("city")
@@ -288,7 +324,7 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip") -> dict:
     if mode == "nearby":
         parsed = _parse_nearby_request(location_hint, city)
         if "question" in parsed:
-            return {"recommendations": [], "nearby_params": None, "clarification_needed": parsed["question"]}
+            return {"recommendations": [], "nearby_params": None, "clarification_needed": parsed["question"], "day_count": 1}
         city = parsed.get("city") or city or "澳门"
         hours = parsed.get("hours") or 3
         try:
@@ -298,6 +334,7 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip") -> dict:
                 "recommendations": [],
                 "nearby_params": None,
                 "clarification_needed": f"没查到「{parsed.get('origin')}」这个地方，能换个更具体的地标或地址吗？",
+                "day_count": 1,
             }
         nearby_candidates = _nearby_plan(origin, city, persona_vector)
         _classify_categories(nearby_candidates)
@@ -305,6 +342,7 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip") -> dict:
             "recommendations": nearby_candidates,
             "nearby_params": {"origin": {"lng": origin["lng"], "lat": origin["lat"], "name": origin["name"]}, "hours": hours},
             "clarification_needed": None,
+            "day_count": 1,
         }
 
     # mode="trip"：先人格检索种子，再对每个种子分别扩展周边真实候选。
@@ -373,7 +411,7 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip") -> dict:
 
     _classify_categories(nearby_extra)  # 种子已经分类过了，这里只分类新出现的高德 POI 候选，不重复分类
     recommendations = seed_recommendations + nearby_extra
-    return {"recommendations": recommendations, "nearby_params": None, "clarification_needed": None}
+    return {"recommendations": recommendations, "nearby_params": None, "clarification_needed": None, "day_count": day_count}
 
 
 if __name__ == "__main__":

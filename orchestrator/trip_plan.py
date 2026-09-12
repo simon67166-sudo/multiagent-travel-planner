@@ -59,7 +59,10 @@ def new_trip_plan(trip_id: str) -> dict:
 
 
 def add_flight(trip_plan: dict, flight: dict[str, Any]) -> None:
-    """flight 字段：flight_no, from_, to, depart_time, arrive_time, status(on_time|delayed|cancelled), booking_ref"""
+    """flight 字段：flight_no, from_, to, date, depart_time, arrive_time,
+    status(on_time|delayed|cancelled), booking_ref。date 是这趟航班的日期（"YYYY-MM-DD"）
+    ——route_agent.schedule() 的 _flight_arrival_and_departure() 只用 from_/to 判断方向、
+    不看 date，这个字段目前主要是给前端展示用，不参与排班判断。"""
     trip_plan["flights"].append(flight)
 
 

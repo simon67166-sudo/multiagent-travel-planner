@@ -140,6 +140,8 @@ def new_shared_state(user_id: str, scenario: str = "vacation", onboarding_answer
         "trip_plan": trip_plan.new_trip_plan(trip_id=f"trip-{user_id}"),
         "trip_preferences": trip_preferences.TripPreferences().to_dict(),
         "pending_trip_request": None,  # 问完偏好之前，用户真正想说的那句话暂存在这里
+        "last_content_candidates": [],  # 达人 Agent 最近一次给出的全量候选池，attraction_picker 确认时要用
+        "last_trip_day_count": 1,  # 同上，达人 Agent 提取到的天数，attraction_picker 确认时一次性排够这么多天
     }
 
 
@@ -279,6 +281,16 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
         if candidates:
             output_widgets.append(widgets.build_post_list_widget(candidates))
             output_widgets.append(widgets.build_attraction_picker_widget(candidates))
+            # attraction_picker 的 options 只是给用户挑的一个精选子集（pool_size=10），
+            # 不是达人 Agent 算出来的全量候选——用户确认选择是另一次 HTTP 请求（见
+            # server.py 的 apply_selection()），到那时候本轮的 candidates 早就不在调用栈里了，
+            # 必须存进 shared_state 才能在确认时把全量候选池（含早餐/午晚餐/用户没勾的景点）
+            # 一起交给 route_agent.schedule()，不能让排班只看得到用户勾选的那几个
+            shared_state["last_content_candidates"] = candidates
+            # 2026-09-17 起：确认一次就该排够整趟行程该有的天数，不是每天单独确认一轮——
+            # 天数是达人 Agent 从这轮消息里提取到的（content_agent._extract_day_count()），
+            # 同样得跨请求存起来才能在确认时用
+            shared_state["last_trip_day_count"] = results["content"].get("day_count", 1)
     if "booking" in results:
         # 两个 widget 各自按 provider_type 从同一份 candidates 里挑，查不到对应类型就返回 None
         booking_candidates = results["booking"]["candidates"]

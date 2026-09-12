@@ -341,8 +341,10 @@ function renderPicker(widgetType, data, headTitle) {
         body: JSON.stringify({ widget: widgetType, selected }),
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
       confirmBtn.textContent = "已确认";
       addSystemNote(`已确认：${selected.map(optionLabel).join("、")}`);
+      if (data.chat_reply) addMessage("assistant", data.chat_reply);
       await refreshSchedule();
     } catch (err) {
       confirmBtn.disabled = false;
@@ -523,7 +525,7 @@ function renderSchedule(trip) {
       html += `<div class="booking-card flight">
         <div class="row1"><span class="kind">机票</span><span class="confirmed">已确认</span></div>
         <div class="title">${f.flight_no || ""} ${f.from_ || ""} → ${f.to || ""}</div>
-        <div class="sub">${f.depart_time || ""} 起飞 → ${f.arrive_time || ""} 到达 · ${f.status || ""}</div>
+        <div class="sub">${f.date || ""} · ${f.depart_time || ""} 起飞 → ${f.arrive_time || ""} 到达 · ${f.status || ""}</div>
       </div>`;
     });
   }

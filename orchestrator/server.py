@@ -36,7 +36,7 @@ from openai import OpenAIError
 import main
 import schedule_widgets
 import trip_plan
-from agents import route_agent
+from agents import ota_hotel_agent, route_agent
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -147,21 +147,60 @@ def widget_response():
         options = offered["data"].get("options", [])
         if any(item not in options for item in selected) or any(item in selected[:i] for i, item in enumerate(selected)):
             return jsonify({"error": "选项不在本次候选清单"}), 400
-        apply_selection(widget, selected, state)
+        chat_reply = apply_selection(widget, selected, state)
         state["pending_widgets"] = [w for w in state["pending_widgets"] if w.get("widget") != widget]
-    return jsonify({"status": "ok"})
+        if chat_reply:
+            # 交互完了不能就这么悄无声息——排班/订票订房这些后台真做了事，聊天框得有句话
+            # 衔接一下，跟 POST /chat 走的助手回复存进同一个 messages 列表，前端/下次刷新
+            # 页面都能看到，不是只在这次响应里一次性带一下就消失
+            state["messages"] = state.get("messages", []) + [{"role": "assistant", "content": chat_reply}]
+    return jsonify({"status": "ok", "chat_reply": chat_reply})
 
 
-def apply_selection(widget, selected, state):
+def apply_selection(widget, selected, state) -> str | None:
+    """落地用户在 widget 里的选择，返回一句衔接用的助手回复文字（没有话说就 None）——
+    调用方负责把这句话存进 state["messages"] 并回传给前端，做成聊天气泡而不是让交互
+    结束后聊天框毫无反应。"""
     if widget == "attraction_picker":
         # 2026-09-15 起，排时间的触发点从"意图分类猜中了 route"改成"用户在这里选完确认"
         # ——这是确定性动作，不会因为同一句话不同轮调用而结果不一样。走真正的骨架排班
-        # （route_agent.schedule()），不是老接口 route_agent.run() 那种单一占位日期顺序追加；
-        # picks 已经是完整候选字典（带 lng/lat/category），content_agent.run() 早就查好了，
-        # schedule() 直接能用
+        # （route_agent.schedule()），不是老接口 route_agent.run() 那种单一占位日期顺序追加。
+        #
+        # 2026-09-17 修正：排班不能只喂 picks（用户在卡片里勾的那几个）——attraction_picker
+        # 的候选池本来就只是达人 Agent 全量候选里精选出来展示的一小撮（pool_size=10），用户
+        # 从中最多再勾 6 个，如果排班只看得到这几个，早餐/午晚餐/用户没勾的其它景点槽位就
+        # 完全没有候选可用，只能空着。正确做法是把达人 Agent 给的全量候选池（存在
+        # shared_state["last_content_candidates"] 里，见 orchestrator_agent.py）整个交给
+        # route_agent.schedule()，用户勾选的那几个只是"优先"（priority_places），不是"唯一"。
+        # 取不到全量池（比如老会话没这个字段）就退回只用 picks，不炸。
+        #
+        # 2026-09-17 再修正：确认一次该排够整趟行程该有的天数，不是每次只排 1 天——之前
+        # time_budget_days 写死 1，用户说"3天行程"确认一次却只排出 day-1，得再确认 2 次
+        # 才能凑够 3 天，跟"一开始就说了3天"的预期不符。天数是达人 Agent 提取到的
+        # （content_agent._extract_day_count()，见 orchestrator_agent.py 存的
+        # last_trip_day_count），不是这里瞎猜的。
         picks = [item for item in selected if item.get("place")]
-        if picks:
-            route_agent.schedule(state, picks, city=state.get("city", _DEMO_CITY), mode="trip", time_budget_days=1)
+        if not picks:
+            return None
+        priority_places = {item["place"] for item in picks}
+        full_pool = state.get("last_content_candidates") or picks
+        result = route_agent.schedule(
+            state, full_pool, city=state.get("city", _DEMO_CITY), mode="trip",
+            time_budget_days=state.get("last_trip_day_count", 1),
+            priority_places=priority_places,
+        )
+        scheduled_days = sorted(day for day, stops in result["days"].items() if stops)
+        if not scheduled_days:
+            return "这几个地点这次没能排进行程（坐标缺失或者当天槽位已经满了），可以再选几个试试。"
+        scheduled_places = {stop.get("place") for stops in result["days"].values() for stop in stops}
+        places = "、".join(p for p in (item.get("place") for item in picks) if p)
+        reply = f"已经把 {places} 排进 {'、'.join(scheduled_days)} 啦，来看看左边的行程时间线吧。"
+        missed_picks = [p for p in (item.get("place") for item in picks) if p and p not in scheduled_places]
+        if missed_picks:
+            reply += f"其中「{'、'.join(missed_picks)}」这次没能排进去（时段冲突或坐标缺失），可以再选一轮试试。"
+        if result.get("weather_reminders"):
+            reply += "\n" + "\n".join(result["weather_reminders"])
+        return reply
     elif widget == "flight_picker":
         for item in selected:
             trip_plan.add_flight(
@@ -170,11 +209,17 @@ def apply_selection(widget, selected, state):
                     "flight_no": item.get("flight_no"),
                     "from_": item.get("from_"),
                     "to": item.get("to"),
+                    # 2026-09-17 修正：candidate 里本来就带 "date"（ota_hotel_agent.run() 算的
+                    # 去程/回程日期），之前这里没往下传，存进 trip_plan.flights 的机票就丢了
+                    # 日期，前端"机票"卡片自然显示不出来——不是前端没做，是数据在这里断了
+                    "date": item.get("date"),
                     "depart_time": item.get("depart_time"),
                     "arrive_time": item.get("arrive_time"),
                     "status": item.get("status"),
                 },
             )
+        flight_nos = "、".join(item.get("flight_no") for item in selected if item.get("flight_no"))
+        return f"已经帮你订好 {flight_nos} 啦，行程里的机票信息更新好了。"
     elif widget == "hotel_picker":
         for item in selected:
             trip_plan.add_hotel(
@@ -193,6 +238,12 @@ def apply_selection(widget, selected, state):
                     "lat": item.get("lat"),
                 },
             )
+        names = "、".join(item.get("name") for item in selected if item.get("name"))
+        reply = f"已经帮你订好 {names} 啦。"
+        reminder = ota_hotel_agent._existing_hotel_distance_check(state["trip_plan"])
+        if reminder:
+            reply += "\n" + reminder
+        return reply
     else:
         raise RuntimeError("Unsupported widget")
 

@@ -84,6 +84,95 @@ class WebTests(unittest.TestCase):
         self.assertIn("day-1", trip["days"])
         self.assertIn("大三巴牌坊", json.dumps(trip, ensure_ascii=False))
 
+    def test_attraction_picker_confirm_uses_full_candidate_pool_not_just_picks(self):
+        # 2026-09-17：用户指出排班不该只看用户勾选的那几个——那样一来用户没勾的早餐/午晚餐
+        # 槽位完全没有候选可用，只能空着。达人 Agent 的全量候选池存在
+        # state["last_content_candidates"]，这里只勾了一个景点，但全量池里还有早餐/午餐候选，
+        # 排完之后 day-1 应该也有早餐/午餐被排进去，不是只有用户勾的那个景点
+        picked_sight = {"place": "大三巴牌坊", "category": "景点", "lng": 113.54, "lat": 22.19, "source": "社区帖子"}
+        breakfast_candidate = {"place": "盛记白粥", "category": "早餐", "lng": 113.539, "lat": 22.189, "source": "社区帖子"}
+        lunch_candidate = {"place": "叠记咖喱美食", "category": "午晚餐", "lng": 113.541, "lat": 22.191, "source": "社区帖子"}
+        self.a.get("/session")
+        sid = self.a.get_cookie("travel_session").value
+        with self.store.edit(sid, dict) as state:
+            state["last_content_candidates"] = [picked_sight, breakfast_candidate, lunch_candidate]
+            state["pending_widgets"] = [{"widget": "attraction_picker", "data": {"options": [picked_sight], "max_select": 6}}]
+        response = self.a.post("/widget-response", json={"widget": "attraction_picker", "selected": [picked_sight]})
+        self.assertEqual(response.status_code, 200)
+        trip = self.store.load(sid)["trip_plan"]
+        day1_places = json.dumps(trip["days"]["day-1"], ensure_ascii=False)
+        self.assertIn("大三巴牌坊", day1_places)
+        self.assertIn("盛记白粥", day1_places)  # 用户没勾选，但该从全量池里自动补进早餐槽位
+        self.assertIn("叠记咖喱美食", day1_places)  # 同理，午晚餐槽位
+
+    def test_flight_picker_confirm_persists_date(self):
+        # 2026-09-17：机票候选（ota_hotel_agent.run() 算的）本来就带 "date" 字段，但确认时
+        # 存进 trip_plan.flights 的字典手动拼字段漏了这一项，前端机票卡片自然显示不出日期——
+        # 不是前端没做，是数据在这里断了
+        item = {"flight_no": "MU5137", "from_": "北京首都国际机场", "to": "澳门",
+                "date": "2026-09-15", "depart_time": "08:00", "arrive_time": "10:10", "status": "on_time"}
+        self.a.get("/session")
+        sid = self.a.get_cookie("travel_session").value
+        with self.store.edit(sid, dict) as state:
+            state["pending_widgets"] = [{"widget": "flight_picker", "data": {"options": [item], "max_select": 1}}]
+        response = self.a.post("/widget-response", json={"widget": "flight_picker", "selected": [item]})
+        self.assertEqual(response.status_code, 200)
+        flights = self.store.load(sid)["trip_plan"]["flights"]
+        self.assertEqual(flights[0]["date"], "2026-09-15")
+
+    def test_attraction_picker_confirm_schedules_all_requested_days_at_once(self):
+        # 2026-09-17：用户反馈"说了3天的行程，确认一次却只排出1天"——之前 time_budget_days
+        # 写死 1，得确认 3 次才能凑够 3 天。天数是达人 Agent 提取到的
+        # （content_agent._extract_day_count()，编排 Agent 存进
+        # state["last_trip_day_count"]），确认一次就该照这个天数把行程排够，不用分好几轮
+        candidates = []
+        for i in range(3):
+            candidates.append({"place": f"景点{i}", "category": "景点", "lng": 113.54 + i * 0.01, "lat": 22.19, "source": "社区帖子"})
+            candidates.append({"place": f"早餐{i}", "category": "早餐", "lng": 113.539 + i * 0.01, "lat": 22.189, "source": "社区帖子"})
+            candidates.append({"place": f"午晚餐{i}", "category": "午晚餐", "lng": 113.541 + i * 0.01, "lat": 22.191, "source": "社区帖子"})
+        picked_sight = candidates[0]
+        self.a.get("/session")
+        sid = self.a.get_cookie("travel_session").value
+        with self.store.edit(sid, dict) as state:
+            state["last_content_candidates"] = candidates
+            state["last_trip_day_count"] = 3
+            state["pending_widgets"] = [{"widget": "attraction_picker", "data": {"options": [picked_sight], "max_select": 6}}]
+        response = self.a.post("/widget-response", json={"widget": "attraction_picker", "selected": [picked_sight]})
+        self.assertEqual(response.status_code, 200)
+        trip = self.store.load(sid)["trip_plan"]
+        self.assertEqual(set(trip["days"].keys()), {"day-1", "day-2", "day-3"})
+
+    def test_attraction_picker_confirm_adds_bridging_chat_reply(self):
+        # 2026-09-17：用户反馈"做完交互后能不能加点衔接提示"——选完确认之前只更新
+        # trip_plan/地图面板，聊天框毫无反应；现在 apply_selection() 生成一句衔接回复，
+        # 既存进 state["messages"]（下次 /session 刷新还在）也直接回传给前端这次响应用
+        item = {"place": "大三巴牌坊", "category": "景点", "lng": 113.54, "lat": 22.19, "source": "社区帖子"}
+        self.a.get("/session")
+        sid = self.a.get_cookie("travel_session").value
+        with self.store.edit(sid, dict) as state:
+            state["pending_widgets"] = [{"widget": "attraction_picker", "data": {"options": [item], "max_select": 6}}]
+        response = self.a.post("/widget-response", json={"widget": "attraction_picker", "selected": [item]})
+        self.assertIn("大三巴牌坊", response.json["chat_reply"])
+        self.assertIn("day-1", response.json["chat_reply"])
+        messages = self.store.load(sid)["messages"]
+        self.assertEqual(messages[-1], {"role": "assistant", "content": response.json["chat_reply"]})
+
+    def test_hotel_picker_confirm_reply_includes_distance_reminder(self):
+        # 酒店确认之后的衔接回复该带上"离行程终点比较远"的提醒（ota_hotel_agent 已有的
+        # _existing_hotel_distance_check() 逻辑，之前只有聊天流程接了，widget 流程没接）
+        import trip_plan as trip_plan_module
+        far_hotel = {"name": "氹仔某酒店", "price": 500, "lng": 113.56, "lat": 22.05}  # 距大三巴 ~16km，超出 5km 提醒阈值
+        self.a.get("/session")
+        sid = self.a.get_cookie("travel_session").value
+        with self.store.edit(sid, dict) as state:
+            day1 = trip_plan_module.get_or_create_day(state["trip_plan"], "2026-09-15")
+            trip_plan_module.add_stop(day1, "n1", "attraction", "大三巴牌坊", arrival_transport="首站",
+                                       arrival_time="09:00", end_time="10:00", lng=113.54, lat=22.19)
+            state["pending_widgets"] = [{"widget": "hotel_picker", "data": {"options": [far_hotel], "max_select": 1}}]
+        response = self.a.post("/widget-response", json={"widget": "hotel_picker", "selected": [far_hotel]})
+        self.assertIn("氹仔某酒店", response.json["chat_reply"])
+        self.assertIn("比较远", response.json["chat_reply"])
+
     def test_nearby_endpoints_removed(self):
         # 2026-09-14：nearby 并入了达人 Agent（content_agent.run(mode="nearby") +
         # route_agent.schedule()），走 POST /chat 就行。这三个独立端点连同独立表单前端
