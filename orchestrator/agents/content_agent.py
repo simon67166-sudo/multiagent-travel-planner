@@ -17,6 +17,7 @@ route_agent.schedule() 的事）。
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -44,6 +45,19 @@ def _extract_city(location_hint: str | None) -> str | None:
     return None
 
 
+_DAY_COUNT_PATTERN = re.compile(r"(\d+)\s*[日天]")
+
+
+def _extract_day_count(text: str | None) -> int:
+    """从用户消息里粗略提取"几天"（"3日游"/"5天"这种），提取不到默认 1 天，封顶 14 天——
+    跟 orchestrator_agent.py 之前删掉的同名函数逻辑一样（那边删掉是因为不再用来触发自动
+    排班，这里搬回来是另一个用途：决定这次该按几天的量去捞候选/配硬性类别配额，见
+    _pick_seeds_with_quotas()）。跟排时间的触发点（用户从候选卡片选完确认）完全无关，
+    两者管的是不同的事。"""
+    match = _DAY_COUNT_PATTERN.search(text or "")
+    return max(1, min(int(match.group(1)), 14)) if match else 1
+
+
 def _dedupe_by_place(posts: list[dict]) -> list[dict]:
     """同一个地点如果有好几条社区帖子都在夸，只留相似度最高的那条——posts 传进来时已经按
     similarity_score 降序排好（store.query_similar_posts() 保证的），遇到的第一条就是最高分
@@ -62,19 +76,21 @@ def _dedupe_by_place(posts: list[dict]) -> list[dict]:
     return deduped
 
 
-def _pick_seeds_with_category_balance(posts: list[dict], top_k: int) -> list[dict]:
-    """挑种子时优先保证至少 1 条"景点"类，剩下按相似度顺序（posts 已经排好序）补满 top_k。
+def _pick_seeds_with_quotas(posts: list[dict], day_count: int) -> list[dict]:
+    """挑种子时按天数强制配额：景点 >= 2×天数，早餐 >= 天数，午晚餐 >= 2×天数——对应骨架
+    排班（route_agent._SLOT_TEMPLATE）每天 2 个景点槽位（上午+下午/晚上其中一个大概率能
+    排上）、1 顿早餐、2 顿不同的午晚餐（lunch+dinner 都从同一个池子选，要 2×天数 才够
+    "天数天、每天两顿都不重复"，不然天数一多会开始撞同一家店）。
 
-    不这么做的话，骨架式排班（route_agent.schedule() mode="trip"）的景点槽位可能天生没东西
-    填——人格向量偏"美食探店"这类标签时，纯相似度 top_k 经常清一色是"饮食"类帖子，每个
-    美食种子再去查周边真实 POI，一家餐厅周边搜出来的大概率还是餐厅，偏差会被放大（真实
-    demo 演示时出现过"推荐的3天行程每天都是美食"）。"景点"类候选不够就照常按相似度顺序
-    回退，不强求，跟"过滤完一个不剩就退回未过滤结果"是同一个"尽力而为，不硬凑"的哲学。"""
-    sight = next((p for p in posts if p.get("category") == "景点"), None)
-    if sight is None:
-        return posts[:top_k]
-    rest = [p for p in posts if p is not sight][: top_k - 1]
-    return [sight] + rest
+    posts 传进来时已经按相似度降序排好（_classify_categories() 处理过、category 已经是
+    干净的"景点"/"早餐"/"午晚餐"三选一），每个类别内部取到的就是那个类别里相似度最高的
+    几条。某个类别候选不够配额就照单全收，不强求，跟"过滤完一个不剩就退回未过滤结果"是
+    同一个"尽力而为，不硬凑"的哲学——229 条社区帖子覆盖有限，不是每个城市/类别都凑得够，
+    靠后面的周边真实 POI 扩展再补一些。"""
+    sight = [p for p in posts if p.get("category") == "景点"][: 2 * day_count]
+    breakfast = [p for p in posts if p.get("category") == "早餐"][:day_count]
+    lunch_dinner = [p for p in posts if p.get("category") == "午晚餐"][: 2 * day_count]
+    return sight + breakfast + lunch_dinner
 
 
 def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) -> list[dict]:
@@ -120,6 +136,10 @@ def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) ->
                 "source": "高德POI",
                 "community_reviews": reviews,
                 "persona_match_score": match_score,
+                # route_agent._llm_review_day() 用的统一打分字段，见 recommendation_score
+                # 的说明；没有口碑复核数据（match_score is None）给个偏低的默认值，
+                # 跟上面"没有评价排最后但仍保留"是同一个降级逻辑，不是排除，只是分低
+                "recommendation_score": match_score if match_score is not None else 0.0,
             }
         )
 
@@ -129,32 +149,49 @@ def _nearby_plan(origin: dict, city: str, persona_vector: list[float] | None) ->
 
 
 _CATEGORY_FIX_PROMPT = """你是达人 Agent 的分类质检员。下面是一批候选地点（JSON 数组，每项：
-index/place/category/caption/address），标注的 category 有可能标错——比如一家餐厅被标成
-"景点"，或者一个景点被标成"饮食"。请逐条判断这个地点应该是"饮食"（餐厅/小吃/咖啡店这类）
-还是"景点"（观光/游览/打卡地这类），如果实在看不出来（比如信息太少），保留原分类不变。
-只输出需要改正的条目，格式 [{"index":,"category":"饮食"或"景点"}]，不需要改的不要输出；
-如果全部不需要改，输出空数组 []。只输出 JSON，不要输出其他任何文字。"""
+index/place/category/caption/address），你的任务是把每一条都归类成"景点"/"早餐"/"午晚餐"
+三选一中的一个：
+- "景点"：观光/游览/打卡地
+- "早餐"：适合早上吃的餐饮（早餐店、粥店、茶餐厅早市这类）
+- "午晚餐"：正餐/晚餐/宵夜这类餐饮，也是餐饮类默认归类（实在判断不出早餐还是午晚餐时选这个）
+
+只要某一条的 category 字段不是精确等于"景点"、"早餐"、"午晚餐"这三个词之一（比如笼统的
+"饮食"、或者高德地图给的原始分类"餐饮服务;中餐厅;中餐厅"这种），你就必须给出归类判断，
+不能以"信息不足"为理由跳过——景点还是餐饮通常从地名/原分类就能看出来，餐饮类如果判断不出
+早餐还是午晚餐，就归"午晚餐"。只有 category 已经精确等于这三个词之一、且你觉得没有错，
+才不需要输出这一条。
+只输出需要改正/需要归类的条目，格式 [{"index":,"category":"景点"或"早餐"或"午晚餐"}]；
+如果全部已经是精确的三选一标签且没有错误，输出空数组 []。只输出 JSON，不要输出其他任何
+文字。"""
 
 
-def _verify_and_fix_categories(recommendations: list[dict]) -> None:
-    """候选提交给编排 Agent 之前的分类质检：一批候选一次性打包成一次 MODEL_LIGHT 调用
-    （不是逐条调用——候选池经常几十条，逐条调模型会让这个 demo 本来就不快的延迟更差，
-    跟 route_agent._llm_review_day() 一天调一次是同一个"批量、不逐项"的思路）。
+def _classify_categories(candidates: list[dict]) -> None:
+    """候选分类质检：统一判成"景点"/"早餐"/"午晚餐"三选一，不是"饮食"这种粗粒度二元标签
+    ——route_agent.schedule() 的骨架排班需要精确区分早餐槽位和午晚餐槽位，不能只知道
+    "是餐饮"。一批候选一次性打包成一次 MODEL_LIGHT 调用（不是逐条调用——候选池经常几十条，
+    逐条调模型会让这个 demo 本来就不快的延迟更差，跟 route_agent._llm_review_day() 一天
+    调一次是同一个"批量、不逐项"的思路）。可以对不同批次的候选分别调用（种子候选池、周边
+    扩展候选池不需要一次性传全部，见 run() 的调用方式）。
 
-    社区帖子的 category 是人工录入的，可能真的标错；高德 POI 的 category 是原始 type
-    字符串，本身就不是干净的"饮食/景点"二元标签——标错一条，route_agent._candidate_role()
-    就可能把餐厅塞进景点槽位（或者相反），骨架排班"每天至少一个景点+两顿饭"这个结构性
-    保证就被数据质量问题绕过去了。
+    社区帖子的 category 是人工录入的，可能真的标错或者只有粗粒度的"饮食"没细分早中晚；
+    高德 POI 的 category 是原始 type 字符串，本身就不是干净的标签——标错/标粗一条，
+    route_agent._pool_for_candidate() 分槽位池子就会错，骨架排班"每天保证早中晚配额"这个
+    结构性保证就被数据质量问题绕过去了。
 
-    原地修改 recommendations 里每个 dict 的 category 字段，不返回新列表。带 post_id 的
+    提示词措辞很关键：真实测过"如果实在看不出来就保留原分类"这种宽松措辞会让模型偷懒，
+    一批 34 条真实候选里 15 条原样保留成笼统的"饮食"，没有细分早中晚——现在的提示词改成
+    "只要不是精确的三选一标签就必须归类，餐饮类判断不出早晚就默认午晚餐"，同一批数据全部
+    34 条都归类干净了。
+
+    原地修改 candidates 里每个 dict 的 category 字段，不返回新列表。带 post_id 的
     （社区帖子来源）改对了顺手写回数据库（store.update_post_category()）——高德 POI 没有
     持久化来源，只改这次返回结果里的内存字段。LLM 调用/解析失败就什么都不改，不影响主
     流程——这是质检，不是必需步骤。"""
-    if not recommendations:
+    if not candidates:
         return
     payload = [
         {"index": i, "place": r.get("place"), "category": r.get("category"), "caption": r.get("caption"), "address": r.get("address")}
-        for i, r in enumerate(recommendations)
+        for i, r in enumerate(candidates)
     ]
     try:
         raw = llm_tool.call_llm(
@@ -177,9 +214,9 @@ def _verify_and_fix_categories(recommendations: list[dict]) -> None:
         if not isinstance(fix, dict):
             continue
         idx, new_category = fix.get("index"), fix.get("category")
-        if not isinstance(idx, int) or idx not in range(len(recommendations)) or new_category not in ("饮食", "景点"):
+        if not isinstance(idx, int) or idx not in range(len(candidates)) or new_category not in ("景点", "早餐", "午晚餐"):
             continue
-        candidate = recommendations[idx]
+        candidate = candidates[idx]
         if candidate.get("category") == new_category:
             continue
         candidate["category"] = new_category
@@ -219,17 +256,18 @@ def _parse_nearby_request(location_hint: str, default_city: str | None) -> dict:
     return parsed
 
 
-def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int = 3) -> dict:
+def run(shared_state: dict, location_hint: str, mode: str = "trip") -> dict:
     """
     mode="trip"（默认）：人格检索种子景点/美食（跟以前逻辑一致）→ 对每个种子分别调
-      _nearby_plan() 查真实周边 POI，汇总去重 → 合并成候选列表。
+      _nearby_plan() 查真实周边 POI，汇总去重 → 合并成候选列表。种子挑选按 location_hint
+      里提取到的天数强制配额（_pick_seeds_with_quotas()），不是固定 top_k。
     mode="nearby"：跳过人格检索种子 → LLM 从 location_hint 解析出起点/游览小时数 → 高德查
       真实起点坐标 → 调一次 _nearby_plan()。解析不出起点会返回 clarification_needed，
       调用方（orchestrator_agent）要检查这个字段，直接把追问文字当回复返回，不硬凑候选。
 
-    返回 {"recommendations": [...候选，city/category/place/source(社区帖子|高德POI)/
-      persona_match_score...], "nearby_params": {"origin":{lng,lat,name}, "hours":int} | None,
-      "clarification_needed": str | None}
+    返回 {"recommendations": [...候选，city/category(景点|早餐|午晚餐)/place/
+      source(社区帖子|高德POI)/recommendation_score...], "nearby_params":
+      {"origin":{lng,lat,name}, "hours":int} | None, "clarification_needed": str | None}
     """
     persona_vector = persona.compute_persona_vector(shared_state["persona"], shared_state["scenario"])
     city = _extract_city(location_hint) or shared_state.get("city")
@@ -249,7 +287,7 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int =
                 "clarification_needed": f"没查到「{parsed.get('origin')}」这个地方，能换个更具体的地标或地址吗？",
             }
         nearby_candidates = _nearby_plan(origin, city, persona_vector)
-        _verify_and_fix_categories(nearby_candidates)
+        _classify_categories(nearby_candidates)
         return {
             "recommendations": nearby_candidates,
             "nearby_params": {"origin": {"lng": origin["lng"], "lat": origin["lat"], "name": origin["name"]}, "hours": hours},
@@ -257,16 +295,20 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int =
         }
 
     # mode="trip"：先人格检索种子，再对每个种子分别扩展周边真实候选。
-    # 多捞一批（top_k*5）再过滤掉 Tips 截断到 top_k——达人 Agent 的定位是"提出候选景点/
-    # 美食"，Tips 类帖子（提醒事项，不是真实地点）从一开始就不该占种子名额。
+    # 天数决定这次该捞多少候选：景点/早餐/午晚餐三类硬性配额（2×天数/天数/2×天数，见
+    # _pick_seeds_with_quotas()），Chroma 查询是本地向量检索，不是真实网络调用，捞多一点
+    # 不心疼——按天数放大过一遍，比固定量更贴合"天数越多要保证的量越大"这个真实需求。
     # 兜底：空白人格（没走 onboarding，novelty/pace 都是中性默认值）实测会系统性地更接近
     # Tips 帖子（Tips 没什么强标签，向量天然更靠近原点），真实 demo 里 server.py 一直用带
     # 具体偏好的 onboarding 人格，碰不到这个边界情况，但达人 Agent 本身不该对着任何输入都
     # 可能空手而归——过滤完一个不剩，就退回未过滤结果，好歹给点东西，不摆烂。
-    fetched = store.query_similar_posts(persona_vector, top_k=top_k * 5, city=city)
+    day_count = _extract_day_count(location_hint)
+    fetched = store.query_similar_posts(persona_vector, top_k=min(20 * day_count, 150), city=city)
     deduped = _dedupe_by_place(fetched)
     filtered = [p for p in deduped if p.get("category") != "Tips"]
-    seed_posts = _pick_seeds_with_category_balance(filtered or deduped, top_k)
+    pool = filtered or deduped
+    _classify_categories(pool)  # 配额筛选要靠干净的"景点"/"早餐"/"午晚餐"三选一标签，先分类
+    seed_posts = _pick_seeds_with_quotas(pool, day_count)
     seed_recommendations = [
         {
             "post_id": p.get("post_id"),
@@ -275,6 +317,7 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int =
             "avg_cost": p.get("avg_cost"),
             "rating": p.get("rating"),
             "similarity_score": p.get("similarity_score"),
+            "recommendation_score": p.get("similarity_score"),
             "avoid_tips": p.get("avoid_tips"),
             "verified_trip": p.get("verified_trip"),
             "caption": p.get("caption"),
@@ -315,8 +358,8 @@ def run(shared_state: dict, location_hint: str, mode: str = "trip", top_k: int =
             seen_places.add(candidate["place"])
             nearby_extra.append(candidate)
 
+    _classify_categories(nearby_extra)  # 种子已经分类过了，这里只分类新出现的高德 POI 候选，不重复分类
     recommendations = seed_recommendations + nearby_extra
-    _verify_and_fix_categories(recommendations)
     return {"recommendations": recommendations, "nearby_params": None, "clarification_needed": None}
 
 
@@ -336,7 +379,7 @@ if __name__ == "__main__":
     demo_shared_state = {"persona": demo_persona, "scenario": "vacation", "city": "澳门"}
 
     print("--- mode=trip ---")
-    trip_result = run(demo_shared_state, location_hint="澳门", mode="trip", top_k=2)
+    trip_result = run(demo_shared_state, location_hint="推荐一个2天的行程", mode="trip")
     print(json.dumps(trip_result, ensure_ascii=False, indent=2))
 
     print("--- mode=nearby ---")

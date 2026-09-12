@@ -40,18 +40,21 @@ _WALK_DRIVE_THRESHOLD_M = 2000  # 两站直线距离超过这个就改算驾车�
 # ---------------------------------------------------------------------------
 _DAY_START_TIME = "09:00"
 _DAY_HOURS_BUDGET = 11  # mode="nearby" 用的粗粒度预算（09:00-20:00），mode="trip" 改用下面的时段骨架
-_MAX_STOPS_PER_DAY = 6  # 跟原 nearby_planner 的上限一致；mode="trip" 骨架的槽位数+加塞总数也受这个上限约束
+_MAX_STOPS_PER_DAY = 7  # mode="trip" 骨架 6 个槽位（含早餐）+ 1 个景点槽位加塞，上限跟着调整
 
-# mode="trip" 的时段骨架（2026-09-15 起）：上午/下午/晚上各一个景点槽位，中间穿插午餐/晚餐，
-# 槽位类型天然保证了"每天至少一个景点+两顿饭"的类别配比，槽位的时间窗口也比"一天11小时"的
-# 粗粒度预算严格得多，能防止贪心排班把隔了老远的候选硬塞进同一天。下午/晚上是可选槽位
-# （排不满候选就空着，不阻塞），上午/午餐/晚餐是必选锚点（见 _fill_day_skeleton()/_llm_review_day()）。
+# mode="trip" 的时段骨架（2026-09-15 起，2026-09-16 加早餐槽位）：早餐 + 上午/下午/晚上各一个
+# 景点槽位，中间穿插午餐/晚餐，槽位类型天然保证了"每天保证早中晚配额"的类别配比，槽位的时间
+# 窗口也比"一天11小时"的粗粒度预算严格得多，能防止贪心排班把隔了老远的候选硬塞进同一天。
+# 下午/晚上是可选槽位（排不满候选就空着，不阻塞），早餐/上午/午餐/晚餐是必选锚点（见
+# _fill_day_skeleton()/_llm_review_day()）。"pool" 字段直接对应 content_agent.py 打好的
+# 三选一类别（景点/早餐/午晚餐），不再是笼统的"attraction/meal"二选一角色。
 _SLOT_TEMPLATE = [
-    {"slot_id": "morning", "role": "attraction", "start": "09:00", "end": "12:00", "required": True},
-    {"slot_id": "lunch", "role": "meal", "start": "12:00", "end": "13:30", "required": True},
-    {"slot_id": "afternoon", "role": "attraction", "start": "14:00", "end": "17:30", "required": False},
-    {"slot_id": "dinner", "role": "meal", "start": "18:00", "end": "19:30", "required": True},
-    {"slot_id": "evening", "role": "attraction", "start": "19:30", "end": "21:30", "required": False},
+    {"slot_id": "breakfast", "pool": "breakfast", "start": "08:00", "end": "09:00", "required": True},
+    {"slot_id": "morning", "pool": "attraction", "start": "09:15", "end": "12:00", "required": True},
+    {"slot_id": "lunch", "pool": "lunch_dinner", "start": "12:00", "end": "13:30", "required": True},
+    {"slot_id": "afternoon", "pool": "attraction", "start": "14:00", "end": "17:30", "required": False},
+    {"slot_id": "dinner", "pool": "lunch_dinner", "start": "18:00", "end": "19:30", "required": True},
+    {"slot_id": "evening", "pool": "attraction", "start": "19:30", "end": "21:30", "required": False},
 ]
 _INSERT_PROXIMITY_M = 800  # 景点槽位排完主候选后，加塞候选必须在这个距离内（比 _nearby_plan() 的 1500m 搜索半径更严格，避免"顺路"变成"绕路"）
 _MIN_LEFTOVER_MINUTES_FOR_INSERT = 45  # 这个槽位至少还剩这么多分钟才考虑加塞
@@ -71,13 +74,26 @@ def _distance_m(a: dict, b: dict) -> float:
 
 
 def _candidate_role(candidate: dict) -> str:
-    """候选是"meal"（餐饮）还是"attraction"（景点）角色，给骨架排班分槽位用。社区帖子的
-    category="饮食" 含"食"字；高德 POI 的 category 是原始 type 字符串，餐饮大类叫"餐饮服务"，
-    不含"食"字但含"餐"字——两个字都查，才能同时覆盖两种候选来源（之前 _stay_minutes() 只查
-    "食"字，对高德餐饮 POI 大概率判不出来，误判成景点，是这次骨架重构顺手修的一个隐藏 bug）。
-    查不到 category 就默认"attraction"，安全默认值，不会让候选凭空消失。"""
+    """候选是"meal"（餐饮）还是"attraction"（景点）角色——只给 _stay_minutes() 的停留时长
+    估算用，粗粒度二选一（早餐/午晚餐都算"meal"）。社区帖子的 category="饮食" 含"食"字；
+    高德 POI 的 category 是原始 type 字符串，餐饮大类叫"餐饮服务"，不含"食"字但含"餐"字
+    ——两个字都查，才能同时覆盖两种候选来源。查不到 category 就默认"attraction"，安全
+    默认值，不会让候选凭空消失。分槽位池子（早餐/午晚餐/景点三选一）用 _pool_for_candidate()，
+    不是这个函数。"""
     category = candidate.get("category") or ""
     return "meal" if ("食" in category or "餐" in category) else "attraction"
+
+
+def _pool_for_candidate(candidate: dict) -> str:
+    """候选属于哪个排班池：优先看 category 是不是精确的"景点"/"早餐"/"午晚餐"
+    （content_agent.py 的分类质检负责打好这三个标签，正常流程下所有候选都会有）；万一有
+    候选没被分类过（防御性兜底，不该发生），退回 _candidate_role() 的粗粒度"食"/"餐"字符
+    判断，食物类默认归"lunch_dinner"（更常见的用餐场景），不归"breakfast"（更少见，不该是
+    猜测的默认值）。"""
+    mapping = {"景点": "attraction", "早餐": "breakfast", "午晚餐": "lunch_dinner"}
+    if candidate.get("category") in mapping:
+        return mapping[candidate["category"]]
+    return "lunch_dinner" if _candidate_role(candidate) == "meal" else "attraction"
 
 
 def _stay_minutes(candidate: dict) -> int:
@@ -177,23 +193,28 @@ def _place_day(day_plan: dict, ordered_stops: list[dict], start_point: dict | No
     return unscheduled, current_point
 
 
-def _fill_day_skeleton(attraction_pool: list[dict], meal_pool: list[dict], city: str | None) -> tuple[list[dict], list[dict], list[dict]]:
+def _fill_day_skeleton(
+    attraction_pool: list[dict], breakfast_pool: list[dict], lunch_dinner_pool: list[dict], city: str | None
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """mode="trip" 专用：按 _SLOT_TEMPLATE 顺序把候选池里的候选排进当天的时段骨架，先在内存
     里排好（还没调 trip_plan.add_stop()，等 _llm_review_day() 复核完再真正落地）。
 
-    返回 (这一天预排好的有序节点列表, 用剩的 attraction_pool, 用剩的 meal_pool)——两个池子
-    要把这天用掉的候选摘除，好让下一天继续从剩下的候选里选，跟 _greedy_order() 返回 leftover
-    的思路一致。
+    返回 (这一天预排好的有序节点列表, 用剩的 attraction_pool, 用剩的 breakfast_pool, 用剩的
+    lunch_dinner_pool)——三个池子要把这天用掉的候选摘除，好让下一天继续从剩下的候选里选，
+    跟 _greedy_order() 返回 leftover 的思路一致。
 
     每个预排节点在原候选字段基础上多带：arrival_time/end_time（datetime）、arrival_transport
-    （格式化字符串）、slot_id、anchor（True=上午主景点/午餐/晚餐，_llm_review_day() 不能拿掉）。
+    （格式化字符串）、slot_id、anchor（True=早餐/上午主景点/午餐/晚餐，_llm_review_day() 不能
+    拿掉）。
 
     槽位之间的时间是硬楼层：cursor = max(上一段结束时间, 这个槽位的 start)，不会因为上一段
     提前结束就提前开始下一段——刻意模拟真实旅游的节奏感（吃完午饭到下午景点开门之间留出
     休息/自由活动时间），不是 bug。
     """
     attraction_pool = list(attraction_pool)
-    meal_pool = list(meal_pool)
+    breakfast_pool = list(breakfast_pool)
+    lunch_dinner_pool = list(lunch_dinner_pool)
+    pools = {"attraction": attraction_pool, "breakfast": breakfast_pool, "lunch_dinner": lunch_dinner_pool}
     day_stops: list[dict] = []
     current_point: dict | None = None
     cursor = datetime.strptime(_SLOT_TEMPLATE[0]["start"], "%H:%M")
@@ -231,7 +252,7 @@ def _fill_day_skeleton(attraction_pool: list[dict], meal_pool: list[dict], city:
         slot_start = datetime.strptime(slot["start"], "%H:%M")
         slot_end = datetime.strptime(slot["end"], "%H:%M")
         cursor = max(cursor, slot_start)
-        pool = meal_pool if slot["role"] == "meal" else attraction_pool
+        pool = pools[slot["pool"]]
         ordered = sorted(pool, key=lambda c: _distance_m(current_point, c)) if current_point else list(pool)
         picked = pick_one(pool, slot_end, ordered)
         if picked is None:
@@ -240,7 +261,7 @@ def _fill_day_skeleton(attraction_pool: list[dict], meal_pool: list[dict], city:
 
         # 景点槽位排完主候选后，槽位还剩足够时间、附近又有很近的同角色候选，就加塞一个——
         # 加塞的不算锚点，_llm_review_day() 觉得不合理可以拿掉
-        if slot["role"] == "attraction" and stops_today < _MAX_STOPS_PER_DAY:
+        if slot["pool"] == "attraction" and stops_today < _MAX_STOPS_PER_DAY:
             leftover_minutes = (slot_end - cursor).total_seconds() / 60
             if leftover_minutes >= _MIN_LEFTOVER_MINUTES_FOR_INSERT:
                 nearby = sorted(
@@ -252,23 +273,24 @@ def _fill_day_skeleton(attraction_pool: list[dict], meal_pool: list[dict], city:
                     if inserted is not None:
                         day_stops.append({**inserted, "slot_id": slot["slot_id"], "anchor": False})
 
-    return day_stops, attraction_pool, meal_pool
+    return day_stops, attraction_pool, breakfast_pool, lunch_dinner_pool
 
 
 _DAY_REVIEW_PROMPT = """你是旅游行程质检员。下面是已经排好的一天行程（JSON 数组，每项一站：
-index/place/category/slot_id/arrival_time/distance_from_prev_m），这份名单里只包含允许被
-拿掉的站（上午主景点/午餐/晚餐是必选锚点，已经从名单里排除，不会出现，你没有机会也不需要
-考虑它们）。找出明显不合理的站（比如同一天已经有类似口味的餐饮扎堆、某一站离上一站明显是
-绕路凑数、体验上不划算），返回要拿掉的 index 列表。没有问题就返回空数组。
-只输出 JSON 数组，不要输出其他任何文字。"""
+index/place/category/slot_id/arrival_time/distance_from_prev_m/recommendation_score），
+这份名单里只包含允许被拿掉的站（早餐/上午主景点/午餐/晚餐是必选锚点，已经从名单里排除，
+不会出现，你没有机会也不需要考虑它们）。找出明显不合理的站（比如同一天已经有类似口味的
+餐饮扎堆、某一站离上一站明显是绕路凑数、体验上不划算），返回要拿掉的 index 列表；
+recommendation_score 越高代表这个候选越值得保留，条件差不多时优先拿掉分数低的。没有问题
+就返回空数组。只输出 JSON 数组，不要输出其他任何文字。"""
 
 
 def _llm_review_day(day_stops: list[dict]) -> set[int]:
     """一天排完之后调一次（不是每加一站调一次，控制延迟——这个 demo 光是真实 API 串行调用
-    就已经要几分钟），只能拿掉 anchor=False 的站（加塞候选/可选槽位的候选），三个必选锚点
-    不在候选范围内，哪怕模型觉得不合理也不会被拿掉——这是结构性保证的保底，宁可效果不完美
-    也不能让一次模型判断把"每天至少一个景点+两顿饭"这个保证打破。解析失败/调用异常一律
-    返回空集合（不拿掉任何东西），绝不能让复核失败拖垮整个排班。"""
+    就已经要几分钟），只能拿掉 anchor=False 的站（加塞候选/可选槽位的候选），早餐/上午
+    主景点/午餐/晚餐四个必选锚点不在候选范围内，哪怕模型觉得不合理也不会被拿掉——这是
+    结构性保证的保底，宁可效果不完美也不能让一次模型判断把"每天保证早中晚配额"这个保证
+    打破。解析失败/调用异常一律返回空集合（不拿掉任何东西），绝不能让复核失败拖垮整个排班。"""
     removable = [i for i, s in enumerate(day_stops) if not s.get("anchor")]
     if not removable:
         return set()
@@ -284,6 +306,7 @@ def _llm_review_day(day_stops: list[dict]) -> set[int]:
             "slot_id": day_stops[i].get("slot_id"),
             "arrival_time": fmt_time(day_stops[i].get("arrival_time")),
             "distance_from_prev_m": round(_distance_m(day_stops[i - 1], day_stops[i])) if i > 0 else 0,
+            "recommendation_score": day_stops[i].get("recommendation_score"),
         }
         for i in removable
     ]
@@ -323,11 +346,12 @@ def schedule(
     mode="nearby"：单日短途排班，还是用最近邻贪心 + 粗粒度小时预算（_greedy_order()/
       _place_day()）。origin 是真实起点坐标（content_agent.run() 的 nearby_params.origin），
       hours 是游览时长（默认 3）。origin 缺失直接原样退回未排班。
-    mode="trip"（默认，2026-09-15 起改成时段骨架排班）：候选按 _candidate_role() 分成
-      景点/餐饮两个池子，每天按 _SLOT_TEMPLATE（上午/下午/晚上景点 + 午餐/晚餐）从对应池子
-      挑最近的候选填槽位（见 _fill_day_skeleton()），排完一天调一次 _llm_review_day() 做
-      "是否影响体验"的软性复核（只能拿掉加塞/可选槽位的候选，上午主景点/午餐/晚餐三个
-      必选锚点不会被拿掉）。没有"起点地标"这个概念，每天第一站标"首站"。
+    mode="trip"（默认，2026-09-15 起改成时段骨架排班，2026-09-16 加早餐槽位）：候选按
+      _pool_for_candidate() 分成景点/早餐/午晚餐三个池子，每天按 _SLOT_TEMPLATE（早餐 +
+      上午/下午/晚上景点 + 午餐/晚餐）从对应池子挑最近的候选填槽位（见 _fill_day_skeleton()），
+      排完一天调一次 _llm_review_day() 做"是否影响体验"的软性复核（只能拿掉加塞/可选槽位的
+      候选，早餐/上午主景点/午餐/晚餐四个必选锚点不会被拿掉）。没有"起点地标"这个概念，
+      每天第一站标"首站"。
 
     candidates 里没有 lng/lat 的（比如口碑复核阶段没查到坐标的候选）直接进 unscheduled，
     不硬凑坐标。天气只查最后排到的那个点附近未来 24 小时（避免每天/每站都查一次天气
@@ -358,15 +382,19 @@ def schedule(
         unscheduled.extend(leftover)
         unscheduled.extend(day_unscheduled)
     else:
-        # 时段骨架排班（2026-09-15 起）：上午/下午/晚上景点槽位 + 午餐/晚餐槽位，见
-        # _SLOT_TEMPLATE。景点/餐饮候选池分开，槽位类型天然保证类别配比，槽位时间窗口
-        # 天然限制单段能跳多远——不再是"一天11小时预算"这种粗粒度贪心。
-        attraction_pool = [c for c in geocoded if _candidate_role(c) == "attraction"]
-        meal_pool = [c for c in geocoded if _candidate_role(c) == "meal"]
+        # 时段骨架排班（2026-09-15 起，2026-09-16 加早餐槽位）：早餐 + 上午/下午/晚上景点
+        # 槽位 + 午餐/晚餐槽位，见 _SLOT_TEMPLATE。景点/早餐/午晚餐候选池三分，槽位类型
+        # 天然保证类别配比，槽位时间窗口天然限制单段能跳多远——不再是"一天11小时预算"
+        # 这种粗粒度贪心。
+        attraction_pool = [c for c in geocoded if _pool_for_candidate(c) == "attraction"]
+        breakfast_pool = [c for c in geocoded if _pool_for_candidate(c) == "breakfast"]
+        lunch_dinner_pool = [c for c in geocoded if _pool_for_candidate(c) == "lunch_dinner"]
         for day_offset in range(time_budget_days):
-            if not attraction_pool and not meal_pool:
+            if not attraction_pool and not breakfast_pool and not lunch_dinner_pool:
                 break
-            day_stops, attraction_pool, meal_pool = _fill_day_skeleton(attraction_pool, meal_pool, city)
+            day_stops, attraction_pool, breakfast_pool, lunch_dinner_pool = _fill_day_skeleton(
+                attraction_pool, breakfast_pool, lunch_dinner_pool, city
+            )
             if not day_stops:
                 continue
             drop = _llm_review_day(day_stops)
@@ -379,7 +407,7 @@ def schedule(
                     continue
                 node_id = f"{day_plan['date']}-node-{len(day_plan['nodes']) + 1}"
                 slot_id = stop.get("slot_id")
-                meal_type = {"lunch": "午餐", "dinner": "晚餐"}.get(slot_id)
+                meal_type = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}.get(slot_id)
                 trip_plan.add_stop(
                     day_plan, node_id, "meal" if meal_type else "attraction", stop.get("place") or stop.get("name"),
                     arrival_transport=stop["arrival_transport"],
@@ -392,7 +420,8 @@ def schedule(
                 last_point = stop
             result_days[day_key] = trip_plan.day_stops(day_plan)
         unscheduled.extend(attraction_pool)
-        unscheduled.extend(meal_pool)
+        unscheduled.extend(breakfast_pool)
+        unscheduled.extend(lunch_dinner_pool)
 
     weather_reminders: list[str] = []
     if last_point is not None:
@@ -435,7 +464,7 @@ if __name__ == "__main__":
         "persona": _demo_persona, "scenario": "vacation", "city": "澳门",
         "trip_plan": trip_plan.new_trip_plan("route-schedule-trip-demo-trip"),
     }
-    _trip_content_result = content_agent.run(_trip_shared_state, location_hint="澳门", mode="trip", top_k=3)
+    _trip_content_result = content_agent.run(_trip_shared_state, location_hint="推荐一个3天的行程", mode="trip")
     _trip_schedule_result = schedule(
         _trip_shared_state, _trip_content_result["recommendations"], city="澳门", mode="trip", time_budget_days=3,
     )

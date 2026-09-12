@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -119,27 +120,43 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(route_agent._candidate_role({"category": "风景名胜;风景名胜;文物古迹"}), "attraction")
         self.assertEqual(route_agent._candidate_role({}), "attraction")  # 没有 category，安全默认值
 
+    def test_pool_for_candidate_maps_three_categories(self):
+        # 2026-09-16：排班池子从"景点/餐饮"二选一改成"景点/早餐/午晚餐"三选一，直接对应
+        # content_agent.py 的分类质检打好的标签；候选没被分类过（防御性兜底）才退回
+        # _candidate_role() 的粗粒度判断，食物类默认落 lunch_dinner，不落 breakfast
+        from agents import route_agent
+        self.assertEqual(route_agent._pool_for_candidate({"category": "景点"}), "attraction")
+        self.assertEqual(route_agent._pool_for_candidate({"category": "早餐"}), "breakfast")
+        self.assertEqual(route_agent._pool_for_candidate({"category": "午晚餐"}), "lunch_dinner")
+        self.assertEqual(route_agent._pool_for_candidate({"category": "餐饮服务;中餐厅;江浙菜"}), "lunch_dinner")
+        self.assertEqual(route_agent._pool_for_candidate({}), "attraction")
+
     def test_fill_day_skeleton_respects_slot_windows_and_fills_anchors(self):
         from agents import route_agent
         attraction_pool = [
             {"place": "上午景点", "category": "景点", "lng": 113.54, "lat": 22.19},
             {"place": "下午景点", "category": "景点", "lng": 113.55, "lat": 22.20},
         ]
-        meal_pool = [
-            {"place": "午餐店", "category": "饮食", "lng": 113.541, "lat": 22.191},
-            {"place": "晚餐店", "category": "饮食", "lng": 113.542, "lat": 22.192},
+        breakfast_pool = [
+            {"place": "早餐店", "category": "早餐", "lng": 113.539, "lat": 22.189},
+        ]
+        lunch_dinner_pool = [
+            {"place": "午餐店", "category": "午晚餐", "lng": 113.541, "lat": 22.191},
+            {"place": "晚餐店", "category": "午晚餐", "lng": 113.542, "lat": 22.192},
         ]
         fake_leg = {"mode": "walking", "duration_min": 5, "distance_m": 300}
         with patch.object(route_agent, "_real_leg", return_value=fake_leg):
-            day_stops, left_attraction, left_meal = route_agent._fill_day_skeleton(attraction_pool, meal_pool, "澳门")
+            day_stops, left_attraction, left_breakfast, left_lunch_dinner = route_agent._fill_day_skeleton(
+                attraction_pool, breakfast_pool, lunch_dinner_pool, "澳门"
+            )
         slot_ids = {s["slot_id"] for s in day_stops}
-        self.assertEqual({"morning", "lunch", "dinner"}, slot_ids & {"morning", "lunch", "dinner"})
+        self.assertEqual({"breakfast", "morning", "lunch", "dinner"}, slot_ids & {"breakfast", "morning", "lunch", "dinner"})
         anchors = {s["slot_id"]: s["anchor"] for s in day_stops}
-        self.assertTrue(anchors["morning"] and anchors["lunch"] and anchors["dinner"])
+        self.assertTrue(anchors["breakfast"] and anchors["morning"] and anchors["lunch"] and anchors["dinner"])
         slot_end_by_id = {slot["slot_id"]: slot["end"] for slot in route_agent._SLOT_TEMPLATE}
         for stop in day_stops:
             self.assertLessEqual(stop["end_time"].strftime("%H:%M"), slot_end_by_id[stop["slot_id"]])
-        self.assertEqual(len(day_stops) + len(left_attraction) + len(left_meal), 4)
+        self.assertEqual(len(day_stops) + len(left_attraction) + len(left_breakfast) + len(left_lunch_dinner), 5)
 
     def test_fill_day_skeleton_inserts_nearby_attraction(self):
         # "加塞"：景点槽位排完主候选后，槽位还剩足够时间、附近有很近的同角色候选就再排一个
@@ -150,7 +167,7 @@ class NearbyTests(unittest.TestCase):
         ]
         fake_leg = {"mode": "walking", "duration_min": 2, "distance_m": 100}
         with patch.object(route_agent, "_real_leg", return_value=fake_leg):
-            day_stops, _, _ = route_agent._fill_day_skeleton(attraction_pool, [], "澳门")
+            day_stops, _, _, _ = route_agent._fill_day_skeleton(attraction_pool, [], [], "澳门")
         morning_stops = [s for s in day_stops if s["slot_id"] == "morning"]
         self.assertEqual(len(morning_stops), 2)
         self.assertFalse(morning_stops[1]["anchor"])  # 加塞的不是锚点，_llm_review_day() 可以拿掉
@@ -164,6 +181,21 @@ class NearbyTests(unittest.TestCase):
         with patch.object(route_agent.llm_tool, "call_llm", return_value="[1]"):
             dropped = route_agent._llm_review_day(day_stops)
         self.assertEqual(dropped, {1})
+
+    def test_llm_review_day_payload_includes_recommendation_score(self):
+        # 2026-09-16：候选的 recommendation_score（社区帖子来自 similarity_score，高德 POI
+        # 来自 persona_match_score，content_agent.py 统一成这一个字段）之前只是算出来放着，
+        # route_agent 从头到尾没读过——"删减"判断只能凭地点名字/类别/距离瞎猜。这次把它
+        # 传进 _llm_review_day() 的复核 payload，让模型删减时有分可依
+        from agents import route_agent
+        day_stops = [
+            {"place": "甲", "category": "景点", "slot_id": "morning", "anchor": True, "arrival_time": "09:00", "end_time": "09:30", "lng": 113.54, "lat": 22.19, "recommendation_score": 0.9},
+            {"place": "乙(加塞)", "category": "景点", "slot_id": "morning", "anchor": False, "arrival_time": "09:35", "end_time": "10:05", "lng": 113.541, "lat": 22.191, "recommendation_score": 0.3},
+        ]
+        with patch.object(route_agent.llm_tool, "call_llm", return_value="[]") as mocked:
+            route_agent._llm_review_day(day_stops)
+        sent_payload = json.loads(mocked.call_args.args[0][1]["content"])
+        self.assertEqual(sent_payload[0]["recommendation_score"], 0.3)
 
     def test_llm_review_day_skips_call_when_nothing_removable(self):
         # 一整天全是锚点（没有加塞/可选槽位候选）时，压根不用调 LLM
@@ -185,61 +217,73 @@ class NearbyTests(unittest.TestCase):
             dropped = route_agent._llm_review_day(day_stops)
         self.assertEqual(dropped, set())
 
-    def test_pick_seeds_with_category_balance_prioritizes_sight(self):
+    def test_pick_seeds_with_quotas_enforces_per_day_minimums(self):
+        # 2026-09-16：种子选择从"至少1个景点，剩下按相似度"改成硬性配额——景点>=2×天数，
+        # 早餐>=天数，午晚餐>=2×天数（n天要吃2n顿午晚餐，候选池要有2n家店才能保证不撞店）
+        from agents import content_agent
+        sights = [{"place": f"景点{i}", "category": "景点", "similarity_score": 1 - i * 0.01} for i in range(5)]
+        breakfasts = [{"place": f"早餐{i}", "category": "早餐", "similarity_score": 1 - i * 0.01} for i in range(5)]
+        lunch_dinners = [{"place": f"午晚餐{i}", "category": "午晚餐", "similarity_score": 1 - i * 0.01} for i in range(5)]
+        picked = content_agent._pick_seeds_with_quotas(sights + breakfasts + lunch_dinners, day_count=2)
+        picked_by_cat = {}
+        for p in picked:
+            picked_by_cat.setdefault(p["category"], []).append(p["place"])
+        self.assertEqual(len(picked_by_cat["景点"]), 4)  # 2×2
+        self.assertEqual(len(picked_by_cat["早餐"]), 2)  # 1×2
+        self.assertEqual(len(picked_by_cat["午晚餐"]), 4)  # 2×2
+        # 每个类别内部按相似度取最高的几条（已经排好序，取到的应该是靠前那几个）
+        self.assertEqual(picked_by_cat["景点"], ["景点0", "景点1", "景点2", "景点3"])
+
+    def test_pick_seeds_with_quotas_falls_back_when_category_short(self):
+        # 某个类别候选不够配额就照单全收，不强求，不报错
         from agents import content_agent
         posts = [
-            {"place": "美食1", "category": "饮食", "similarity_score": 0.9},
-            {"place": "美食2", "category": "饮食", "similarity_score": 0.85},
-            {"place": "景点1", "category": "景点", "similarity_score": 0.5},
-            {"place": "美食3", "category": "饮食", "similarity_score": 0.4},
+            {"place": "早餐1", "category": "早餐", "similarity_score": 0.9},
         ]
-        picked = content_agent._pick_seeds_with_category_balance(posts, top_k=3)
-        self.assertEqual(len(picked), 3)
-        self.assertIn("景点", [p["category"] for p in picked])
+        picked = content_agent._pick_seeds_with_quotas(posts, day_count=3)  # 早餐配额需要3条，只有1条
+        self.assertEqual(picked, posts)
 
-    def test_pick_seeds_with_category_balance_falls_back_when_no_sight(self):
-        from agents import content_agent
-        posts = [
-            {"place": "美食1", "category": "饮食", "similarity_score": 0.9},
-            {"place": "美食2", "category": "饮食", "similarity_score": 0.85},
-        ]
-        picked = content_agent._pick_seeds_with_category_balance(posts, top_k=3)
-        self.assertEqual(picked, posts[:3])
-
-    def test_verify_and_fix_categories_applies_llm_corrections(self):
-        # 2026-09-15：达人 Agent 向编排提交候选之前的分类质检——社区帖子的 category 是人工
-        # 录入的，可能真的标错；高德 POI 的 category 是原始 type 字符串，本身就不是干净的
-        # "饮食/景点"标签。标错一条，route_agent._candidate_role() 就可能把餐厅塞进景点槽位
+    def test_classify_categories_applies_llm_corrections(self):
+        # 2026-09-16：分类质检升级成三选一（景点/早餐/午晚餐），不再是"饮食/景点"二选一
+        # ——社区帖子的 category 是人工录入的，可能真的标错，也可能只有粗粒度的"饮食"没细分
+        # 早中晚；高德 POI 的 category 是原始 type 字符串，本身就不是干净的标签
         from agents import content_agent
         recs = [
             {"place": "甲餐厅", "category": "景点", "post_id": "p1"},
             {"place": "乙景点", "category": "景点"},
         ]
-        with patch.object(content_agent.llm_tool, "call_llm", return_value='[{"index":0,"category":"饮食"}]'):
-            content_agent._verify_and_fix_categories(recs)
-        self.assertEqual(recs[0]["category"], "饮食")
+        with patch.object(content_agent.llm_tool, "call_llm", return_value='[{"index":0,"category":"午晚餐"}]'):
+            content_agent._classify_categories(recs)
+        self.assertEqual(recs[0]["category"], "午晚餐")
         self.assertEqual(recs[1]["category"], "景点")  # 没被模型点名的不动
 
-    def test_verify_and_fix_categories_writes_back_only_for_community_posts(self):
+    def test_classify_categories_writes_back_only_for_community_posts(self):
         from agents import content_agent
         recs = [
             {"place": "甲餐厅", "category": "景点", "post_id": "p1"},  # 社区帖子来源，带 post_id
             {"place": "乙餐厅", "category": "景点"},  # 高德 POI 来源，没有 post_id
         ]
         with patch.object(content_agent.llm_tool, "call_llm",
-                           return_value='[{"index":0,"category":"饮食"},{"index":1,"category":"饮食"}]'), \
+                           return_value='[{"index":0,"category":"早餐"},{"index":1,"category":"早餐"}]'), \
              patch.object(content_agent.store, "update_post_category") as update_mock:
-            content_agent._verify_and_fix_categories(recs)
-        self.assertEqual(recs[0]["category"], "饮食")
-        self.assertEqual(recs[1]["category"], "饮食")
-        update_mock.assert_called_once_with("p1", "饮食")
+            content_agent._classify_categories(recs)
+        self.assertEqual(recs[0]["category"], "早餐")
+        self.assertEqual(recs[1]["category"], "早餐")
+        update_mock.assert_called_once_with("p1", "早餐")
 
-    def test_verify_and_fix_categories_degrades_gracefully_on_error(self):
+    def test_classify_categories_degrades_gracefully_on_error(self):
         from agents import content_agent
         recs = [{"place": "甲餐厅", "category": "景点", "post_id": "p1"}]
         with patch.object(content_agent.llm_tool, "call_llm", side_effect=RuntimeError("boom")):
-            content_agent._verify_and_fix_categories(recs)
+            content_agent._classify_categories(recs)
         self.assertEqual(recs[0]["category"], "景点")
+
+    def test_extract_day_count_parses_or_defaults(self):
+        from agents import content_agent
+        self.assertEqual(content_agent._extract_day_count("推荐一个3天的行程"), 3)
+        self.assertEqual(content_agent._extract_day_count("5日游怎么安排"), 5)
+        self.assertEqual(content_agent._extract_day_count("推荐一下怎么玩"), 1)  # 提取不到默认1天
+        self.assertEqual(content_agent._extract_day_count("来个99天的旅行"), 14)  # 封顶14天
 
     def test_days_last_stops_takes_final_geocoded_node_per_day(self):
         # 2026-09-15：晚上回酒店睡觉，"最后一站"比"第一站"更直接影响住宿体验，酒店锚点/

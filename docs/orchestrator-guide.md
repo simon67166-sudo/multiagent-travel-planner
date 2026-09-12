@@ -547,3 +547,11 @@ python orchestrator/server.py
     - **顺带修的前置缺口**：`trip_plan.add_hotel()` 存进去的酒店记录之前没存坐标（`hotel_tool.search_hotels()` 明明有 `lat`/`lng`，只是 `_search_real_hotels()` 构造候选字典时没往下传，`server.py` 的 `apply_selection()` 也没存）——这是这次对话反复出现的同一类"坐标算出来了但传递链路中间丢了"问题，这次一并接上（`_search_real_hotels()` 候选带上 `lng`/`lat`，`apply_selection()` 的 `hotel_picker` 分支存进 `trip_plan.add_hotel()`），不然"已订酒店距离复核"这个新功能根本没有坐标可用。
 
 真实验证：两天真实行程（`content_agent.run()` + `route_agent.schedule(time_budget_days=2)`），`_anchor_place_from_trip()` 返回的坐标跟两天末站真实坐标的算术平均值完全一致；模拟一个真实离行程很远的已订酒店（氹仔坐标），确认 `run()` 没有发起新的酒店搜索（`_search_real_hotels` 断言未调用）、`hotel_distance_reminder` 正确点名了两天行程终点都偏远。
+
+25. **候选筛选加硬性类别配额：景点≥2×天数、早餐≥天数、午晚餐≥2×天数，早餐/午晚餐分开管理**（2026-09-16，用户提出）：用户问"一开始选的时候会区分景点和美食吗"——现状只有一个软性兜底（种子里至少 1 条"景点"，剩下纯按相似度），周边真实 POI 扩展完全没有类别配额意识；用户建议加硬性配额，且要把"美食"细分成早餐/午晚餐（保证早餐/午晚餐候选池数量分别 ≥天数/≥2×天数，才能保证 n 天不撞同一家店）。**已解决**，贯穿 `content_agent.py`（选）和 `route_agent.py`（排）两个 Agent：
+    - `content_agent.py` 恢复天数提取（`_extract_day_count()`，逻辑跟上上个提交删掉的 `orchestrator_agent` 版本一样，这次只用来决定该捞多少候选，不触发自动排班）；候选池扩大到按天数缩放（`min(20×天数, 150)`）；新增 `_pick_seeds_with_quotas()` 替换原来"至少1个景点"的软性兜底，按 `2×天数`/`天数`/`2×天数` 强制配额挑种子。
+    - 新增分类质检 `_classify_categories()`（原 `_verify_and_fix_categories()` 升级，二选一"饮食/景点"改成三选一"景点/早餐/午晚餐"，社区帖子/高德 POI 都要走一遍）——**提示词踩了一个坑**：真实测过用"如果实在看不出来就保留原分类"这种宽松措辞，一批 34 条候选里 15 条会被模型偷懒原样保留成笼统的"饮食"，改成"只要不是精确的三选一标签就必须归类，餐饮类判断不出早晚就默认午晚餐"这种强制措辞后，同一批数据、以及真实 3 天行程里全部 290 条候选（243 条来自周边高德 POI 扩展）都被归类干净，零遗留。
+    - `route_agent.py` 的 `_SLOT_TEMPLATE` 加早餐槽位（08:00-09:00，必选锚点），槽位标识从"attraction/meal"二选一角色改成"attraction/breakfast/lunch_dinner"三选一池子（`_pool_for_candidate()`，候选没被分类过时兜底默认归 `lunch_dinner` 不归 `breakfast`）；`_fill_day_skeleton()`/`schedule()` 相应改成管理三个候选池；`_MAX_STOPS_PER_DAY` 从 6 调到 7（6 个槽位+1 个景点加塞）。
+    - **顺带解决另一个用户提出的缺口**："传回去的数据会有推荐指数吗"——发现数据其实已经有 `similarity_score`（社区帖子）/`persona_match_score`（周边 POI）两个打分字段，但 `route_agent.py` 从头到尾没读过。统一成 `recommendation_score` 字段，传进 `_llm_review_day()` 的复核 payload，让"删减"判断有分可依（同等情况优先拿掉分数低的）——`pick_one()` 选点本身还是按距离/时间可行性，跟"推不推荐"是两回事，不混在一起。
+
+真实验证：真实 3 天行程（`content_agent.run(location_hint="推荐一个3天的行程")` + `route_agent.schedule(time_budget_days=3)`），290 条候选全部归类成干净的三选一标签（景点43/早餐6/午晚餐241）、全部带 `recommendation_score`；排完的 3 天共 17 站，`meal_type` 正确区分早餐/午餐/晚餐三档，**17 个地点互不重复**（`len(set(all_places)) == 17`）。
