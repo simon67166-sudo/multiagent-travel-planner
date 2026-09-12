@@ -29,6 +29,7 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR_DIR))
 
 import hotel_tool
+import map_tool
 import trip_plan as trip_plan_module
 
 _DEFAULT_STAY_NIGHTS = 2
@@ -111,6 +112,19 @@ def _parse_date_range(date_range: str | None) -> tuple[str | None, str | None, i
 _ANCHOR_SANITY_KM = 50  # RollingGo 按地点名字匹配也可能像高德一样认错地方（生僻地名尤其容易
 # 撞到国外同名地方——真实测过"中西药局旧址"这种没那么出名的地标被匹配成美国圣路易斯，坐标
 # 直接跑去了密苏里州），查回来的酒店离锚点真实坐标这么远就当匹配失败，整批放弃退回城市级搜索
+_CITY_SANITY_KM = 80  # 城市级兜底校验半径，比 _ANCHOR_SANITY_KM 更宽松（覆盖整个城市范围，
+# 不是某个具体锚点附近）——两层校验管的不是同一件事：锚点校验管"离行程地点近不近"，这个管
+# "压根有没有查到别的城市/国家去"，哪怕锚点校验已经通过，也不代表城市本身没串
+
+
+def _city_center(city: str) -> dict | None:
+    """城市中心点坐标，给酒店候选做"这家店到底在不在这个城市"的兜底校验用——查不到
+    （城市名字打错/API 一时抽风）就返回 None，调用方跳过这层校验，不强求。"""
+    try:
+        lng, lat = map_tool.geocode(city)
+        return {"lng": lng, "lat": lat}
+    except Exception:
+        return None
 
 
 def _haversine_km(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
@@ -207,6 +221,14 @@ def _search_real_hotels(
     被匹配到美国圣路易斯去了）——查回来的酒店坐标用 anchor 里已经查好的真实坐标做一次合理性
     校验（_ANCHOR_SANITY_KM 内），全部超出范围就当这次锚点匹配失败，退回城市级搜索重查一次，
     不把跑偏的结果直接给用户。
+
+    2026-09-17 用户真实预订时发现地图上出现了异地酒店——查出根因是这层校验之前只用
+    on_target 判断"要不要整批重查"，判断完之后却没拿过滤后的结果替换 hotels：只要 5 个
+    候选里有 1 个在范围内，其余 4 个跑偏的也会原样混进最终候选，不会触发整批重查。现在
+    on_target 非空时真的拿它替换 hotels，不是算完就扔。另外不管有没有 anchor，最后都会
+    再拿 _city_center() 做一次"离这个城市够不够近"的兜底校验（_CITY_SANITY_KM，比锚点校验
+    宽松很多，只挡"整个查到别的城市/国家"这种离谱情况）——锚点校验和城市级校验管的不是
+    同一件事，没有 anchor 的城市级搜索之前完全没有任何坐标合理性校验。
     """
     origin_query = user_message or (f"想在{city}订一间{category}酒店" if category else f"想在{city}订一间性价比高的酒店")
     if anchor:
@@ -226,7 +248,9 @@ def _search_real_hotels(
             if h.get("lng") is not None and h.get("lat") is not None
             and _haversine_km(anchor["lng"], anchor["lat"], h["lng"], h["lat"]) <= _ANCHOR_SANITY_KM
         ]
-        if not on_target:
+        if on_target:
+            hotels = on_target
+        else:
             try:
                 hotels = hotel_tool.search_hotels(
                     place=city, place_type="城市", origin_query=origin_query,
@@ -234,6 +258,14 @@ def _search_real_hotels(
                 )
             except Exception as e:
                 return [], str(e)
+
+    city_center = _city_center(city)
+    if city_center and hotels:
+        hotels = [
+            h for h in hotels
+            if h.get("lng") is None or h.get("lat") is None
+            or _haversine_km(city_center["lng"], city_center["lat"], h["lng"], h["lat"]) <= _CITY_SANITY_KM
+        ]
 
     if not check_in:
         check_in = (date.today() + timedelta(days=1)).isoformat()

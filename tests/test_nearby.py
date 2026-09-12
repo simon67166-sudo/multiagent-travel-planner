@@ -558,14 +558,16 @@ class NearbyTests(unittest.TestCase):
         from agents import ota_hotel_agent
         anchor = {"place": "大三巴", "lng": 113.54, "lat": 22.19}
         on_target_hotel = [{"name": "近旁酒店", "lng": 113.541, "lat": 22.191}]
-        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=on_target_hotel) as mocked:
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=on_target_hotel) as mocked, \
+             patch.object(ota_hotel_agent, "_city_center", return_value={"lng": 113.54, "lat": 22.19}):
             ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=anchor)
         self.assertEqual(mocked.call_args.kwargs["place"], "大三巴")
         self.assertEqual(mocked.call_args.kwargs["place_type"], "景点")
 
     def test_search_real_hotels_falls_back_to_city_without_anchor(self):
         from agents import ota_hotel_agent
-        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=[]) as mocked:
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=[]) as mocked, \
+             patch.object(ota_hotel_agent, "_city_center", return_value={"lng": 113.54, "lat": 22.19}):
             ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=None)
         self.assertEqual(mocked.call_args.kwargs["place"], "澳门")
         self.assertEqual(mocked.call_args.kwargs["place_type"], "城市")
@@ -580,7 +582,7 @@ class NearbyTests(unittest.TestCase):
         on_target_hotel = [{"name": "近旁酒店", "lng": 113.541, "lat": 22.191}]
         with patch.object(
             ota_hotel_agent.hotel_tool, "search_hotels", side_effect=[far_away_hotel, on_target_hotel]
-        ) as mocked:
+        ) as mocked, patch.object(ota_hotel_agent, "_city_center", return_value={"lng": 113.54, "lat": 22.19}):
             candidates, error = ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=anchor)
         self.assertIsNone(error)
         self.assertEqual(len(candidates), 1)
@@ -589,12 +591,55 @@ class NearbyTests(unittest.TestCase):
         self.assertEqual(mocked.call_args_list[1].kwargs["place"], "澳门")
         self.assertEqual(mocked.call_args_list[1].kwargs["place_type"], "城市")
 
+    def test_search_real_hotels_keeps_only_on_target_when_results_are_mixed(self):
+        # 2026-09-17：用户真实预订时反馈"地图上出现了异地酒店"——查出根因是 on_target 之前
+        # 只用来判断"要不要整批重查"，判断完之后却没拿过滤后的结果替换 hotels：5 个候选里
+        # 有 1 个在范围内就不会触发重查，但混进最终候选的还是原始未过滤的那一批，跑偏的
+        # 酒店会跟着正常的一起冒出来。现在必须验证：命中 on_target 时确实只保留通过校验的
+        from agents import ota_hotel_agent
+        anchor = {"place": "大三巴", "lng": 113.54, "lat": 22.19}
+        mixed_hotels = [
+            {"name": "近旁酒店", "lng": 113.541, "lat": 22.191},
+            {"name": "异地酒店", "lng": -90.195015, "lat": 38.623196},
+        ]
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=mixed_hotels) as mocked, \
+             patch.object(ota_hotel_agent, "_city_center", return_value={"lng": 113.54, "lat": 22.19}):
+            candidates, error = ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=anchor)
+        self.assertIsNone(error)
+        self.assertEqual([c["name"] for c in candidates], ["近旁酒店"])
+        self.assertEqual(mocked.call_count, 1)  # 有 on_target 结果，不该触发城市级重查
+
+    def test_search_real_hotels_city_level_sanity_check_without_anchor(self):
+        # 没有 anchor 的城市级搜索之前完全没有任何坐标合理性校验——查到别的城市/国家去也会
+        # 原样返回给用户。现在不管有没有 anchor 都要过一次"离城市中心够不够近"的兜底校验
+        from agents import ota_hotel_agent
+        mixed_hotels = [
+            {"name": "本地酒店", "lng": 113.541, "lat": 22.191},
+            {"name": "异地酒店", "lng": -90.195015, "lat": 38.623196},
+        ]
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=mixed_hotels), \
+             patch.object(ota_hotel_agent, "_city_center", return_value={"lng": 113.54, "lat": 22.19}):
+            candidates, error = ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=None)
+        self.assertIsNone(error)
+        self.assertEqual([c["name"] for c in candidates], ["本地酒店"])
+
+    def test_search_real_hotels_skips_sanity_check_when_city_center_unresolvable(self):
+        # _city_center() 查不到（城市名字打错/API 抽风）就跳过这层校验，不强求、不报错
+        from agents import ota_hotel_agent
+        hotels = [{"name": "某酒店", "lng": 113.541, "lat": 22.191}]
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=hotels), \
+             patch.object(ota_hotel_agent, "_city_center", return_value=None):
+            candidates, error = ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=None)
+        self.assertIsNone(error)
+        self.assertEqual(len(candidates), 1)
+
     def test_search_real_hotels_forwards_star_min(self):
         # 2026-09-16：star_min 是 hotel_tool.search_hotels() 本来就有的参数，之前
         # _search_real_hotels() 没接上——trip_preferences.py 的"度假酒店"场景要用它
         # 提高星级门槛
         from agents import ota_hotel_agent
-        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=[]) as mocked:
+        with patch.object(ota_hotel_agent.hotel_tool, "search_hotels", return_value=[]) as mocked, \
+             patch.object(ota_hotel_agent, "_city_center", return_value={"lng": 113.54, "lat": 22.19}):
             ota_hotel_agent._search_real_hotels("澳门", None, None, 2, None, None, anchor=None, star_min=4.0)
         self.assertEqual(mocked.call_args.kwargs["star_min"], 4.0)
 
