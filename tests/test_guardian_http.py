@@ -56,8 +56,8 @@ class GuardianHTTPTests(unittest.TestCase):
     def test_events_are_cached_for_all_members(self):
         self.join()
         with patch("guardian_service.check_events",return_value={"events":[{"id":"demo-test","data_kind":"demo"}],"proposed_itinerary":None}) as check:
-            a=self.owner.post("/events/check",json={"demo":True})
-            b=self.member.post("/events/check",json={"demo":True})
+            a=self.owner.post("/events/check",json={"demo":False})
+            b=self.member.post("/events/check",json={"demo":False})
         self.assertEqual(a.status_code,200,a.json)
         self.assertTrue(b.json["cached"])
         self.assertEqual(check.call_count,1)
@@ -65,6 +65,26 @@ class GuardianHTTPTests(unittest.TestCase):
         with patch.dict("os.environ",{"PUBLIC_BASE_URL":"https://travel.example"}):
             response=self.owner.post("/team/invite",json={})
         self.assertTrue(response.json["invite_url"].startswith("https://travel.example/?join="))
+    def test_demo_weather_refresh_never_calls_live_provider(self):
+        out=self.owner.post("/guardian/plan",json={"message":"行程","mode":"demo","city":"香港"}).json
+        self.owner.post("/proposals/"+out["proposal"]["id"]+"/accept",json={"expected_version":0})
+        with patch("nearby_planner.sources.weather") as weather:
+            response=self.owner.post("/nearby-weather",json={})
+        self.assertEqual(response.status_code,200,response.json)
+        self.assertEqual(response.json["data_kind"],"demo")
+        weather.assert_not_called()
+        self.assertEqual(self.owner.get("/").headers["Referrer-Policy"],"no-referrer")
+
+    def test_new_blank_team_leaves_existing_trip_intact(self):
+        self.join()
+        out=self.owner.post("/guardian/plan",json={"message":"行程","mode":"demo","city":"香港"}).json
+        self.owner.post("/proposals/"+out["proposal"]["id"]+"/accept",json={"expected_version":0})
+        old=self.member.get("/team").json
+        fresh=self.owner.post("/team",json={"name":"獨立演示","member_name":"我","inherit":False})
+        self.assertEqual(fresh.status_code,200,fresh.json)
+        self.assertIsNone(fresh.json["itinerary"]["nearby_plan"])
+        self.assertEqual(self.member.get("/team").json["itinerary"],old["itinerary"])
+
     def test_skill_list_has_all_fifteen(self):
         response=self.owner.get("/guardian/skills")
         self.assertEqual(response.status_code,200,response.json)

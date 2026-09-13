@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 import math
 import re
 
+if __package__:
+    from .guardian_sources import content_is_current
+else:
+    from guardian_sources import content_is_current
+
 SKILL_IDS = ('food_risk', 'group_consensus', 'queue', 'weather', 'toilet', 'souvenir',
              'citywalk', 'crowd', 'safety', 'social', 'hidden_menu', 'diy', 'lazy', 'museum', 'photo')
 KEYWORDS = dict(zip(SKILL_IDS, [
@@ -22,12 +27,12 @@ KEYWORDS = dict(zip(SKILL_IDS, [
     ('toilet', 'restroom', '厕所', '廁所', '洗手间', '洗手間'),
     ('souvenir', 'gift', '伴手礼', '伴手禮', '手信'), ('citywalk', 'city walk', '散步', '漫步'),
     ('crowd', '拥挤', '擁擠', '人多'), ('safety', 'safe', '安全', '危险', '危險'),
-    ('social', 'meetup', '社交', '交友'), ('hidden menu', '隐藏菜单', '隱藏菜單'),
+    ('social', 'meetup', '社交', '交友', '問路', '问路', '點餐', '点餐', '社恐'), ('hidden menu', '隐藏菜单', '隱藏菜單'),
     ('diy', 'craft', '手作', '手工'), ('lazy', 'tired', '累', '休息', '躺平'),
     ('museum', '博物馆', '博物館', '展览', '展覽'), ('photo', '摄影', '攝影', '拍照', '打卡')]))
 ROLES = dict(zip(SKILL_IDS, ('FoodShopping','Group','Mobility','Guardian','Mobility','FoodShopping','Mobility','Mobility','Guardian','Experience','FoodShopping','Experience','Group','Experience','Experience')))
 SKILLS = [{'id': skill, 'name': name, 'agent': ROLES[skill]} for skill, name in zip(SKILL_IDS,
-    ('飲食風險', '團隊共識', '排隊調整', '天氣應變', '洗手間', '手信', '城市漫步', '人潮避讓', '安全提醒', '公共活動', '隱藏菜單', '手作體驗', '輕鬆行程', '博物館', '攝影'))]
+    ('飲食風險', '團隊共識', '排隊調整', '天氣應變', '洗手間', '手信', '城市漫步', '人潮避讓', '安全提醒', '社交話術', '隱藏菜單', '手作體驗', '輕鬆行程', '博物館', '攝影'))]
 
 DIET_ALIASES = {'素食': 'vegetarian', '纯素': 'vegan', '純素': 'vegan', '清真': 'halal',
                 '无麸质': 'gluten_free', '無麩質': 'gluten_free', 'gluten-free': 'gluten_free',
@@ -230,8 +235,9 @@ def validate_itinerary_feasibility(itinerary: dict, members: list) -> dict:
 
     Returns status='feasible'|'unknown'|'infeasible', feasible:bool, violations,
     unknowns, total_cost_by_currency, known_walking_m, constraint_summary.
-    nearby_plan.stops/legs are authoritative if present; else legacy nodes' poi
-    metadata + trip_plan.legs. Prices are per-person; legs need explicit price
+    nearby_plan.stops/legs replace only its request date; legacy POIs on other
+    days and their day-level legs remain in the total. Other-day missing coverage
+    stays unknown. Without nearby, use legacy nodes' poi + trip_plan.legs. Prices are per-person; legs need explicit price
     even when zero. Hotels/flights/additional_costs are included (same price shape).
     Internal walking requires internal_walking_m per stop. Walking legs distance_m,
     transit/driving walking_distance_m include connections. Missing/unavailable legs,
@@ -248,17 +254,48 @@ def validate_itinerary_feasibility(itinerary: dict, members: list) -> dict:
     trip = itinerary.get('trip_plan') or {}
     nearby = itinerary.get('nearby_plan')
     plan = nearby if isinstance(nearby, dict) else trip
+    other_days = []
     if isinstance(nearby, dict):
-        stops = nearby.get('stops', [])
+        raw_stops = nearby.get('stops', [])
+        if not isinstance(raw_stops, list):
+            raise ValueError('stops must be a list')
+        stops = deepcopy(raw_stops)
+        nearby_date = (nearby.get('request') or {}).get('date')
+        for day_key, day in trip.get('days', {}).items():
+            if str(day_key) == str(nearby_date) or (nearby_date is not None and str(day.get('date')) == str(nearby_date)):
+                continue
+            # Undated legacy mirrors cannot safely be resolved by POI name/ID.
+            if nearby_date is None:
+                unknowns.append('nearby request date missing; cross-day overlap unverified')
+            other_days.append(day)
+            for key in _ordered(day):
+                node = day['nodes'][key]
+                stops.append(deepcopy(node.get('poi', node)))
     else:
         stops = []
         for day in trip.get('days', {}).values():
             for key in _ordered(day):
                 node = day['nodes'][key]
-                stops.append(node.get('poi', node))
-    legs = plan.get('legs', [])
-    if not isinstance(stops, list) or not isinstance(legs, list):
-        raise ValueError('stops and legs must be lists')
+                stops.append(deepcopy(node.get('poi', node)))
+    legs = deepcopy(plan.get('legs', []))
+    if not isinstance(legs, list):
+        raise ValueError('legs must be a list')
+    extra_costs = deepcopy(plan.get('additional_costs', []))
+    for day in other_days:
+        day_legs = day.get('legs', [])
+        if not isinstance(day_legs, list):
+            raise ValueError('day legs must be a list')
+        legs.extend(deepcopy(day_legs))
+        extra_costs.extend(deepcopy(day.get('additional_costs', [])))
+        count = len(day.get('nodes', {}))
+        if count and len(day_legs) < count:
+            unknowns.append('other-day origin/connecting legs and transport costs unknown')
+        if count and day.get('cost_complete') is not True:
+            unknowns.append('other-day cost coverage unverified')
+        if count and day.get('walking_complete') is not True:
+            unknowns.append('other-day walking coverage unverified')
+    for record in stops + legs + extra_costs:
+        _refresh_joined_facts(record, 'demo' if record.get('demo') or record.get('data_kind') == 'demo' else 'real')
     costs, walking = {}, 0.0
     for stop in stops:
         reasons, missing = _hard_check(stop, hard, check_walking=False)
@@ -285,7 +322,7 @@ def validate_itinerary_feasibility(itinerary: dict, members: list) -> dict:
             violations.append('total walking maximum exceeded')
         if plan.get('walking_complete') is not True:
             unknowns.append('whole-itinerary walking coverage unverified')
-    cost_records = stops + legs + trip.get('hotels', []) + trip.get('flights', []) + plan.get('additional_costs', [])
+    cost_records = stops + legs + trip.get('hotels', []) + trip.get('flights', []) + extra_costs
     if hard['budget_by_currency']:
         for record in cost_records:
             price = _price(record)
@@ -333,14 +370,12 @@ def _provenance(record, mode):
             return None
     except ValueError:
         return None
-    if not demo and record.get('valid_until'):
-        try:
-            expiry=datetime.fromisoformat(record['valid_until'].replace('Z','+00:00'))
-            if expiry.tzinfo is None or expiry <= datetime.now(timezone.utc): return None
-        except (ValueError,TypeError): return None
+    if not content_is_current(record):
+        return None
     return {'source': source, 'source_url': record.get('source_url'), 'fetched_at': stamp,
             'demo': demo, 'data_kind': record.get('data_kind', 'demo' if demo else 'real'),
-            'record_id': record.get('id', record.get('poi_id'))}
+            'record_id': record.get('id', record.get('poi_id')),
+            **{k: record[k] for k in ('valid_from', 'valid_until') if k in record}}
 
 
 def _schedule(itinerary, skill, candidates):
@@ -432,47 +467,150 @@ def _adverse(weather):
         return True
     # Amap daily/observed conditions stay daily/observed, never invented hourly slots.
     descriptions = []
+    records = list(weather.get('records') or [])
     for section in ('live', 'forecast'):
-        for record in (weather.get(section) or {}).get('records', []):
-            descriptions.append(str(record.get('weather', '')))
-            for cast in record.get('casts', []):
+        part = weather.get(section)
+        if isinstance(part, dict):
+            records.extend(part.get('records') or [])
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        descriptions.append(str(record.get('weather', '')))
+        for cast in record.get('casts') or []:
+            if isinstance(cast, dict):
                 descriptions.extend(str(cast.get(k, '')) for k in ('dayweather', 'nightweather'))
-    return any(word in ' '.join(descriptions).lower() for word in ('雨', '雷', '雪', '台风', 'rain', 'storm'))
+    return any(word in ' '.join(descriptions).lower() for word in ('雨', '雷', '雪', '台风', '颱風', 'rain', 'storm', 'typhoon'))
 
+
+
+CONTENT_FIELDS = {'diet', 'accessibility', 'walking_distance_m', 'internal_walking_m',
+                  'queue_minutes', 'crowd_level', 'indoor', 'toilet', 'soft', 'products',
+                  'exhibits', 'photo_spots', 'cross_contact', 'opening_hours', 'price', 'currency',
+                  'story', 'stories', 'ordered_exhibits', 'photo_angle', 'photo_time',
+                  'materials', 'toilet_fee', 'floor', 'tissue'}
+
+
+def _refresh_joined_facts(poi, mode):
+    """Persist field provenance and recheck it when candidates are reused."""
+    ledger = poi.get('field_evidence', {})
+    if not isinstance(ledger, dict):
+        poi.pop('field_evidence', None)
+        return
+    current = {}
+    for key, entry in ledger.items():
+        if key not in CONTENT_FIELDS or not isinstance(entry, dict):
+            continue
+        evidence = [e for e in entry.get('evidence', []) if _provenance(e, mode)]
+        if evidence:
+            current[key] = {**entry, 'evidence': evidence}
+            poi.setdefault('_supporting_evidence', []).extend(evidence)
+        elif poi.get(key) == entry.get('value'):
+            poi.pop(key, None)
+    poi['field_evidence'] = current
+
+
+def _field_sources(poi, field):
+    return deepcopy(poi.get('field_evidence', {}).get(field, {}).get('evidence', [poi.get('_evidence')]))
 
 
 def _attach_content(pois, content):
-    """Join curated facts by adapter ID only, retaining each source separately.
-
-    Recognized facts may fill missing POI attributes. Contradictory existing facts
-    fail closed instead of selecting whichever document happened to be last.
-    No identity/provenance/coordinates are overwritten by content.
-    """
-    fields = {'diet', 'accessibility', 'walking_distance_m', 'internal_walking_m',
-              'queue_minutes', 'crowd_level', 'indoor', 'toilet', 'soft', 'products',
-              'exhibits', 'photo_spots', 'cross_contact', 'opening_hours', 'price', 'currency'}
+    """Join exactly one matching ID; no names, coordinates or source replacement."""
     normalized = []
     for record in content:
-        facts = record.get('facts') if isinstance(record.get('facts'), dict) else {}
-        linked = [p for p in pois if (record.get('poi_id') == p['id'] or
-                  (record.get('amap_id') and record['amap_id'] == p.get('amap_id')))
+        facts = deepcopy(record.get('facts')) if isinstance(record.get('facts'), dict) else {}
+        item = {**record, 'kind': record.get('kind', facts.get('kind', record.get('category'))),
+                'text': record.get('text', facts.get('text')),
+                'steps': deepcopy(record.get('steps', facts.get('steps', [])))}
+        if item['kind'] in ('museum', 'citywalk') and item.get('text') and not facts.get('story'):
+            facts['story'] = item['text']
+        linked = [p for p in pois if (record.get('poi_id') or record.get('amap_id'))
+                  and (not record.get('poi_id') or record['poi_id'] == p['id'])
+                  and (not record.get('amap_id') or record['amap_id'] == p.get('amap_id'))
                   and record['_evidence']['demo'] == p['_evidence']['demo']]
-        for poi in linked:
-            for key in fields:
-                if key not in facts or facts[key] is None:
-                    continue
-                if poi.get(key) is None:
-                    poi[key] = deepcopy(facts[key])
-                elif poi[key] != facts[key]:
-                    poi.setdefault('_fact_conflicts', []).append(key)
-            poi.setdefault('_supporting_evidence', []).append(record['_evidence'])
-            normalized.append({**record, 'poi_id': poi['id'],
-                               'kind': record.get('kind', facts.get('kind', record.get('category'))),
-                               'text': record.get('text', facts.get('text')),
-                               'steps': record.get('steps', facts.get('steps', []))})
+        if len(linked) != 1:
+            normalized.append({**item, 'poi_id': None, 'linked': False})
+            continue
+        poi = linked[0]
+        for key in CONTENT_FIELDS:
+            if key not in facts or facts[key] is None:
+                continue
+            if poi.get(key) is None:
+                poi[key] = deepcopy(facts[key])
+                poi.setdefault('field_evidence', {})[key] = {
+                    'value': deepcopy(facts[key]), 'evidence': [record['_evidence']]}
+            elif poi[key] != facts[key]:
+                poi.setdefault('_fact_conflicts', []).append(key)
+            elif key in poi.get('field_evidence', {}):
+                poi['field_evidence'][key]['evidence'].append(record['_evidence'])
+        poi.setdefault('_supporting_evidence', []).append(record['_evidence'])
+        normalized.append({**item, 'poi_id': poi['id'], 'linked': True})
     return normalized
 
-def _workflow(skill, pois, content, events, weather, row):
+
+def _text_input(value):
+    return value.strip() if isinstance(value, str) else ''
+
+
+def _social_action(message, context, hard):
+    social = context.get('social')
+    social = social if isinstance(social, dict) else {}
+    order = _text_input(social.get('order', context.get('order')))
+    destination = _text_input(social.get('destination', context.get('destination')))
+    if not order:
+        match = re.search(r'(?:想點|想点|想吃|order\s+)([^，。；;!?！？\n]+)', message, re.I)
+        order = match.group(1).strip() if match else ''
+    if not destination:
+        match = re.search(r'(?:怎麼去|怎么去|前往|去|directions to\s+|way to\s+)([^，。；;!?！？\n]+)', message, re.I)
+        destination = match.group(1).strip() if match else ''
+    intents, scripts = [], []
+    if order or any(x in message.lower() for x in ('order', '點餐', '点餐', '吃')):
+        intents.append('ordering')
+        scripts.append('你好，我想點：' + (order or '請按下方原話確認餐點') + '。請先確認材料與供應情況。')
+    directions = '請問前往「' + destination + '」應該怎麼走？請指出可走的公共路線。' if destination else '請問可以協助確認我要去的目的地與路線嗎？'
+    if destination or any(x in message.lower() for x in ('direction', '問路', '问路')):
+        intents.append('directions')
+        scripts.append(directions)
+    allergies = social.get('allergies', context.get('allergies', []))
+    allergies = [allergies] if isinstance(allergies, str) else allergies
+    restrictions = list(hard['diet'])
+    if isinstance(allergies, list):
+        restrictions.extend(x.strip() for x in allergies if isinstance(x, str) and x.strip())
+    restrictions.extend(x.strip() for x in re.split(r'[，。；;!?！？\n]', message)
+                        if any(k in x.lower() for k in ('allerg', '過敏', '过敏')))
+    restrictions = list(dict.fromkeys(restrictions))
+    if restrictions:
+        intents.append('allergies')
+        scripts.append('飲食限制／過敏原話：' + '；'.join(restrictions) + '。請向廚房確認材料、醬料及共用器具；不能確認請告訴我，先不要下單。')
+    scripts.append('我的原話：' + (message or '請協助我溝通，並先確認需求。'))
+    ready = '\n'.join(scripts)
+    return {'ready_to_show': ready, 'user_message': message, 'intents': intents,
+            'order': order or None, 'destination': destination or None,
+            'dietary_requirements': restrictions, 'directions_script': directions,
+            'dialogue': [{'speaker': '旅客', 'text': ready},
+                         {'speaker': '旅客（確認追問）', 'text': '請確認後再告訴我；不確定的部分請明確說明。'}],
+            'decision': 'user-worded communication aid; no staff answer or route asserted'}
+
+
+def _recipient(message, context):
+    value = context.get('recipient', context.get('souvenir_recipient'))
+    return deepcopy(value) if isinstance(value, (str, dict)) and value else message.strip() or '請補充收禮人的興趣'
+
+
+def _gift_products(products, recipient, poi):
+    terms, result = str(recipient).lower(), []
+    for product in products:
+        item = deepcopy(product) if isinstance(product, dict) else {'name': str(product)}
+        tags = item.get('recipient_tags', [])
+        tags = tags if isinstance(tags, list) else []
+        item['matched_interests'] = [t for t in tags if isinstance(t, str) and t.lower() in terms]
+        item['price'] = _price(item)
+        item['price_source'] = _field_sources(poi, 'products') if item['price'] else []
+        item['fit_basis'] = 'explicit product tags only; no recipient traits inferred'
+        result.append(item)
+    return sorted(result, key=lambda p: -len(p['matched_interests']))
+
+
+def _workflow(skill, pois, content, events, weather, row, message, context):
     """Skill-specific grounded transformations; actions carry executable decisions."""
     selected = []
     if skill == 'food_risk':
@@ -490,7 +628,7 @@ def _workflow(skill, pois, content, events, weather, row):
         fresh=[]
         for p in pois:
             is_demo=p.get('demo') or p.get('data_kind')=='demo'
-            age=(datetime.now(timezone.utc)-datetime.fromisoformat(p['fetched_at'].replace('Z','+00:00'))).total_seconds()
+            age = max((datetime.now(timezone.utc)-datetime.fromisoformat(e['fetched_at'].replace('Z','+00:00'))).total_seconds() for e in _field_sources(p, field))
             if is_demo or 0 <= age <= 3600: fresh.append(p)
             elif _numeric(p,field): row['unknowns'].append('排隊／人潮紀錄已過期，請重新確認')
         selected = sorted((p for p in fresh if _numeric(p, field)), key=lambda p: (p[field], -p['score'], str(p['id'])))
@@ -503,23 +641,22 @@ def _workflow(skill, pois, content, events, weather, row):
         row['actions'] = [{'poi_id': p['id'], 'accessibility': p.get('accessibility'), 'opening_hours': p.get('opening_hours'), 'rank': i + 1} for i, p in enumerate(selected)]
     elif skill in ('souvenir', 'museum', 'photo'):
         field = {'souvenir': 'products', 'museum': 'exhibits', 'photo': 'photo_spots'}[skill]
-        selected = [p for p in pois if isinstance(p.get(field), list) and p[field]]
-        row['actions'] = [{'poi_id': p['id'], field: deepcopy(p[field]), 'decision': {'souvenir': 'compare listed products; purchases require separate total-budget check', 'museum': 'follow exhibit order; confirm tickets and opening hours', 'photo': 'use listed viewpoints and photography rules'}[skill]} for p in selected]
+        selected = [p for p in pois if (isinstance(p.get(field), list) and p[field]) or (skill == 'museum' and (p.get('story') or p.get('ordered_exhibits')))]
+        row['actions'] = [{'poi_id': p['id'], field: deepcopy(p.get(field, [])), 'decision': {'souvenir': 'compare listed products; purchases require separate total-budget check', 'museum': 'follow exhibit order; confirm tickets and opening hours', 'photo': 'use listed viewpoints and photography rules'}[skill]} for p in selected]
     elif skill == 'citywalk':
         selected = sorted((p for p in pois if _numeric(p, 'walking_distance_m')), key=lambda p: (p['walking_distance_m'], -p['score']))
         row['actions'] = [{'poi_id': p['id'], 'known_walking_m': p['walking_distance_m'], 'rank': i + 1, 'decision': 'single-destination walking alternative; obtain actual route before combining'} for i, p in enumerate(selected)]
     elif skill == 'social':
-        selected = pois[:1]
-        row['actions'] = [{'ready_to_show': '你好，請問可以協助我點餐，並確認這道菜的材料嗎？ / Hello, could you help me order and confirm the ingredients?',
-            'dialogue': [{'speaker':'旅客','text':'請問這道菜包含哪些材料？'}, {'speaker':'店員（模擬）','text':'我先向廚房確認。'}, {'speaker':'旅客','text':'謝謝，請確認後再下單。'}],
-            'directions_script':'請問前往這個地點應該怎麼走？ / Could you show me the way to this place?',
-            'decision':'可直接展示的通用話術；店員回覆只是練習，不代表實際承諾'}]
-        row['unknowns'].append('實際菜名、材料、目的地與店員回覆待確認')
+        row['actions'] = [_social_action(message, context, row['constraint_summary'])]
+        public = [e for e in events if e.get('public') is True and e.get('title')]
+        row['public_events'] = [{k: deepcopy(v) for k, v in e.items() if not k.startswith('_')} for e in public]
+        row['evidence'].extend(e['_evidence'] for e in public)
+        row['unknowns'].append('實際材料、供應、路線及對方回覆待確認')
     elif skill in ('hidden_menu', 'diy', 'safety'):
         ids = {p['id'] for p in pois}
         matches = [c for c in content if c.get('kind') == skill and c.get('poi_id') in ids and (c.get('text') or c.get('steps'))]
         selected = [p for p in pois if any(c['poi_id'] == p['id'] for c in matches)]
-        row['actions'] = [{'poi_id': c['poi_id'], 'text': c.get('text'), 'steps': deepcopy(c.get('steps', [])), 'decision': {'hidden_menu': 'ask venue to confirm sourced item; no availability guarantee', 'diy': 'follow supplied workshop steps; confirm materials and supervision', 'safety': 'apply sourced advisory; no safety guarantee'}[skill]} for c in matches]
+        row['actions'] = [{'poi_id': c['poi_id'], 'text': c.get('text'), 'steps': deepcopy(c.get('steps', [])), 'materials': deepcopy(c.get('materials', c.get('facts', {}).get('materials'))), 'content_source': c['_evidence'], 'decision': {'hidden_menu': 'ask venue to confirm sourced item; no availability guarantee', 'diy': 'follow supplied workshop steps; confirm materials and supervision', 'safety': 'apply sourced advisory; no safety guarantee'}[skill]} for c in matches]
         row['evidence'].extend(c['_evidence'] for c in matches)
     elif skill == 'lazy':
         selected = sorted(pois, key=lambda p: -(p.get('soft', {}).get('rest', 0.5) if isinstance(p.get('soft'), dict) and _numeric(p['soft'], 'rest') else 0.5))
@@ -532,16 +669,31 @@ def _workflow(skill, pois, content, events, weather, row):
             action.update(fee=poi.get('toilet_fee'),floor=poi.get('floor'),tissue=poi.get('tissue'))
             row['unknowns'].extend(k+' 未提供' for k in ('fee','floor','tissue') if action[k] is None)
         elif skill=='souvenir':
-            action.update(recipient='請補充收禮人的興趣',product_source=poi.get('_evidence'),tax='無已核實稅務資料，不估算退稅')
+            recipient = _recipient(message, context)
+            products = _gift_products(poi.get('products', []), recipient, poi)
+            action.update(recipient=recipient, products=products, product_source=_field_sources(poi, 'products'),
+                          tax='無已核實稅務資料，不估算退稅')
+            if any(p['price'] is None for p in products):
+                row['unknowns'].append('product price/currency unknown; venue price is not a gift price')
         elif skill=='museum':
-            action.update(ordered_exhibits=deepcopy(poi.get('exhibits',[])),story=poi.get('story','來源未提供展品故事'),fiction=bool(poi.get('demo')))
+            action.update(ordered_exhibits=deepcopy(poi.get('ordered_exhibits',poi.get('exhibits',[]))),story=poi.get('story','來源未提供展品故事'),fiction=bool(poi.get('demo') or poi.get('data_kind') == 'demo'),
+                          story_source=_field_sources(poi, 'story'),
+                          order_basis='explicit sourced order' if poi.get('ordered_exhibits') else 'source listing order only; no venue route asserted')
         elif skill=='photo':
-            action.update(angle=poi.get('photo_angle'),time=poi.get('photo_time'))
+            spots = [spot for spot in poi.get('photo_spots', []) if isinstance(spot, dict)]
+            action.update(angle=poi.get('photo_angle') or [spot['angle'] for spot in spots if spot.get('angle')] or None,
+                          time=poi.get('photo_time') or [spot['time'] for spot in spots if spot.get('time')] or None,
+                          viewpoint_source=_field_sources(poi, 'photo_spots'))
             row['unknowns'].append('拍攝角度、最佳時間與現場規則以資料及現場確認為準')
         elif skill=='diy':
-            action.update(price=poi.get('price'),materials=poi.get('materials'),availability='名額及可預訂狀態待確認')
+            action.update(price=poi.get('price'),materials=action.get('materials') or poi.get('materials'),availability='名額及可預訂狀態待確認')
         elif skill=='citywalk':
-            action.update(ordered_stops=[p['id'] for p in selected],stories=[{'poi_id':p['id'],'text':p.get('story','來源未提供故事'),'fiction':bool(p.get('demo'))} for p in selected])
+            action.update(ordered_stops=[p['id'] for p in selected],stories=[{'poi_id':p['id'],'text':p.get('story','來源未提供故事'),'fiction':bool(p.get('demo') or p.get('data_kind') == 'demo'), 'source':_field_sources(p, 'story'), 'stories':deepcopy(p.get('stories', []))} for p in selected])
+    if skill == 'safety' and not row['actions']:
+        row['actions'] = [{'scope': 'general', 'local_bulletin_available': False,
+                           'text': '保管好隨身物品，使用開放的公共通道；遇到不確定情況向現場工作人員求助。',
+                           'decision': 'general suggestions only; no local incident or crime assessment'}]
+        row['unknowns'].append('no current sourced local safety bulletin')
     if not selected:
         row['unknowns'].append(f'{skill}: no verified matching records')
     row['evidence'].extend(p['_evidence'] for p in selected)
@@ -594,9 +746,12 @@ def run_skills(message: str, context: dict, requested_skills: list | None = None
         for record in values:
             evidence = _provenance(record, mode)
             if evidence is None:
-                unknowns.append(f'{key}: missing provenance or demo excluded in real mode')
+                unknowns.append(f'{key}: missing/invalid provenance, expired/not-yet-valid record, or demo excluded in real mode')
                 continue
-            accepted.append({**deepcopy(record), '_evidence': evidence})
+            item = {**deepcopy(record), '_evidence': evidence}
+            if key == 'pois':
+                _refresh_joined_facts(item, mode)
+            accepted.append(item)
         return accepted
     pois, seen = [], set()
     city = CITY_ALIASES.get(str(context.get('city', '')).lower(), context.get('city'))
@@ -611,6 +766,8 @@ def run_skills(message: str, context: dict, requested_skills: list | None = None
         else:
             pois.append(poi)
     content, events = records('content'), records('events')
+    content = [c for c in content if not c.get('city') or not city or
+               CITY_ALIASES.get(str(c['city']).lower(), c['city']) == city]
     content = _attach_content(pois, content)
     evaluated = evaluate_candidates(pois, members)
     candidates = evaluated['eligible'] if not errors else []
@@ -628,10 +785,17 @@ def run_skills(message: str, context: dict, requested_skills: list | None = None
         row = {'skill': skill, 'agent': ROLES[skill], 'candidates': [], 'evidence': [],
                'limitations': ['Source snapshots are not live guarantees; verify venue access, cross-contact, opening hours and transport.', 'Candidates are alternatives, not a verified combined itinerary.'],
                'errors': list(errors) + deepcopy(context.get('errors', [])) if isinstance(context.get('errors', []), list) else list(errors), 'unknowns': list(unknowns), 'actions': [], 'constraint_summary': deepcopy(hard)}
-        choices = _workflow(skill, candidates, content, events, weather, row)
+        choices = _workflow(skill, candidates, content, events, weather, row, message, context)
+        row['informational_items'] = [
+            {k: deepcopy(v) for k, v in c.items() if not k.startswith('_')}
+            for c in content if not c.get('linked') and c.get('kind') == skill]
+        row['evidence'].extend(c['_evidence'] for c in content
+                               if not c.get('linked') and c.get('kind') == skill)
         row['excluded']=[{k:v for k,v in p.items() if not k.startswith('_')} for p in evaluated['excluded']]
         if skill=='food_risk':
             row['evidence'].extend(p['_evidence'] for p in evaluated['excluded'] if p.get('_evidence'))
+            for p in evaluated['excluded']:
+                row['evidence'].extend(p.get('_supporting_evidence', []))
         row['candidates'] = [{k: v for k, v in p.items() if not k.startswith('_')} for p in choices]
         if not members:
             row['unknowns'].append('member preferences not supplied; neutral group score')
@@ -649,7 +813,7 @@ def run_skills(message: str, context: dict, requested_skills: list | None = None
                     row['errors'].append(str(exc))
             elif not working:
                 row['unknowns'].append('existing canonical itinerary unavailable')
-        row['status'] = 'error' if row['errors'] else 'ok' if choices else 'unknown'
+        row['status'] = 'error' if row['errors'] else 'ok' if choices else 'informational' if row['informational_items'] or skill in ('social', 'safety') else 'unknown'
         row['evidence'] = [e for i, e in enumerate(row['evidence']) if e not in row['evidence'][:i]]
         for evidence in row['evidence']:
             if evidence not in sources:
@@ -657,7 +821,7 @@ def run_skills(message: str, context: dict, requested_skills: list | None = None
         results.append(row)
     prefix = 'DEMO — fictional places and scenarios. ' if mode == 'demo' else ''
     names={s['id']:s['name'] for s in SKILLS}
-    reply = prefix + '\n'.join(f"{names[r['skill']]}：{len(r['candidates'])} 個有來源候選；" + '、'.join(str(p['name']) for p in r['candidates'][:3]) for r in results)
+    reply = prefix + '\n'.join(f"{names[r['skill']]}：{len(r['candidates'])} 個有來源候選；" + '、'.join(str(p['name']) for p in r['candidates'][:3])  + (f"；{len(r['informational_items'])} 則未關聯地圖的來源資料" if r['informational_items'] else '') for r in results)
     if any(r['unknowns'] or r['errors'] for r in results):
         reply += '\n部分条件或资料待确认；不保证饮食安全、价格、无障碍或路线可行性。'
     if proposal:

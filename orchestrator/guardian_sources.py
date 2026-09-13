@@ -1,6 +1,6 @@
 """Evidence-preserving Amap adapters; no fabricated routes or business matches."""
 from copy import deepcopy
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import json
 import math
 from pathlib import Path
@@ -327,6 +327,34 @@ def _facts(value):
     return copy_value(value)
 
 
+def _validity(record):
+    """Explicit validity bounds, inclusive start and exclusive end."""
+    bounds = {}
+    for key in ('valid_from', 'valid_until'):
+        value = record.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(key + ' must be an ISO timestamp')
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            raise ValueError(key + ' must include timezone')
+        bounds[key] = parsed
+    if len(bounds) == 2 and bounds['valid_from'] >= bounds['valid_until']:
+        raise ValueError('valid_from must precede valid_until')
+    return bounds
+
+
+def content_is_current(record):
+    """No explicit expiry means unknown lifetime, not a freshness guarantee."""
+    try:
+        bounds = _validity(record)
+    except (ValueError, TypeError):
+        return False
+    now = datetime.now(timezone.utc)
+    return bounds.get('valid_from', now) <= now and ('valid_until' not in bounds or now < bounds['valid_until'])
+
+
 def validate_content(records):
     """Validate an entire JSON-style list atomically; never infer identity from names."""
     if not isinstance(records, list) or len(records) > 10000:
@@ -335,13 +363,14 @@ def validate_content(records):
     for record in records:
         if not isinstance(record, dict):
             raise ValueError('Content record must be an object')
+        _validity(record)
         kind = record.get('data_kind')
         if kind not in ('real','curated','demo') or not _text(record.get('id')) or not _text(record.get('name')):
             raise ValueError('id, name and explicit data_kind are required')
         if record['id'] in seen:
             raise ValueError('Duplicate content id')
         seen.add(record['id'])
-        for key in ('amap_id','category','source','currency','fetched_at'):
+        for key in ('amap_id','poi_id','city','kind','category','source','currency','fetched_at'):
             if record.get(key) is not None and not _text(record[key]):
                 raise ValueError('Invalid content field: ' + key)
         if kind != 'demo' and not all(_text(record.get(k)) for k in ('source','source_url','fetched_at')):
@@ -366,6 +395,9 @@ def validate_content(records):
                 if record[key] is not None and not isinstance(record[key], str):
                     raise ValueError('Invalid content text')
                 normalized[key] = record[key]
+        for key in ('valid_from', 'valid_until', 'poi_id', 'city', 'kind'):
+            if record.get(key) is not None:
+                normalized[key] = record[key]
         normalized['facts'] = _facts(record.get('facts', {}))
         output.append(normalized)
     return output
@@ -387,7 +419,7 @@ def match_content(poi, records):
     """Return separate provenance-bearing records; demos never attach to real POIs."""
     validated = validate_content(records)
     identifier = poi.get('amap_id')
-    return [r for r in validated if identifier and r['amap_id'] == identifier and r['data_kind'] != 'demo']
+    return [r for r in validated if identifier and r['amap_id'] == identifier and r['data_kind'] != 'demo' and content_is_current(r)]
 
 
 def provider_status():

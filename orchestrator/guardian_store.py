@@ -45,7 +45,7 @@ def canonical_itinerary(state):
                 nearby.get("request",{}).get("mode","walking"),stop.get("arrival_time","待確認"),
                 stop.get("end_time","待確認"),after_id=previous,poi=deepcopy(stop))
             previous=node_id
-        result["trip_plan"]["days"]={date:day}
+        result["trip_plan"].setdefault("days", {})[date]=day
     return result
 
 class GuardianStore:

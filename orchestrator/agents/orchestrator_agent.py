@@ -94,12 +94,12 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
     history = deepcopy(shared_state.get("messages", []))
     intents = classify_intent(user_message, history)
 
-    if "nearby" in intents:
-        output, shared_state = nearby_planner.from_chat(user_message, shared_state)
-        shared_state["messages"] = history + [{"role": "user", "content": user_message}, {"role": "assistant", "content": output["chat_reply"]}]
-        return output, shared_state
-
     results: dict[str, Any] = {}
+    nearby_output = None
+    if "nearby" in intents:
+        nearby_output, shared_state = nearby_planner.from_chat(user_message, shared_state)
+        results["nearby"] = nearby_output
+
     if "restaurant" in intents:
         results["restaurant"] = restaurant_agent.run(user_message, shared_state)
     if "content" in intents and "restaurant" not in intents:
@@ -137,7 +137,10 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
             if widget is not None:
                 output_widgets.append(widget)
 
-    if "restaurant" in results:
+    if nearby_output and "restaurant" not in results:
+        reply = nearby_output["chat_reply"]
+        if "booking" in results: reply += "\n另附演示酒店／機票卡片，未實際預訂。"
+    elif "restaurant" in results:
         # Keep the tool-grounded reply intact; do not ask a second model to rewrite it.
         reply = results["restaurant"]["reply"]
         if "route" in results and results["route"].get("note"):

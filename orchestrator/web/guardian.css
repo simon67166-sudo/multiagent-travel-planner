@@ -24,3 +24,8 @@
 #travel-guardian .tg-roster li { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid #d8e3db; padding: 4px 0; }
 #travel-guardian .tg-sources a { display: inline-block; color: #0b5d3b; margin: 4px 8px; text-decoration: underline; }
 @media (max-width: 480px) { #travel-guardian .tg-grid, #travel-guardian .tg-compare { grid-template-columns: 1fr; } }
+
+#travel-guardian [hidden] { display: none !important; }
+#travel-guardian .tg-detail { border-left: 2px solid #cbded1; padding-left: 10px; margin: 8px 0; }
+#travel-guardian .tg-demo { background: #fff8e9; border: 1px solid #b99a55; padding: 10px; border-radius: 8px; }
+#travel-guardian input[readonly] { background: #edf2ee; cursor: text; }

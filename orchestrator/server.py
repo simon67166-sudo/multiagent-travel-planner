@@ -72,6 +72,7 @@ def persist_session_cookie(response):
     response.set_cookie("travel_session", g.session_id, max_age=30 * 86400,
                         httponly=True, samesite="Lax", secure=request.is_secure)
     response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
 def new_state():
@@ -191,7 +192,11 @@ def nearby_weather():
         plan = deepcopy(state.get("nearby_plan"))
         if not plan:
             return jsonify({"error": "請先建立港澳附近遊行程"}), 400
-        req = plan["request"]
+        if plan.get("demo"):
+            return jsonify({"weather": plan.get("weather", {}), "data_kind": "demo", "message": "演示天氣不代表即時預報；可使用演示事件播放器。"})
+        req = plan.get("request", {})
+        if not plan.get("origin") or not all(k in req for k in ("date", "start_time", "city", "hours")):
+            return jsonify({"error": "舊行程缺少天氣查詢條件，請重新規劃附近遊。"}), 400
         start = datetime.fromisoformat(req["date"] + "T" + req["start_time"])
         plan["weather"] = nearby_planner.sources.weather(req["city"], plan["origin"], start, start + timedelta(hours=req["hours"]))
     return jsonify({"weather": plan["weather"]})

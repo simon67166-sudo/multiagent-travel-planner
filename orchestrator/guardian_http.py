@@ -27,6 +27,11 @@ def proposal_for(sessions,state,team,reason,sources=None):
     draft=canonical_itinerary(state)
     proposal=None
     if draft!=team["itinerary"]:
+        from guardian_replan import rebuild
+        from guardian_service import validate_itinerary
+        draft=rebuild(draft)
+        check=validate_itinerary(draft,team["members"])
+        if check["violations"]: raise ValueError("行程無法提交："+"；".join(check["violations"]))
         proposal=GuardianStore(sessions.path).propose(g.session_id,draft,reason,team["version"],team["revision"],sources)
     restore(state,team)
     return proposal
@@ -53,7 +58,9 @@ def register(app,get_sessions,new_state):
     @api.post("/team")
     def create_team():
         data=body(); legacy=get_sessions().load(g.session_id) or new_state()
-        if store().exists(g.session_id): legacy=store().snapshot(g.session_id)["itinerary"]
+        if type(data.get("inherit",True)) is not bool: raise ValueError("inherit 必須是布林值")
+        if not data.get("inherit",True): legacy=new_state()
+        elif store().exists(g.session_id): legacy=store().snapshot(g.session_id)["itinerary"]
         return jsonify(store().create(g.session_id,data.get("name","旅行團隊"),data.get("member_name","發起人"),legacy))
     @api.post("/team/join")
     def join_team():
@@ -116,11 +123,14 @@ def register(app,get_sessions,new_state):
         from guardian_service import check_events
         current=team(); data=body(); demo=data.get("demo",False)
         if type(demo) is not bool: raise ValueError("demo 必須為布林值")
-        key=("demo" if demo else "real")+":"+str(current["version"])+":"+str(current["revision"])
+        scenario=data.get("scenario","rain")
+        if scenario not in ("rain","queue","clear"): raise ValueError("不支援的演示事件")
+        if demo and current["role"]!="owner": raise Forbidden("只有團主可觸發演示事件")
+        key=("demo:"+scenario if demo else "real")+":"+str(current["version"])+":"+str(current["revision"])
         with _event_lock:
             now=time.time(); cached=store().cached_check(g.session_id,key,now)
             if cached: return jsonify({**cached,"cached":True,"proposals":store().snapshot(g.session_id)["proposals"]})
-            output=check_events(current,demo=demo)
+            output=check_events(current,demo=demo,scenario=scenario)
             store().record_events(g.session_id,output.get("events",[]))
             draft=output.pop("proposed_itinerary",None)
             proposal=store().propose(g.session_id,draft,"環境事件調整提案",current["version"],current["revision"],output.get("sources"),event_key=key) if draft else None

@@ -50,11 +50,34 @@ def load_demo(city: str) -> dict:
          'soft': {'photo': 0.5, 'culture': 0.7, 'shopping': 1.0, 'rest': 0.5},
          'products': ['DEMO folded-paper bookmark', 'DEMO woven card sleeve'], 'toilet': False},
     ]
+    # Every detail below is scenario fiction, not public cultural documentation.
+    pois[0].update(
+        story='DEMO fiction: neighbours hang paper moons to welcome imaginary harbour travellers.',
+        photo_angle='DEMO: eye-level three-quarter view of the paper lanterns, from the marked public area.',
+        photo_time='DEMO scenario 10:00; not a measured lighting forecast',
+        toilet_fee={'amount': 0, 'currency': currency}, floor='DEMO ground floor', tissue=True,
+        products=[{'name': 'DEMO paper lantern postcard', 'price': {'amount': 8, 'currency': currency},
+                   'recipient_tags': ['photography', '攝影', '拍照', 'postcards']}])
+    pois[1].update(
+        story='DEMO fiction: a paper boat carried a cloud into the harbour; the model introduces its imagined journey.',
+        ordered_exhibits=['DEMO harbour model', 'DEMO paper craft history'],
+        exhibits=[{'name': 'DEMO harbour model', 'story': 'DEMO fiction: the paper boat arrives.'},
+                  {'name': 'DEMO paper craft history', 'story': 'DEMO fiction: visitors fold clouds into letters.'}],
+        photo_angle='DEMO: frontal eye-level foyer composition; keep the exit clear; no flash.',
+        photo_time='DEMO scenario 11:00, indoors; no claim about natural light',
+        toilet_fee={'amount': 0, 'currency': currency}, floor='DEMO ground floor', tissue=True)
+    pois[2].update(
+        story='DEMO fiction: the workshop turns the imaginary cloud letters into bookmarks.',
+        materials=['DEMO supplied paper', 'DEMO printed folding guide', 'DEMO supplied stamps'],
+        products=[{'name': 'DEMO woven card sleeve', 'price': {'amount': 18, 'currency': currency},
+                   'recipient_tags': ['craft', '手作']},
+                  {'name': 'DEMO folded-paper bookmark', 'price': {'amount': 12, 'currency': currency},
+                   'recipient_tags': ['reading', '讀書', '阅读', '閱讀', 'books']}])
     content = [
         {**source, 'id': f'demo-{code}-menu', 'poi_id': pois[0]['id'], 'kind': 'hidden_menu',
          'text': 'DEMO-only off-menu tea pairing; ask staff to confirm ingredients and availability.'},
         {**source, 'id': f'demo-{code}-diy', 'poi_id': pois[2]['id'], 'kind': 'diy',
-         'text': 'DEMO paper bookmark workshop', 'steps': ['Choose supplied paper', 'Fold along printed guides', 'Decorate with supplied stamps']},
+         'text': 'DEMO paper bookmark workshop', 'materials': deepcopy(pois[2]['materials']), 'steps': ['Choose supplied paper', 'Fold along printed guides', 'Decorate with supplied stamps']},
         {**source, 'id': f'demo-{code}-safety', 'poi_id': pois[0]['id'], 'kind': 'safety',
          'text': 'DEMO rain scenario: avoid the slippery outdoor display and use the staffed indoor waiting area.'},
     ]

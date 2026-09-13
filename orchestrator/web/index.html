@@ -144,8 +144,7 @@
       <label>交通<select id="nearby-mode"><option value="walking">步行</option><option value="driving">駕車路線估算</option><option value="transit">公交（另查班次）</option></select></label>
     </div>
     <p>同行者請使用上方邀請連結加入，並在「我的偏好」填寫；以下不會覆蓋團隊資料。</p>
-    <div id="nearby-members" hidden></div>
-    <button id="add-member" hidden type="button">＋新增同行者</button>
+    <p>同行者與飲食、預算及步行需求使用上方團隊內各成員已儲存的偏好。</p>
     <button id="build-nearby" type="submit">生成附近遊攻略</button>
     <div id="nearby-status" role="status"></div>
   </form>
@@ -380,11 +379,12 @@ function renderWidgets(widgets) {
 // 左侧：实时日程渲染（航班/酒店/异常提醒/地图/每日时间线）
 // ---------------------------------------------------------------------
 function renderMap(tripMap) {
-  if (!map || !tripMap) return;
+  if (!map) return;
   map.clearMap();
+  if (!tripMap || tripMap.demo || tripMap.data_kind === "demo") return;
   const data = tripMap.data || {};
-  const markers = data.markers || [];
-  const routes = data.routes || [];
+  const markers = (tripMap.crs || data.crs) === "GCJ02" ? (data.markers || []).filter(m => Number.isFinite(m.lng) && Number.isFinite(m.lat)) : [];
+  const routes = (tripMap.crs || data.crs) === "GCJ02" && !data.demo && data.data_kind !== "demo" ? (data.routes || []).filter(r => r.available === true && !r.demo && r.data_kind !== "demo" && (!r.crs || r.crs === "GCJ02") && Array.isArray(r.coordinates) && r.coordinates.length >= 2 && r.coordinates.every(c => Array.isArray(c) && c.length === 2 && c.every(Number.isFinite) && Math.abs(c[0]) <= 180 && Math.abs(c[1]) <= 90)) : [];
 
   const overlays = [];
   markers.forEach(m => {
@@ -514,6 +514,7 @@ function renderSchedule(trip) {
 
 async function refreshSchedule() {
   const res = await fetch("/trip");
+  if (!res.ok) throw new Error("正式行程更新失敗，請稍後重試。");
   const trip = await res.json();
   renderSchedule(trip);
   if (trip.nearby_plan) renderNearby(trip.nearby_plan);
@@ -561,7 +562,7 @@ async function restoreSession() {
     const data = await res.json();
     for (const message of data.messages) addMessage(message.role, message.content);
     renderWidgets(data.widgets || []);
-    if (data.nearby_plan) restoreNearby(data.nearby_plan);
+
     await refreshSchedule();
     if (window.TravelGuardian) await window.TravelGuardian.refresh();
   } catch (err) {
