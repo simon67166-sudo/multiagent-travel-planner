@@ -40,7 +40,7 @@ def _get_client() -> OpenAI:
 
 
 def call_message(messages: list[dict], model: str = MODEL_FULL, **kwargs):
-    """返回完整的 message 对象（不只是文本），给需要读 tool_calls 的调用方用（比如 restaurant_agent.py 的工具调用循环）。"""
+    """返回完整的 message 对象（不只是文本），给需要读 tool_calls 的调用方用（工具调用循环场景）。"""
     response = _get_client().chat.completions.create(model=model, messages=messages, **kwargs)
     if not response.choices:
         raise RuntimeError("模型没有返回任何 choice")

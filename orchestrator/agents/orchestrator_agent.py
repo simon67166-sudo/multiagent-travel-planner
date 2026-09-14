@@ -23,7 +23,7 @@ import persona
 import trip_plan
 import trip_preferences
 import widgets
-from agents import content_agent, exception_agent, ota_hotel_agent, route_agent, restaurant_agent
+from agents import content_agent, exception_agent, ota_hotel_agent, route_agent
 
 # 跟 content_agent._extract_city 同一个"先跑起来，以后再换实体识别"的子串匹配思路，
 # 独立一份而不是互相 import 是因为这两个模块本来就没有依赖关系，不想为了共用 4 行代码
@@ -203,11 +203,9 @@ def new_shared_state(user_id: str, scenario: str = "vacation", onboarding_answer
 # ---------------------------------------------------------------------------
 _INTENT_SYSTEM_PROMPT = """你是一个旅游助手的意图识别模块。根据用户消息，判断需要调用下面哪些能力：
 - nearby: 以某个地标/地址为起点，就近逛几个小时（"从大三巴出发逛3小时"这种短途场景）。
-  跟 content 共用同一个候选推荐能力，只是不做人格检索、直接查真实起点附近；用户明确要求
-  模拟餐厅才选 restaurant。
-- content: 景点或社区攻略推荐（非餐厅演示、非"以某地标为起点逛几小时"的短途场景）——命中后只出候选卡片，
+  跟 content 共用同一个候选推荐能力，只是不做人格检索、直接查真实起点附近。
+- content: 景点或美食推荐（非"以某地标为起点逛几小时"的短途场景）——命中后只出候选卡片，
   不会自动排时间；排时间是用户在候选卡片里选完、点"确认选择"之后才触发的独立动作，不受这里的意图分类影响
-- restaurant: 餐厅、饮食、餐饮预算或餐厅排队需求，包括前文餐饮需求的修改、追问与回忆。此技能只提供澳门模拟餐厅；其他城市餐饮问题也交给它说明资料限制。
 - booking: 需要查酒店/机票/门票预订信息
 - exception: 用户在问天气/航班延误等突发情况的应对，还没确定要不要调整行程（只是了解情况）
 - cancel: 用户明确要求把行程里已经排好的某个地点/活动删掉、取消（不是在问外部情况，是直接下达删除指令，比如"把西湖那站删了"/"取消灵隐寺"）
@@ -232,7 +230,7 @@ def classify_intent(user_message: str, history: list[dict] | None = None) -> lis
         intents = json.loads(clean)
         if not isinstance(intents, list):
             return []
-        return [key for key in ("nearby", "content", "restaurant", "booking", "exception", "cancel") if key in intents]
+        return [key for key in ("nearby", "content", "booking", "exception", "cancel") if key in intents]
     except Exception:
         # 意图识别没解析出来就退化成"只聊天"，不调用任何子 Agent
         return []
@@ -282,14 +280,12 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
             {"role": "user", "content": user_message},
             {"role": "assistant", "content": question},
         ]
-        return {"chat_reply": question, "community_panel": [], "map_panel": {}, "widgets": [], "restaurant_evidence": []}, shared_state
+        return {"chat_reply": question, "community_panel": [], "map_panel": {}, "widgets": []}, shared_state
 
     results: dict[str, Any] = {}
-    if "restaurant" in intents:
-        results["restaurant"] = restaurant_agent.run(user_message, shared_state)
     if "nearby" in intents:
         results["content"] = content_agent.run(shared_state, location_hint=user_message, mode="nearby")
-    elif "content" in intents and "restaurant" not in intents:
+    elif "content" in intents:
         results["content"] = content_agent.run(shared_state, location_hint=user_message, mode="trip")
 
     # mode="nearby" 解析不出起点/游览时长，达人 Agent 会直接给一句追问，整轮到此为止——
@@ -300,7 +296,7 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
             {"role": "user", "content": user_message},
             {"role": "assistant", "content": clarification},
         ]
-        return {"chat_reply": clarification, "community_panel": [], "map_panel": {}, "widgets": [], "restaurant_evidence": []}, shared_state
+        return {"chat_reply": clarification, "community_panel": [], "map_panel": {}, "widgets": []}, shared_state
 
     nearby_params = results.get("content", {}).get("nearby_params")
     if nearby_params and results.get("content", {}).get("recommendations"):
@@ -371,21 +367,7 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
             if widget is not None:
                 output_widgets.append(widget)
 
-    if "restaurant" in results:
-        # 保留工具产出的回复原样，不再让第二个模型改写
-        reply = results["restaurant"]["reply"]
-        if "route" in results and results["route"].get("note"):
-            reply += "\n" + results["route"]["note"]
-        if "exception" in results:
-            reply += "\n" + results["exception"]["suggested_adjustment"]
-            weather_check = results["exception"].get("weather_check")
-            if weather_check and weather_check.get("has_warning"):
-                reply += "\n" + weather_check["suggested_adjustment"]
-        if "booking" in results:
-            reply += "\n已附上查询候选卡片；尚未进行实际预订。"
-            if results["booking"].get("hotel_distance_reminder"):
-                reply += "\n" + results["booking"]["hotel_distance_reminder"]
-    elif "cancel" in results:
+    if "cancel" in results:
         # cancel 是真执行动作，回复用固定模板拼，不交给 LLM 生成——确认文案跟实际有没有真删掉
         # 必须完全对得上，不能有半点"是不是真删了"的不确定性
         cancel_result = results["cancel"]
@@ -423,14 +405,15 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
                 "出现在 trip_plan.days 的地点只能提成\"备选，还没排进行程\"，不能说得像已经排定的安排。"
                 "holiday_facts 是本地农历库真实算出来的节日日期（不是猜的），用户这句话提到的节日"
                 "只能按这里给的日期回答；这里没有的节日不要自己编日期，说不确定、建议用户自己核实。"
+                "不能自己拼一份带具体航班号/酒店名/逐天时间表的完整行程草案来冒充规划——那是"
+                "attraction_picker 选完确认之后 route_agent 真正排出来的东西，你这里只能提\"有"
+                "哪些候选\"，并引导用户去候选卡片里勾选确认，不能自己画一个看起来像真的方案，"
+                "哪怕标注了\"未验证\"也不行。"
                 "资料：" + context
             )},
             *history, {"role": "user", "content": user_message}])
-    if "restaurant" not in results:
-        shared_state["messages"] = history + [{"role": "user", "content": user_message},
-                                              {"role": "assistant", "content": reply}]
-    elif shared_state.get("messages") and shared_state["messages"][-1].get("role") == "assistant":
-        shared_state["messages"][-1]["content"] = reply
+    shared_state["messages"] = history + [{"role": "user", "content": user_message},
+                                          {"role": "assistant", "content": reply}]
     shared_state["pending_widgets"] = output_widgets
 
     output = {
@@ -438,7 +421,6 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
         "community_panel": results.get("content", {}).get("recommendations", []),
         "map_panel": results.get("route", {}),
         "widgets": output_widgets,
-        "restaurant_evidence": results.get("restaurant", {}).get("evidence", []),
     }
     return output, shared_state
 

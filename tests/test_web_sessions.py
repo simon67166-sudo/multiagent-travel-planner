@@ -220,16 +220,20 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.a.get("/").status_code, 200)
 
 class OrchestrationTests(unittest.TestCase):
-    def test_restaurant_uses_history_without_adding_mock_map_stop(self):
+    def test_restaurant_agent_removed_and_classify_intent_drops_stray_restaurant_key(self):
+        # 2026-09-17，用户真实反馈：conversation 被 "restaurant" 意图卡死在一个纯虚构数据
+        # （不接真实社区帖子库）的演示子系统里，从没真正走到 content_agent/attraction_picker
+        # 这条真实排班链路——查实 restaurant_agent.py 的工具只返回三条硬编码的"演示餐厅"，
+        # 从来没用过 store.py 的真实数据，用户决定直接删掉这个功能。已经整个删掉
+        # restaurant_agent.py/restaurant_tools.py，orchestrator_agent 不再 import 它们；
+        # classify_intent() 的白名单也不再认 "restaurant" 这个 key——就算 LLM 因为旧的
+        # prompt 记忆/训练偏置还是吐出这个词，也会被过滤掉，不会走到任何特殊分支
         from agents import orchestrator_agent as agent
-        state = agent.new_shared_state("x")
-        state["messages"] = [{"role": "user", "content": "previous preference"}, {"role": "assistant", "content": "ok"}]
-        result = {"reply": "mock Macau", "is_mock": True, "evidence": []}
-        with patch.object(agent.llm_tool, "call_llm", return_value='["restaurant"]') as classify, patch.object(agent.restaurant_agent, "run", return_value=result), patch.object(agent.route_agent, "schedule") as schedule:
-            output, _ = agent.orchestrate("budget changed", state)
-        self.assertIn("mock Macau", output["chat_reply"])
-        self.assertIn("previous preference", json.dumps(classify.call_args_list[0].args[0]))
-        schedule.assert_not_called()
+        self.assertFalse(hasattr(agent, "restaurant_agent"))
+        with patch.object(agent.llm_tool, "call_llm", return_value='["restaurant", "content"]'):
+            intents = agent.classify_intent("随便推荐点吃的")
+        self.assertNotIn("restaurant", intents)
+        self.assertIn("content", intents)
 
     def test_content_intent_gates_on_trip_preferences_then_resumes_original_message(self):
         # 2026-09-16：常规推荐（mode="trip"）开始搜索前先确认酒店/机票偏好（persona 系统
