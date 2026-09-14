@@ -615,3 +615,12 @@ python orchestrator/server.py
     - **顺带收紧了自由组句回复的系统提示词**：明确禁止自己拼一份带具体航班号/酒店名/逐天时间表的完整行程草案来冒充规划（哪怕标注"未验证提案"也不行）——那份看起来越来越像真的"参考草案"就是这么来的，即使技能本身删了，自由组句分支本来就有能力编出类似的东西，这条限制是独立于 restaurant_agent 删除之外的第二层防护。
 
     真实验证：`classify_intent()` 即使被 mock 成返回 `["restaurant", "content"]`，白名单过滤后也只剩 `["content"]`；确认 `orchestrator_agent` 模块上已经没有 `restaurant_agent` 这个属性。83 个测试全过（删除了 8 个纯 `restaurant_agent`/`restaurant_tools` 相关的测试）。
+
+38. **新增：多城市行程（"前两天去澳门，后两天去香港"，或者先规划完一个城市后面接着说想去另一个城市）**（2026-09-17，用户提出）：查实每一层都假设整趟行程只有一个城市——`_extract_city()`（`content_agent.py`/`orchestrator_agent.py` 各一份）在 `("澳门","香港")` 里挨个找，命中第一个就返回，两个城市都提到时后一个直接被忽略；`shared_state["city"]` 只在会话创建时设一次（`server.py` 的 `_DEMO_CITY`），**整个对话过程中从没被更新过**，`apply_selection()` 排班时用的就是这个过期的静态值，哪怕候选实际是另一个城市查的。**已解决**，两种触发方式共用同一套机制：
+    - `shared_state["city"]` 改成跟着最新一句话动态更新：`orchestrate()` 里这次请求提取到城市就写回 `shared_state["city"]`，提取不到才保留原值。
+    - 新增 `last_content_city`（跟已有的 `last_content_candidates`/`last_trip_day_count` 放一起）：记住这批候选是给哪个城市查的，`attraction_picker` 确认时排班优先用这个，不用可能已经被后续对话覆盖掉的 `state["city"]`。
+    - **一句话说清楚的多城市**（"前两天去澳门，后两天去香港"）：新增 `_parse_multi_city_segments()`，跟 `_parse_nearby_request()`/`_parse_preference_answer()` 一样的思路——自然语言里"前两天"/"先...再..."这种表达方式太多，正则覆盖不过来，交给一次 `MODEL_LIGHT` 调用解析成 `[{"city":,"days":}]` 有序分段，只解析出 1 个城市就不算"多城市"，退回单城市流程。命中多城市时，`orchestrate()` 只处理第一段（用 `f"{city}玩{days}天"` 拼一个合成的 `location_hint` 喂给 `content_agent.run()`，复用它已有的 `_extract_day_count()` 解析，不用改 `content_agent.py` 的接口），剩下的段存进新增的 `pending_city_segments`。
+    - **续接机制**（一句话多城市 / 增量式"接着还想去另一个城市"是同一套）：`server.py` 的 `apply_selection()` 排完当前这段确认的候选之后，检查 `pending_city_segments` 有没有排队等着的下一段——有就自动调 `content_agent.run()` 查下一个城市的候选、生成新的 `attraction_picker`/`post_list` 卡片塞进 `pending_widgets`，衔接回复里提示"接下来是XX的部分"，不用用户重新开口。`widget_response()` 路由里"摘掉这次确认掉的卡片"那行代码挪到了 `apply_selection()` 调用**之前**（不然新塞进去的下一段卡片会被这行代码当成"这次确认掉的"一起摘掉）。
+    - **顺带修的一个连带问题**：`state["weather_checked"]` 原来是"整个 session 只查一次"的布尔值，多城市行程分批订机票时，第一个城市订完触发一次检查后，第二个城市新增的机票永远不会再被检查到。改成 `weather_checked_flight_count`（记录上次检查时 `trip_plan.flights` 有几条），机票数量比上次检查时更多才重新查，不是布尔开关。
+
+    真实验证：真实调用 `_parse_multi_city_segments("我前两天去澳门，后两天去香港，一起帮我规划")`，正确解析出 `[{"city":"澳门","days":2},{"city":"香港","days":2}]`；合成的 `location_hint`（"澳门玩2天"）真实过一遍 `_extract_day_count()` 正确得到 2。88 个测试全过。

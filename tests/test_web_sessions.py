@@ -142,6 +142,38 @@ class WebTests(unittest.TestCase):
         trip = self.store.load(sid)["trip_plan"]
         self.assertEqual(set(trip["days"].keys()), {"day-1", "day-2", "day-3"})
 
+    def test_attraction_picker_confirm_auto_continues_to_next_city_segment(self):
+        # 2026-09-17 用户提出：多城市行程（"前两天去澳门，后两天去香港"，或者先规划完一个
+        # 城市后面接着说想去另一个城市）——澳门这段排完确认之后，该自动接着查香港的候选、
+        # 生成新的 attraction_picker 卡片，不用用户重新开口
+        macau_sight = {"place": "大三巴牌坊", "category": "景点", "lng": 113.54, "lat": 22.19, "source": "社区帖子"}
+        hk_recs = {"recommendations": [{"place": "维多利亚港", "category": "景点", "lng": 114.16, "lat": 22.29}],
+                   "nearby_params": None, "clarification_needed": None, "day_count": 2}
+        self.a.get("/session")
+        sid = self.a.get_cookie("travel_session").value
+        with self.store.edit(sid, dict) as state:
+            state["last_content_candidates"] = [macau_sight]
+            state["last_trip_day_count"] = 2
+            state["last_content_city"] = "澳门"
+            state["pending_city_segments"] = [{"city": "香港", "days": 2}]
+            state["pending_widgets"] = [{"widget": "attraction_picker", "data": {"options": [macau_sight], "max_select": 6}}]
+        with patch.object(self.server.content_agent, "run", return_value=hk_recs) as content_mock:
+            response = self.a.post("/widget-response", json={"widget": "attraction_picker", "selected": [macau_sight]})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("香港", response.json["chat_reply"])
+        content_mock.assert_called_once()
+        self.assertEqual(content_mock.call_args.kwargs["location_hint"], "香港玩2天")
+
+        state_after = self.store.load(sid)
+        self.assertEqual(state_after["pending_city_segments"], [])
+        self.assertEqual(state_after["last_content_city"], "香港")
+        self.assertEqual(state_after["city"], "香港")
+        widget_types = [w["widget"] for w in state_after["pending_widgets"]]
+        self.assertIn("attraction_picker", widget_types)
+        hk_widget = next(w for w in state_after["pending_widgets"] if w["widget"] == "attraction_picker")
+        self.assertEqual(hk_widget["data"]["options"][0]["place"], "维多利亚港")
+        self.assertIn("day-1", state_after["trip_plan"]["days"])  # 澳门这段真的排进去了
+
     def test_attraction_picker_confirm_adds_bridging_chat_reply(self):
         # 2026-09-17：用户反馈"做完交互后能不能加点衔接提示"——选完确认之前只更新
         # trip_plan/地图面板，聊天框毫无反应；现在 apply_selection() 生成一句衔接回复，
@@ -176,8 +208,8 @@ class WebTests(unittest.TestCase):
     def test_hotel_picker_confirm_triggers_weather_check_once_fully_booked(self):
         # 2026-09-17，用户提出：机票酒店行程都定完之后该调 exception_agent 查一次天气，
         # 标出可能下雨/下雪的天，雨大的话问一下要不要调整。这里机票和行程都已经有了，
-        # 这次酒店确认正好凑齐"三件套"，该触发天气检查；确认之后 weather_checked 变
-        # True，immediately 再订一次（比如换一间酒店）不该重复查
+        # 这次酒店确认正好凑齐"三件套"，该触发天气检查；确认之后 weather_checked_flight_count
+        # 记住当时的机票数量，immediately 再订一次（比如换一间酒店，机票数量没变）不该重复查
         import trip_plan as trip_plan_module
         near_hotel = {"name": "近旁酒店", "price": 500, "lng": 113.541, "lat": 22.191}
         self.a.get("/session")
@@ -198,7 +230,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("天气", response.json["chat_reply"])
         self.assertIn("2026-09-15", response.json["chat_reply"])
         state_after = self.store.load(sid)
-        self.assertTrue(state_after["weather_checked"])
+        self.assertEqual(state_after["weather_checked_flight_count"], 1)
         self.assertEqual(len(state_after["trip_plan"]["weather_alerts"]), 1)
         mocked.assert_called_once()
 

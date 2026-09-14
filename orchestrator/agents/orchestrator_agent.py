@@ -38,6 +38,46 @@ def _extract_city(text: str) -> str | None:
     return None
 
 
+_MULTI_CITY_PARSE_PROMPT = """判断用户这句话是不是要安排一趟跨越多个城市的行程（比如"前两天去澳门，
+后两天去香港"/"先在香港玩3天，再去澳门玩2天"），只认识"澳门"、"香港"这两个城市。是的话，
+按用户说的先后顺序拆解成每个城市玩几天：只输出 JSON 数组，每项 {"city": "澳门" 或 "香港",
+"days": 整数天数}，顺序要跟用户说的先后顺序一致。
+如果不是多城市行程（只提到一个城市、没说清楚天数、或者提到"澳门"/"香港"之外的城市），
+输出空数组 []。只输出 JSON，不要输出其他任何文字。"""
+
+
+def _parse_multi_city_segments(text: str) -> list[dict]:
+    """2026-09-17 用户提出：想让编排 Agent 识别"前两天去澳门，后两天去香港"这种一句话
+    说清楚的多城市行程，按顺序拆成分段。自然语言里"前两天"/"先...再..."这种表达方式太多，
+    正则覆盖不过来，跟 _parse_nearby_request()/_parse_preference_answer() 一样的思路，
+    交给一次 MODEL_LIGHT 调用解析成结构化数据，不硬写规则。
+
+    解析失败、不是多城市表达、或者只解析出 1 个城市（那就是普通单城市请求，不算"多城市"）
+    都返回空列表，调用方退回原来的单城市流程，不强求。"""
+    try:
+        raw = llm_tool.call_llm(
+            [
+                {"role": "system", "content": _MULTI_CITY_PARSE_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            model=llm_tool.MODEL_LIGHT,
+        )
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = "\n".join(clean.splitlines()[1:-1])
+        segments = json.loads(clean)
+        if not isinstance(segments, list):
+            return []
+        valid = [
+            s for s in segments
+            if isinstance(s, dict) and s.get("city") in _KNOWN_CITIES
+            and isinstance(s.get("days"), int) and 0 < s["days"] <= 14
+        ]
+        return valid if len(valid) >= 2 else []
+    except Exception:
+        return []
+
+
 def _resolve_holiday_mentions(text: str, today: date | None = None) -> dict[str, str]:
     """text 里提到的节日名，查真实日期（holiday_tool.py，本地农历库算出来的，不是 LLM
     自己编的）——2026-09-17 真实踩过的坑：自由组句回复说"2026年中秋节是9/17"，真实日期是
@@ -194,7 +234,12 @@ def new_shared_state(user_id: str, scenario: str = "vacation", onboarding_answer
         "trip_preferences_city": None,  # trip_preferences 是为哪个城市答的——换城市要重新问，见 orchestrate()
         "last_content_candidates": [],  # 达人 Agent 最近一次给出的全量候选池，attraction_picker 确认时要用
         "last_trip_day_count": 1,  # 同上，达人 Agent 提取到的天数，attraction_picker 确认时一次性排够这么多天
-        "weather_checked": False,  # 机票酒店行程凑齐之后有没有查过天气了，见 server.py 的 _trip_fully_booked()
+        "last_content_city": None,  # 同上，这批候选是给哪个城市查的——attraction_picker 确认时排班要用这个
+        # 城市，不能用当时可能已经聊到别的城市、过期了的 shared_state["city"]（多城市行程见下）
+        "pending_city_segments": [],  # 多城市行程剩下还没处理的分段（_parse_multi_city_segments()
+        # 解析出来的），第一段处理完确认之后，server.py 会自动接着处理下一段，不用用户重新开口
+        "weather_checked_flight_count": 0,  # 上次查天气时 trip_plan.flights 有几条——多城市行程
+        # 会分批订机票，每多一批新机票就该重新查一次天气，不是整个 session 只查一次
     }
 
 
@@ -268,6 +313,12 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
     requested_city = _extract_city(user_message) or shared_state.get("city")
     if requested_city and requested_city != shared_state.get("trip_preferences_city"):
         prefs = trip_preferences.TripPreferences()
+    # 2026-09-17 用户提出想支持多城市行程（"前两天去澳门，后两天去香港"，或者先规划完一个
+    # 城市、后面接着说想去另一个城市玩）——shared_state["city"] 之前只在会话创建时设一次，
+    # 从没跟着对话更新过，后续订酒店/查天气永远用的是最开始那个城市。这里让它跟着"这句话
+    # 提到的城市"动态更新，提取不到才保留原值，不强行清空
+    if requested_city:
+        shared_state["city"] = requested_city
 
     if "content" in intents and "nearby" not in intents and not prefs.is_complete():
         # mode="trip"（常规推荐）开始搜索之前先确认偏好；mode="nearby"（"从大三巴出发逛
@@ -286,7 +337,21 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
     if "nearby" in intents:
         results["content"] = content_agent.run(shared_state, location_hint=user_message, mode="nearby")
     elif "content" in intents:
-        results["content"] = content_agent.run(shared_state, location_hint=user_message, mode="trip")
+        # 多城市行程（"前两天去澳门，后两天去香港"）：一次只处理第一段，剩下的存进
+        # pending_city_segments，等这段的 attraction_picker 确认排完之后，server.py 会
+        # 自动接着处理下一段——不需要用户重新开口说"现在规划香港"，跟"先规划完一个城市、
+        # 后面接着说想去另一个城市"（增量式多城市）走的是同一套机制，只是这里是编排 Agent
+        # 自己把一句话拆成了等效的多轮
+        segments = _parse_multi_city_segments(user_message)
+        if segments:
+            first_segment = segments[0]
+            shared_state["pending_city_segments"] = segments[1:]
+            shared_state["city"] = first_segment["city"]
+            results["content"] = content_agent.run(
+                shared_state, location_hint=f"{first_segment['city']}玩{first_segment['days']}天", mode="trip"
+            )
+        else:
+            results["content"] = content_agent.run(shared_state, location_hint=user_message, mode="trip")
 
     # mode="nearby" 解析不出起点/游览时长，达人 Agent 会直接给一句追问，整轮到此为止——
     # 跟以前 nearby_planner.from_chat() 解析失败时的短路行为一致，不硬着头皮跑完剩下的分发
@@ -357,6 +422,9 @@ def orchestrate(user_message: str, shared_state: dict) -> tuple[dict, dict]:
             # 天数是达人 Agent 从这轮消息里提取到的（content_agent._extract_day_count()），
             # 同样得跨请求存起来才能在确认时用
             shared_state["last_trip_day_count"] = results["content"].get("day_count", 1)
+            # 这批候选是给 shared_state["city"] 查的（这轮可能刚被多城市分段/动态更新改过），
+            # 排班时要用这个而不是确认那一刻可能已经聊到别的城市、过期了的 shared_state["city"]
+            shared_state["last_content_city"] = shared_state.get("city")
     if "booking" in results:
         # 两个 widget 各自按 provider_type 从同一份 candidates 里挑，查不到对应类型就返回 None
         booking_candidates = results["booking"]["candidates"]

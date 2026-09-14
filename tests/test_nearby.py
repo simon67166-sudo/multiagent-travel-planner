@@ -736,6 +736,55 @@ class NearbyTests(unittest.TestCase):
         resolved = agent._resolve_holiday_mentions("春节安排", today)
         self.assertEqual(resolved["春节"], "2027-02-06")
 
+    def test_parse_multi_city_segments_splits_ordered_cities_and_days(self):
+        # 2026-09-17 用户提出：想支持"前两天去澳门，后两天去香港"这种一句话说清楚的多城市
+        # 行程，按顺序拆成分段
+        from agents import orchestrator_agent as agent
+        with patch.object(agent.llm_tool, "call_llm", return_value='[{"city":"澳门","days":2},{"city":"香港","days":2}]'):
+            segments = agent._parse_multi_city_segments("前两天去澳门，后两天去香港")
+        self.assertEqual(segments, [{"city": "澳门", "days": 2}, {"city": "香港", "days": 2}])
+
+    def test_parse_multi_city_segments_returns_empty_for_single_city(self):
+        # 只解析出 1 个城市就不算"多城市"，退回单城市流程——不然连"推荐一个3天的行程"
+        # 这种普通单城市请求都会被当成多城市处理
+        from agents import orchestrator_agent as agent
+        with patch.object(agent.llm_tool, "call_llm", return_value='[{"city":"澳门","days":3}]'):
+            self.assertEqual(agent._parse_multi_city_segments("推荐一个3天的澳门行程"), [])
+        with patch.object(agent.llm_tool, "call_llm", return_value="不是JSON"):
+            self.assertEqual(agent._parse_multi_city_segments("随便聊聊"), [])
+
+    def test_orchestrate_dynamically_updates_city_from_message(self):
+        # 2026-09-17 用户反馈：shared_state["city"] 之前只在会话创建时设一次，从没跟着
+        # 对话更新过——后续订酒店/查天气永远用最开始那个城市。现在要跟着最新一句话动态更新
+        from agents import orchestrator_agent as agent
+        state = agent.new_shared_state("dynamic-city-test-user")
+        state["city"] = "澳门"
+        state["trip_preferences"] = {"hotel_preference": "周边", "flight_priority": "折衷"}  # 跳过偏好门槛
+        with patch.object(agent, "classify_intent", return_value=["booking"]), \
+             patch.object(agent.ota_hotel_agent, "run", return_value={"candidates": []}), \
+             patch.object(agent.llm_tool, "call_llm", return_value="收到"):
+            agent.orchestrate("帮我订香港的酒店", state)
+        self.assertEqual(state["city"], "香港")
+
+    def test_orchestrate_multi_city_message_schedules_first_segment_and_queues_rest(self):
+        # 端到端验证：一句话说的多城市行程，这一轮该只处理第一段（澳门），第二段（香港）
+        # 存进 pending_city_segments 等 attraction_picker 确认之后自动续接
+        from agents import orchestrator_agent as agent
+        state = agent.new_shared_state("multi-city-test-user")
+        state["trip_preferences"] = {"hotel_preference": "周边", "flight_priority": "折衷"}
+        state["trip_preferences_city"] = "澳门"  # 避免触发"换城市重新问偏好"的门槛，见 test_trip_preferences_reasked...
+        fake_content_result = {"recommendations": [{"place": "大三巴", "category": "景点"}],
+                                "nearby_params": None, "clarification_needed": None, "day_count": 2}
+        with patch.object(agent, "classify_intent", return_value=["content"]), \
+             patch.object(agent, "_parse_multi_city_segments", return_value=[{"city": "澳门", "days": 2}, {"city": "香港", "days": 2}]), \
+             patch.object(agent.content_agent, "run", return_value=fake_content_result) as content_mock, \
+             patch.object(agent.llm_tool, "call_llm", return_value="收到"):
+            agent.orchestrate("前两天去澳门，后两天去香港", state)
+        self.assertEqual(content_mock.call_args.kwargs["location_hint"], "澳门玩2天")
+        self.assertEqual(state["city"], "澳门")
+        self.assertEqual(state["last_content_city"], "澳门")
+        self.assertEqual(state["pending_city_segments"], [{"city": "香港", "days": 2}])
+
     def test_day_dates_from_flight_derives_real_dates_from_depart_flight(self):
         # 2026-09-17：trip_plan.days 用的 "day-1"/"day-2" 是占位 key，不是真实日历日期——
         # 借去程航班的真实日期倒推，day-1 是抵达那天，day-N 顺推 N-1 天

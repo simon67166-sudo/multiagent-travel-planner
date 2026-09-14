@@ -36,7 +36,8 @@ from openai import OpenAIError
 import main
 import schedule_widgets
 import trip_plan
-from agents import exception_agent, ota_hotel_agent, route_agent
+import widgets
+from agents import content_agent, exception_agent, ota_hotel_agent, route_agent
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -153,16 +154,23 @@ def widget_response():
         options = offered["data"].get("options", [])
         if any(item not in options for item in selected) or any(item in selected[:i] for i, item in enumerate(selected)):
             return jsonify({"error": "选项不在本次候选清单"}), 400
-        chat_reply = apply_selection(widget, selected, state)
+        # 先把这次确认掉的卡片从 pending_widgets 里摘掉，再调 apply_selection()——多城市
+        # 行程续接下一段时（见 apply_selection() 里 attraction_picker 分支），apply_selection()
+        # 会往 pending_widgets 里塞一张新的 attraction_picker 卡片，如果先调用它再做这个过滤，
+        # 刚塞进去的新卡片会被这行代码当成"这次确认掉的"一并摘掉
         state["pending_widgets"] = [w for w in state["pending_widgets"] if w.get("widget") != widget]
+        chat_reply = apply_selection(widget, selected, state)
 
         # 2026-09-17 用户提出：机票酒店行程都定完之后，该调 exception_agent 查一次真实天气，
-        # 在行程里标出可能下雨/下雪的天，雨大的话问一下要不要调整——只在"刚好凑齐"那一次
-        # 检查（state["weather_checked"] 记过就不再重复查，不然每多订一次东西都要重查一遍，
-        # 真实 API 调用没必要，回复也会一直重复同样的天气提醒）
-        if not state.get("weather_checked") and _trip_fully_booked(state["trip_plan"]):
+        # 在行程里标出可能下雨/下雪的天，雨大的话问一下要不要调整——只在"新增了机票"之后才
+        # 重新检查（state["weather_checked_flight_count"] 记的是上次查的时候 trip_plan.flights
+        # 有几条，机票数量没变就不重复查，真实 API 调用没必要，回复也不用重复同样的提醒）。
+        # 2026-09-17 起支持多城市行程分批订机票（一个城市一批往返），不能只查一次就不再查——
+        # 之前用一个全程只生效一次的布尔值，第二个城市新增的机票永远不会被检查到
+        current_flight_count = len(state["trip_plan"].get("flights", []))
+        if current_flight_count > state.get("weather_checked_flight_count", 0) and _trip_fully_booked(state["trip_plan"]):
             weather_result = exception_agent.check_itinerary_weather(state)
-            state["weather_checked"] = True
+            state["weather_checked_flight_count"] = current_flight_count
             if weather_result["day_weather"]:
                 summaries = []
                 for m in weather_result["day_weather"].values():
@@ -208,8 +216,11 @@ def apply_selection(widget, selected, state) -> str | None:
             return None
         priority_places = {item["place"] for item in picks}
         full_pool = state.get("last_content_candidates") or picks
+        # city 优先用 last_content_city（这批候选实际是给哪个城市查的）——多城市行程/中途
+        # 换城市之后，确认这一刻的 state["city"] 可能已经被后面聊到的新城市覆盖掉了，
+        # last_content_city 才是跟 full_pool 真正对得上的那个城市，见 orchestrator_agent.py
         result = route_agent.schedule(
-            state, full_pool, city=state.get("city", _DEMO_CITY), mode="trip",
+            state, full_pool, city=state.get("last_content_city") or state.get("city", _DEMO_CITY), mode="trip",
             time_budget_days=state.get("last_trip_day_count", 1),
             priority_places=priority_places,
         )
@@ -224,6 +235,28 @@ def apply_selection(widget, selected, state) -> str | None:
             reply += f"其中「{'、'.join(missed_picks)}」这次没能排进去（时段冲突或坐标缺失），可以再选一轮试试。"
         if result.get("weather_reminders"):
             reply += "\n" + "\n".join(result["weather_reminders"])
+
+        # 2026-09-17 起支持多城市行程：这段排完了，看看 orchestrator_agent.py 有没有存下
+        # 还没处理的下一段（_parse_multi_city_segments() 从一句话里拆出来的，或者用户后面
+        # 接着说"还想去 XX 玩"新追加的）——有就自动接着查下一个城市的候选、生成新的
+        # attraction_picker 卡片，不用用户重新开口，跟增量式多城市走的是同一套机制
+        next_segments = state.get("pending_city_segments") or []
+        if next_segments:
+            next_segment = next_segments[0]
+            next_city, next_days = next_segment["city"], next_segment["days"]
+            state["pending_city_segments"] = next_segments[1:]
+            state["city"] = next_city
+            next_result = content_agent.run(state, location_hint=f"{next_city}玩{next_days}天", mode="trip")
+            next_candidates = next_result["recommendations"]
+            if next_candidates:
+                state["last_content_candidates"] = next_candidates
+                state["last_trip_day_count"] = next_result.get("day_count", next_days)
+                state["last_content_city"] = next_city
+                state["pending_widgets"].append(widgets.build_post_list_widget(next_candidates))
+                state["pending_widgets"].append(widgets.build_attraction_picker_widget(next_candidates))
+                reply += f"\n接下来是{next_city}的部分，已经帮你挑了一批候选，去候选卡片里选完确认吧。"
+            else:
+                reply += f"\n接下来想接着排{next_city}的行程，但这次没查到合适的候选，可以再跟我说说想去哪逛逛。"
         return reply
     elif widget == "flight_picker":
         for item in selected:
