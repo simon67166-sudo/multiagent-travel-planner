@@ -693,6 +693,49 @@ class NearbyTests(unittest.TestCase):
         self.assertNotIn("机票", question)
         self.assertIn("继续", question)  # 提示可以跳过
 
+    def test_extract_date_range_parses_and_infers_year(self):
+        # 2026-09-17 用户真实反馈：不管说哪天出发，订票订房查的永远是"明天起2晚"——查出来
+        # 是 orchestrate() 调 ota_hotel_agent.run() 从来没传过 date_range。这里验证解析
+        # 本身：日期已经过了今年就推到明年，没过就用今年
+        from datetime import date
+        from agents import orchestrator_agent as agent
+        today = date(2026, 9, 14)
+        # 9/24-9/27 还没到，今年
+        self.assertEqual(agent._extract_date_range("9/24-9/27想去澳门", today), "2026-09-24~2026-09-27")
+        # 9.1到9.5已经过了今年（今天是9/14），该推到明年
+        self.assertEqual(agent._extract_date_range("9.1到9.5想去澳门", today), "2027-09-01~2027-09-05")
+        self.assertIsNone(agent._extract_date_range("推荐一下怎么玩", today))  # 没提日期就是 None
+
+    def test_orchestrate_passes_extracted_date_range_to_booking(self):
+        # 端到端验证：booking 意图命中时，ota_hotel_agent.run() 该收到从用户消息解析出来的
+        # date_range，不是 None（之前的 bug：不管用户说什么日期都查"明天起2晚"）
+        from agents import orchestrator_agent as agent
+        state = agent.new_shared_state("date-range-test-user")
+        with patch.object(agent, "classify_intent", return_value=["booking"]), \
+             patch.object(agent.ota_hotel_agent, "run", return_value={"candidates": []}) as booking_mock, \
+             patch.object(agent.llm_tool, "call_llm", return_value="收到"):
+            agent.orchestrate("帮我订9/24-9/27的机票酒店", state)
+        booking_mock.assert_called_once()
+        self.assertEqual(booking_mock.call_args.kwargs["date_range"], "2026-09-24~2026-09-27")
+
+    def test_resolve_holiday_mentions_uses_real_lunar_calendar(self):
+        # 2026-09-17 真实踩过的坑：自由组句回复说"2026年中秋节是9/17"，真实日期
+        # （zhdate 算出来的）是 9/25，差了 8 天——不能让模型自己编节日日期
+        from datetime import date
+        from agents import orchestrator_agent as agent
+        today = date(2026, 9, 14)
+        resolved = agent._resolve_holiday_mentions("中秋节想去澳门玩", today)
+        self.assertEqual(resolved, {"中秋节": "2026-09-25"})
+        self.assertEqual(agent._resolve_holiday_mentions("随便推荐一下", today), {})
+
+    def test_resolve_holiday_mentions_rolls_over_past_holiday_to_next_year(self):
+        from datetime import date
+        from agents import orchestrator_agent as agent
+        # 今天已经过了 2026 年春节（2026-02-17），问"春节"该给 2027 年的
+        today = date(2026, 9, 14)
+        resolved = agent._resolve_holiday_mentions("春节安排", today)
+        self.assertEqual(resolved["春节"], "2027-02-06")
+
     def test_day_dates_from_flight_derives_real_dates_from_depart_flight(self):
         # 2026-09-17：trip_plan.days 用的 "day-1"/"day-2" 是占位 key，不是真实日历日期——
         # 借去程航班的真实日期倒推，day-1 是抵达那天，day-N 顺推 N-1 天

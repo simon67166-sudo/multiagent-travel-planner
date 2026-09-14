@@ -602,3 +602,9 @@ python orchestrator/server.py
     - `server.py` 新增 `_trip_fully_booked()`（机票+酒店+每日行程是不是都有了），`POST /widget-response` 确认完（不管是哪个 widget）之后检查这个条件，刚好凑齐就调一次 `check_itinerary_weather()`，天气提醒并进衔接回复里；`state["weather_checked"]` 记一次就不再重复查（不然每多订一次东西——比如换酒店——都要重查一遍，真实 API 调用没必要）。
 
     真实验证：真实调用和风天气 API 查当天澳门天气（降雨概率 16%），正确标成 `severity="minor"`、`needs_replan=False`；模拟高降雨概率场景验证 `needs_replan=True` 且正确生成"要不要调整"的问句，`weather_alerts` 里写入对应记录。
+
+36. **订票订房不管用户说哪天出发，永远查"明天起2晚"** + **自由组句回复编节日日期**（2026-09-17，团队成员真实测试反馈）：
+    - `orchestrate()` 调 `ota_hotel_agent.run()` 的地方一直没传 `date_range` 参数（`ota_hotel_agent.run(shared_state, location=None, user_message=user_message)`）——`date_range=None` 时 `_parse_date_range()` 直接退回默认值：check_in 是"明天"，住 2 晚，**跟用户说了什么日期完全无关**。真实测试时系统日期是 9/14，"明天"正好是 9/15，不管用户说 9/24-9/27 还是别的，查出来的永远是 9/15-9/17，不是巧合，是压根没人把用户说的日期解析出来传下去。**已解决**：新增 `_extract_date_range()`（跟 `content_agent._DATE_RANGE_PATTERN` 同样的正则思路，独立一份，这边要的是真实公历日期不是天数），`orchestrate()` 命中 `booking` 意图时解析当前消息里的日期区间传给 `ota_hotel_agent.run()`；没有年份信息，日期已经过了今年就推到明年（没人会订"去年"的机票）；解析不出来就是 `None`，退回原来的默认值，不强求。
+    - 自由组句回复（`orchestrate()` 里没命中 `restaurant`/`cancel` 时走的 LLM 组句分支）被问到"2026年中秋节是哪天"，编出了"9/17"——真实日期（`zhdate` 库算出来的）是 **9/25**，差了整整 8 天。`llm_tool.call_llm()` 是纯聊天补全调用，没有联网搜索也没有工具调用能力，农历转公历这种事对 LLM 来说本来就容易凭训练数据编错。**已解决**：新增 `holiday_tool.py`（本地农历库 `zhdate` 算农历固定节日，公历固定节日直接算，不需要联网/API key，比接一个真实的联网搜索工具轻量得多——这类"哪天是哪个节日"的问题本身就是可以精确计算的事实，不是需要搜索的信息），收录春节/元宵/端午/七夕/中秋/重阳/腊八（农历）+ 元旦/劳动节/国庆节（公历）。`orchestrator_agent._resolve_holiday_mentions()` 检查用户这句话有没有提到认识的节日名，查出真实日期后跟着 `results`/`trip_plan`/`persona` 一起塞进给 LLM 的 `context`（新增 `holiday_facts` 字段），system prompt 明确要求"用户提到的节日只能按 holiday_facts 给的日期回答，没有的节日不要自己编，说不确定"。日期如果已经是今年过去的日子，自动换算成明年的（同样的"没人会问去年的节日"逻辑）。
+
+    真实验证：`_extract_date_range("9/24-9/27想去澳门")` 正确解析出 `"2026-09-24~2026-09-27"`；`holiday_tool.get_holiday_date("中秋节", 2026)` 真实算出 `"2026-09-25"`，`_resolve_holiday_mentions()` 正确识别节日提及并换算过期年份（问"春节"，2026年的已经过了，正确给出2027年的真实日期）。91 个测试全过。
