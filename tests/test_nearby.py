@@ -693,4 +693,67 @@ class NearbyTests(unittest.TestCase):
         self.assertNotIn("机票", question)
         self.assertIn("继续", question)  # 提示可以跳过
 
+    def test_day_dates_from_flight_derives_real_dates_from_depart_flight(self):
+        # 2026-09-17：trip_plan.days 用的 "day-1"/"day-2" 是占位 key，不是真实日历日期——
+        # 借去程航班的真实日期倒推，day-1 是抵达那天，day-N 顺推 N-1 天
+        from agents import exception_agent
+        import trip_plan as tp
+        trip = tp.new_trip_plan("weather-date-test")
+        tp.add_flight(trip, {"from_": "北京首都国际机场", "to": "澳门", "date": "2026-09-15", "depart_time": "08:00", "arrive_time": "10:10"})
+        tp.get_or_create_day(trip, "day-1")
+        tp.get_or_create_day(trip, "day-2")
+        tp.get_or_create_day(trip, "day-3")
+        state = {"trip_plan": trip, "city": "澳门"}
+        self.assertEqual(
+            exception_agent._day_dates_from_flight(state),
+            {"day-1": "2026-09-15", "day-2": "2026-09-16", "day-3": "2026-09-17"},
+        )
+
+    def test_day_dates_from_flight_returns_empty_without_depart_flight(self):
+        from agents import exception_agent
+        import trip_plan as tp
+        trip = tp.new_trip_plan("weather-date-test-2")
+        tp.get_or_create_day(trip, "day-1")
+        state = {"trip_plan": trip, "city": "澳门"}
+        self.assertEqual(exception_agent._day_dates_from_flight(state), {})
+
+    def test_check_itinerary_weather_marks_heavy_rain_and_needs_replan(self):
+        # 端到端验证：机票订好之后，某天预报降雨概率很高——该写进 trip_plan.weather_alerts，
+        # 且 needs_replan=True、带一句"要不要调整"的问句，不自动改行程
+        from agents import exception_agent
+        import trip_plan as tp
+        trip = tp.new_trip_plan("weather-check-test")
+        tp.add_flight(trip, {"from_": "北京首都国际机场", "to": "澳门", "date": "2026-09-15", "depart_time": "08:00", "arrive_time": "10:10"})
+        day1 = tp.get_or_create_day(trip, "day-1")
+        tp.add_stop(day1, "n1", "attraction", "大三巴", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.54, lat=22.19)
+        state = {"trip_plan": trip, "city": "澳门"}
+
+        fake_forecast = [
+            {"time": "2026-09-15T14:00", "temperature_c": 28, "rain_probability": 0.75, "condition_text": "大雨"},
+            {"time": "2026-09-15T15:00", "temperature_c": 27, "rain_probability": 0.8, "condition_text": "大雨"},
+        ]
+        with patch.object(exception_agent.weather_tool, "get_hourly_forecast", return_value=fake_forecast):
+            result = exception_agent.check_itinerary_weather(state)
+
+        self.assertTrue(result["needs_replan"])
+        self.assertIn("2026-09-15", result["suggested_adjustment"])
+        self.assertEqual(result["day_weather"]["day-1"]["max_rain_probability"], 0.8)
+        alerts = trip["weather_alerts"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["date"], "2026-09-15")
+        self.assertEqual(alerts[0]["severity"], "severe")
+
+    def test_check_itinerary_weather_skips_day_without_real_date_or_forecast_error(self):
+        # 没订机票（算不出真实日期）、或者查询本身失败，都该优雅跳过，不报错、不误标
+        from agents import exception_agent
+        import trip_plan as tp
+        trip = tp.new_trip_plan("weather-check-test-2")
+        day1 = tp.get_or_create_day(trip, "day-1")
+        tp.add_stop(day1, "n1", "attraction", "大三巴", arrival_transport="首站", arrival_time="09:00", end_time="10:00", lng=113.54, lat=22.19)
+        state = {"trip_plan": trip, "city": "澳门"}
+        result = exception_agent.check_itinerary_weather(state)
+        self.assertEqual(result["day_weather"], {})
+        self.assertFalse(result["needs_replan"])
+        self.assertEqual(trip["weather_alerts"], [])
+
 if __name__ == "__main__": unittest.main()

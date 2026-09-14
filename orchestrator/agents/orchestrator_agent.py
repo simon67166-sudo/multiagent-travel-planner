@@ -143,6 +143,7 @@ def new_shared_state(user_id: str, scenario: str = "vacation", onboarding_answer
         "trip_preferences_city": None,  # trip_preferences 是为哪个城市答的——换城市要重新问，见 orchestrate()
         "last_content_candidates": [],  # 达人 Agent 最近一次给出的全量候选池，attraction_picker 确认时要用
         "last_trip_day_count": 1,  # 同上，达人 Agent 提取到的天数，attraction_picker 确认时一次性排够这么多天
+        "weather_checked": False,  # 机票酒店行程凑齐之后有没有查过天气了，见 server.py 的 _trip_fully_booked()
     }
 
 

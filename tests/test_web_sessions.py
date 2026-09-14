@@ -173,6 +173,42 @@ class WebTests(unittest.TestCase):
         self.assertIn("氹仔某酒店", response.json["chat_reply"])
         self.assertIn("比较远", response.json["chat_reply"])
 
+    def test_hotel_picker_confirm_triggers_weather_check_once_fully_booked(self):
+        # 2026-09-17，用户提出：机票酒店行程都定完之后该调 exception_agent 查一次天气，
+        # 标出可能下雨/下雪的天，雨大的话问一下要不要调整。这里机票和行程都已经有了，
+        # 这次酒店确认正好凑齐"三件套"，该触发天气检查；确认之后 weather_checked 变
+        # True，immediately 再订一次（比如换一间酒店）不该重复查
+        import trip_plan as trip_plan_module
+        near_hotel = {"name": "近旁酒店", "price": 500, "lng": 113.541, "lat": 22.191}
+        self.a.get("/session")
+        sid = self.a.get_cookie("travel_session").value
+        with self.store.edit(sid, dict) as state:
+            trip_plan_module.add_flight(state["trip_plan"], {
+                "from_": "北京首都国际机场", "to": "澳门", "date": "2026-09-15",
+                "depart_time": "08:00", "arrive_time": "10:10", "status": "on_time",
+            })
+            day1 = trip_plan_module.get_or_create_day(state["trip_plan"], "day-1")
+            trip_plan_module.add_stop(day1, "n1", "attraction", "大三巴牌坊", arrival_transport="首站",
+                                       arrival_time="09:00", end_time="10:00", lng=113.54, lat=22.19)
+            state["pending_widgets"] = [{"widget": "hotel_picker", "data": {"options": [near_hotel], "max_select": 1}}]
+
+        fake_forecast = [{"time": "2026-09-15T14:00", "temperature_c": 28, "rain_probability": 0.8, "condition_text": "大雨"}]
+        with patch.object(self.server.exception_agent.weather_tool, "get_hourly_forecast", return_value=fake_forecast) as mocked:
+            response = self.a.post("/widget-response", json={"widget": "hotel_picker", "selected": [near_hotel]})
+        self.assertIn("天气", response.json["chat_reply"])
+        self.assertIn("2026-09-15", response.json["chat_reply"])
+        state_after = self.store.load(sid)
+        self.assertTrue(state_after["weather_checked"])
+        self.assertEqual(len(state_after["trip_plan"]["weather_alerts"]), 1)
+        mocked.assert_called_once()
+
+        # 再订一次（比如覆盖同一个 hotel_picker），不该再触发天气查询
+        with self.store.edit(sid, dict) as state:
+            state["pending_widgets"] = [{"widget": "hotel_picker", "data": {"options": [near_hotel], "max_select": 1}}]
+        with patch.object(self.server.exception_agent.weather_tool, "get_hourly_forecast", return_value=fake_forecast) as mocked2:
+            self.a.post("/widget-response", json={"widget": "hotel_picker", "selected": [near_hotel]})
+        mocked2.assert_not_called()
+
     def test_nearby_endpoints_removed(self):
         # 2026-09-14：nearby 并入了达人 Agent（content_agent.run(mode="nearby") +
         # route_agent.schedule()），走 POST /chat 就行。这三个独立端点连同独立表单前端

@@ -36,7 +36,7 @@ from openai import OpenAIError
 import main
 import schedule_widgets
 import trip_plan
-from agents import ota_hotel_agent, route_agent
+from agents import exception_agent, ota_hotel_agent, route_agent
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -131,6 +131,12 @@ def chat():
 def validation_error(error):
     return jsonify({"error": str(error)}), 400
 
+def _trip_fully_booked(trip_plan_obj: dict) -> bool:
+    """机票、酒店、每日行程是不是都定完了——exception_agent.check_itinerary_weather() 的
+    触发条件（用户要求"已经制定完了机票酒店行程后"才查天气，不是随便哪个环节都查）。"""
+    return bool(trip_plan_obj.get("flights")) and bool(trip_plan_obj.get("hotels")) and bool(trip_plan_obj.get("days"))
+
+
 @app.post("/widget-response")
 def widget_response():
     payload = request.get_json(silent=True)
@@ -149,6 +155,24 @@ def widget_response():
             return jsonify({"error": "选项不在本次候选清单"}), 400
         chat_reply = apply_selection(widget, selected, state)
         state["pending_widgets"] = [w for w in state["pending_widgets"] if w.get("widget") != widget]
+
+        # 2026-09-17 用户提出：机票酒店行程都定完之后，该调 exception_agent 查一次真实天气，
+        # 在行程里标出可能下雨/下雪的天，雨大的话问一下要不要调整——只在"刚好凑齐"那一次
+        # 检查（state["weather_checked"] 记过就不再重复查，不然每多订一次东西都要重查一遍，
+        # 真实 API 调用没必要，回复也会一直重复同样的天气提醒）
+        if not state.get("weather_checked") and _trip_fully_booked(state["trip_plan"]):
+            weather_result = exception_agent.check_itinerary_weather(state)
+            state["weather_checked"] = True
+            if weather_result["day_weather"]:
+                summaries = []
+                for m in weather_result["day_weather"].values():
+                    detail = "有降雪" if m["is_snow"] else f"降雨概率约 {round(m['max_rain_probability'] * 100)}%"
+                    summaries.append(f"{m['date']}{detail}")
+                weather_note = "机票酒店行程都定好了，顺手查了一下天气：" + "；".join(summaries)
+                if weather_result["suggested_adjustment"]:
+                    weather_note += "\n" + weather_result["suggested_adjustment"]
+                chat_reply = (chat_reply + "\n" + weather_note) if chat_reply else weather_note
+
         if chat_reply:
             # 交互完了不能就这么悄无声息——排班/订票订房这些后台真做了事，聊天框得有句话
             # 衔接一下，跟 POST /chat 走的助手回复存进同一个 messages 列表，前端/下次刷新

@@ -16,6 +16,7 @@ requires_confirmation 恒为 True，谁都不直接碰 trip_plan。apply_adjustm
 """
 
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 _ORCHESTRATOR_DIR = Path(__file__).resolve().parent.parent
@@ -83,6 +84,110 @@ def check_weather(shared_state: dict, city: str) -> dict:
         "requires_confirmation": True,
         "needs_replan": _SEVERITY_ORDER.get(worst_severity, 0) >= _SEVERITY_ORDER[_NEEDS_REPLAN_SEVERITY],
         "suggested_adjustment": f"{city} 当前有真实灾害预警（最高等级：{worst_severity}）。行程尚未变更，是否需要调整由你决定。",
+    }
+
+
+_HEAVY_RAIN_THRESHOLD = 0.6  # 跟 route_agent.schedule() 排完一天后的降雨提醒用的是同一个阈值
+_SNOW_KEYWORDS = ("雪",)  # condition_text 是和风天气给的中文天气描述，不是结构化字段，只能关键词匹配
+
+
+def _day_dates_from_flight(shared_state: dict) -> dict[str, str]:
+    """trip_plan.days 的 key（"day-1"/"day-2"...）是 route_agent.schedule() 排班时按顺序
+    分配的占位符，不是真实日历日期（已知的设计取舍，见 docs/orchestrator-guide.md）。这个
+    函数只在"机票已经订好"之后才会被调用（check_itinerary_weather() 的前提条件），借去程
+    航班的真实日期倒推：day-1 是航班抵达那天，day-N 顺推 N-1 天。没有去程航班（还没到
+    "机票酒店行程都定完"这一步）就返回空字典，调用方跳过天气检查，不瞎猜日期。"""
+    flights = shared_state.get("trip_plan", {}).get("flights", [])
+    city = shared_state.get("city")
+    depart_date_str = next((f["date"] for f in flights if f.get("to") == city and f.get("date")), None)
+    if not depart_date_str:
+        return {}
+    try:
+        start = date.fromisoformat(depart_date_str)
+    except ValueError:
+        return {}
+    days = shared_state.get("trip_plan", {}).get("days", {})
+    try:
+        day_keys = sorted(days.keys(), key=lambda k: int(k.split("-")[1]))
+    except (IndexError, ValueError):
+        day_keys = sorted(days.keys())
+    return {key: (start + timedelta(days=i)).isoformat() for i, key in enumerate(day_keys)}
+
+
+def check_itinerary_weather(shared_state: dict) -> dict:
+    """机票、酒店、每日行程都定完之后调用（server.py 在 widget-response 确认之后检查这个
+    条件）：给 trip_plan.days 里每一天真实查一次天气预报（weather_tool.get_hourly_forecast()，
+    按这天最后一个有坐标的节点查——跟 route_agent.schedule() 排完一天查天气用的是同一个
+    "查最后一个点"的思路，不用每站都查，控制调用次数），标出可能下雨/下雪的天。
+
+    标记直接写进 trip_plan.weather_alerts（trip_plan.add_weather_alert()，前端已经在渲染
+    这个字段，不用额外改前端）——这是纯信息性标记，不删除/修改任何行程节点，不受这个模块
+    "提案制、不自动执行"的限制（那条规则管的是会真的改变行程结构的操作，比如 run() 发现
+    地点被影响、要不要删掉这个节点；标天气纯粹是告知，跟 route_agent.schedule() 里排完一天
+    顺手查一次降雨提醒是同一件事，只是这里覆盖行程里的每一天，不只是最后排到的那个点）。
+
+    哪天降雨概率达到 _HEAVY_RAIN_THRESHOLD 就整体标 needs_replan=True，返回一句问句交给
+    编排 Agent 问用户要不要调整——真要怎么改还是得用户自己在对话里说清楚，这里只问不猜、
+    不自动执行，跟 run()/check_weather() 的"提案不执行"是同一个原则，只是这次"提案"的
+    动作是"打个招呼问一下"而不是"准备删除某个节点"。
+
+    某天排不出真实日历日期（_day_dates_from_flight() 查不到，比如机票还没订）、某天没有
+    带坐标的节点、或者查询本身失败（key 没配/网络问题）都跳过那天，不报错、不让一天的
+    失败拖垮整个检查。
+    """
+    day_dates = _day_dates_from_flight(shared_state)
+    days = shared_state.get("trip_plan", {}).get("days", {})
+    day_weather: dict[str, dict] = {}
+    heavy_rain_dates = []
+
+    for day_key, day_plan in days.items():
+        real_date = day_dates.get(day_key)
+        if not real_date:
+            continue
+        stops = trip_plan.day_stops(day_plan)
+        target = next((s for s in reversed(stops) if s.get("lng") is not None and s.get("lat") is not None), None)
+        if not target:
+            continue
+        try:
+            forecast = weather_tool.get_hourly_forecast(target["lng"], target["lat"], hours=240)
+        except Exception:
+            continue
+        day_rows = [h for h in forecast if h["time"].startswith(real_date)]
+        if not day_rows:
+            continue
+        rain_values = [h["rain_probability"] for h in day_rows if h.get("rain_probability") is not None]
+        max_rain = max(rain_values) if rain_values else 0
+        is_snow = any(h.get("condition_text") and any(k in h["condition_text"] for k in _SNOW_KEYWORDS) for h in day_rows)
+        if max_rain <= 0 and not is_snow:
+            continue
+
+        marker = {
+            "date": real_date,
+            "max_rain_probability": max_rain,
+            "is_snow": is_snow,
+            "condition_text": next((h["condition_text"] for h in day_rows if h.get("condition_text")), None),
+        }
+        day_weather[day_key] = marker
+        trip_plan.add_weather_alert(shared_state["trip_plan"], {
+            "date": real_date,
+            "location": target.get("place"),
+            "event_type": "降雪" if is_snow else "降雨",
+            "severity": "severe" if max_rain >= _HEAVY_RAIN_THRESHOLD else "minor",
+            "description": f"{real_date} 预计{'有降雪' if is_snow else f'降雨概率约 {round(max_rain * 100)}%'}，建议关注天气变化。",
+            "affects_dates": [real_date],
+        })
+        if max_rain >= _HEAVY_RAIN_THRESHOLD:
+            heavy_rain_dates.append(real_date)
+
+    needs_replan = bool(heavy_rain_dates)
+    suggested_adjustment = None
+    if needs_replan:
+        suggested_adjustment = f"{'、'.join(heavy_rain_dates)} 降雨概率较高，要不要调整这几天的行程（比如换成室内景点）？"
+    return {
+        "day_weather": day_weather,
+        "needs_replan": needs_replan,
+        "requires_confirmation": True,
+        "suggested_adjustment": suggested_adjustment,
     }
 
 
