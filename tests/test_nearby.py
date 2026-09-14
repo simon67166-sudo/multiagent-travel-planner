@@ -107,6 +107,22 @@ class NearbyTests(unittest.TestCase):
             results = content_agent._nearby_plan({"lng": 113.54, "lat": 22.19, "name": "起点", "id": None}, "澳门", None)
         self.assertEqual(len(results), content_agent._NEARBY_PER_CALL_CAP)
 
+    def test_nearby_plan_excludes_non_recommendable_facility_pois(self):
+        # 2026-09-17 用户真实反馈：候选池里出现了一个"景点"叫"公厕"——查实是高德自己把
+        # 这个 POI 的 type 标成了"风景名胜;风景名胜;风景名胜"（typecode 110200，高德自己
+        # 数据标错了类别），_classify_categories() 只能凭这个错误的原始类别归类，没法凭空
+        # 判断"这条候选压根不该被推荐"。真正可靠的信号是地名本身——公厕/停车场这类公共设施
+        # 关键词命中就该在查回来这一步直接排除，不进候选池
+        from agents import content_agent
+        pois = [
+            {"id": "poi1", "name": "公厕", "lng": 113.5438, "lat": 22.1929, "category": "风景名胜;风景名胜;风景名胜", "address": "庇山耶街26号"},
+            {"id": "poi2", "name": "大三巴牌坊", "lng": 113.54, "lat": 22.19, "category": "风景名胜", "address": "大三巴街"},
+        ]
+        with patch.object(content_agent.nearby_sources, "nearby", return_value=pois), \
+             patch.object(content_agent.store, "find_posts_by_place", return_value=[]):
+            results = content_agent._nearby_plan({"lng": 113.54, "lat": 22.19, "name": "起点", "id": None}, "澳门", None)
+        self.assertEqual([r["place"] for r in results], ["大三巴牌坊"])
+
     def test_place_day_never_fakes_a_failed_route(self):
         # 原 test_missing_route_never_draws_fake_line 的等价替代：查路线失败时不能编造到达时间，
         # 要老实标"待定（地图查询失败）"，不能假装查到了什么

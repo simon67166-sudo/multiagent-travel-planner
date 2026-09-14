@@ -35,6 +35,15 @@ _KNOWN_CITIES = ("澳门", "香港")
 _NEARBY_RADIUS_M = 1500  # 跟 nearby_sources.nearby() 默认半径一致，显式写出来方便以后调
 _NEARBY_PER_CALL_CAP = 8  # 每次 _nearby_plan() 调用最多留几个候选，见该函数文档字符串
 
+# 2026-09-17 真实踩过的坑：高德周边查询查回来一个叫"公厕"的 POI，高德自己给的 type 字段是
+# "风景名胜;风景名胜;风景名胜"（typecode 110200）——高德自己的数据就标错了类别，
+# _classify_categories() 看着这个"风景名胜"字样，理所当然地把它归成了"景点"塞进候选池。
+# 靠 LLM 分类环节纠正这种"上游数据源自己标错类别"的情况不现实（分类提示词能判断的是
+# "这条候选属于哪个类别"，没法凭空判断"这条候选压根不该被推荐"）——真正可靠的信号是
+# 地名本身：公厕/停车场这类公共设施，不管高德把它归到哪个类别，都不该出现在候选池里。
+# 命中这些关键词的 POI 在查回来这一步就直接排除，不进候选池，不用等分类环节再去猜。
+_NON_RECOMMENDABLE_PLACE_KEYWORDS = ("公厕", "洗手间", "卫生间", "停车场", "收费站", "公共电话亭")
+
 
 def _extract_city(location_hint: str | None) -> str | None:
     """跟 orchestrator_agent._extract_city 同一个"先跑起来，以后再换实体识别"的子串匹配思路，
@@ -159,6 +168,8 @@ def _nearby_plan(
 
     results = []
     for poi in pois:
+        if any(keyword in poi["name"] for keyword in _NON_RECOMMENDABLE_PLACE_KEYWORDS):
+            continue
         reviews = store.find_posts_by_place(poi["name"])
         match_score = None
         if reviews and persona_vector is not None:
